@@ -37,20 +37,22 @@ Instant Rehydration: You access the file. The Interceptor catches the request an
 
 🚀 Quick Start (Ubuntu 24.04)#Requirement because of kernel feature set
 1. Prerequisites
+
 Install the required system tools and the Rust compiler:
+
 code
 Bash
 sudo apt update
 sudo apt install -y build-essential rclone libcap2-bin attr
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
-2. Build and Grant Capabilities
+3. Build and Grant Capabilities
 HuskHoard uses the Linux fanotify kernel API to intercept file reads. You must grant the binary specific capabilities to run as a standard user:
 code
 Bash
 cargo build --release
 sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
-3. Configure for "Test Mode"
+4. Configure for "Test Mode"
 Create a folder for your "Hot" files and a dummy file to act as your "Tape":
 code
 Bash
@@ -67,7 +69,7 @@ replication_volumes = []
 max_age_days = 0 # TEST MODE: Archive immediately
 janitor_interval_secs = 10 
 log_level = "info"
-4. Launch the Daemon
+5. Launch the Daemon
 code
 Bash
 ./target/release/huskhoard daemon
