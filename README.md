@@ -1,7 +1,7 @@
 HuskHoard: The Infinite Hybrid SSD
 Enterprise-Grade HSM for Data Hoarders & Media Professionals.
 
-HuskHoard is a Hierarchical Storage Management (HSM) engine that turns your affordable external storage into a high-performance, infinite archive. It "freezes" cold files into a sequential vault while leaving behind a Husk—a zero-byte stub that rehydrates instantly when accessed.
+HuskHoard is a Hierarchical Storage Management (HSM) engine that turns your affordable external storage into a high-performance, infinite archive. It "freezes" cold files into a sequential vault while leaving behind a Husk—a zero-byte stub that rehydrates instantly when accessed./n
 🏗️ Hardware-Aware Architecture: The "Tape" Philosophy
 Most filesystems are designed for random-access SSDs. They kill high-capacity hard drives with "write amplification" and fragmented seeks. HuskHoard is built differently.
 🧊 SMR-Native by Design (Shingled Magnetic Recording)
