@@ -42,7 +42,7 @@ HuskHoard treats the cloud as a massive, sequential tape drive. Using **rclone**
 Install the required system tools and the Rust compiler:
 ```bash
 sudo apt update
-sudo apt install -y build-essential rclone libcap2-bin attr
+sudo apt install -y build-essential rclone libcap2-bin attr pkg-config libsqlite3-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
@@ -51,7 +51,7 @@ source $HOME/.cargo/env
 HuskHoard uses the Linux `fanotify` kernel API to intercept file reads. You must grant the binary specific capabilities to run as a standard user:
 ```bash
 cargo build --release
-sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
+sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/husk
 ```
 
 ### 3. Configure for "Test Mode"
@@ -59,23 +59,19 @@ Create a folder for your "Hot" files and a dummy file to act as your "Tape":
 ```bash
 mkdir hot_tier
 fallocate -l 100M my_vault.img
-./target/release/huskhoard format --tape-dev my_vault.img
+./target/release/husk format --tape-dev my_vault.img
 ```
 
-Create `huskhoard_config.toml` with Instant Archiving enabled:
+Edit `husk_config.toml` with Instant Archiving enabled:
 ```toml
-hot_tier = "hot_tier"
-db_path = "huskhoard_catalog.db"
 primary_volumes = ["my_vault.img"]
-replication_volumes = []
 max_age_days = 0 # TEST MODE: Archive immediately
-janitor_interval_secs = 10 
-log_level = "info"
+janitor_interval_secs = 10
 ```
 
 ### 4. Launch the Daemon
 ```bash
-./target/release/huskhoard daemon
+./target/release/husk daemon
 ```
 Drop any file into `hot_tier`. Watch it turn into a Husk while the data is moved to `my_vault.img`.
 
@@ -85,17 +81,17 @@ Drop any file into `hot_tier`. Watch it turn into a Husk while the data is moved
 
 **Check "Tank Gauge" (Usage & Reclaimable Space)**
 ```bash
-./huskhoard info --tape-dev /dev/sdb
+./target/release/husk info --tape-dev my_vault.img
 ```
 
 **Scrub for Bit-Rot**
 ```bash
-./huskhoard scrub --tape-dev /dev/sdb
+./target/release/husk scrub --tape-dev my_vault.img
 ```
 
 **Manual PITR Restore (Rollback to Version 1)**
 ```bash
-./huskhoard restore --file-path /data/docs/report.pdf --version 1 --dest_path ./recovered.pdf
+./target/release/husk restore --file-path $(pwd)/hot_tier/report.pdf --version 1 --dest-path ./recovered.pdf
 ```
 
 ---
