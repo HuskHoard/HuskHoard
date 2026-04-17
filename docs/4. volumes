@@ -30,6 +30,35 @@ HuskHoard does not rely on fragile Linux device paths like `/dev/sdb1`.
 *   **Auto-Rescan:** If you move a USB drive to a different port, HuskHoard will scan `/sys/block` at startup, find the serial number, and automatically update the Catalog with the new path.
 
 ---
+This is a "killer feature" for home labbers and serious archivists—the ability to have a **"Cold Library"** of drives that sit on a shelf and are only plugged in when needed.
 
+Let's integrate this into **Section 4 (Volume Management)** as a new subsection called **"The Cold Library: Shelf Management & Offline Recalls."**
 
+---
+## 5. The Cold Library: Shelf Management
+HuskHoard was designed with the understanding that you may have more data than you have SATA ports. It treats your archive drives like a **Tape Library**, where volumes can be "Ejected" and stored on a shelf.
 
+### Persistent Hardware Identity
+When you format a volume, HuskHoard captures two critical pieces of metadata:
+1.  **Volume UUID:** A unique software identifier stored in the USTD Header.
+2.  **Drive Serial Number:** The factory hardware ID (e.g., `WDC_WD140EDGZ_ZEK12345`) pulled from the disk controller.
+
+This information is stored permanently in your `husk_catalog.db`. If you unplug a drive, the Catalog does not forget it; it simply marks it as **OFFLINE**.
+
+### Handling Offline Recalls
+If a user or application attempts to read a "Husk" file that resides on a drive currently sitting on your shelf, the following happens:
+
+1.  **The Interceptor Pauses:** The application requesting the file is placed in a "wait" state by the Kernel.
+2.  **The Daemon Alerts:** The HuskHoard daemon detects that the required Volume UUID is not currently mounted.
+3.  **The CLI Prompt:** The daemon logs a high-priority alert to the terminal and system logs:
+    > `⚠️  OFFLINE RECALL: File 'family_photo_2012.raw' is stored on an offline volume.`  
+    > `👉  PLEASE INSERT: Volume UUID [c659bb93] (Drive Serial: ZEK12345)`
+4.  **Auto-Resume:** As soon as you plug the drive into **any** USB or SATA port, the daemon rescans, identifies the Serial/UUID, and automatically resumes the rehydration. The application that was "frozen" will suddenly receive its data and continue without crashing.
+
+### Ejecting Drives Safely
+Because HuskHoard uses `O_DIRECT` and performs sequential writes, it is very "safe" for removable media. To eject a drive:
+1. Ensure the **Archive Worker** is idle (check logs).
+2. Use standard Linux eject commands: `sudo eject /dev/sdX`.
+3. HuskHoard will continue to show the files in your `hot_tier`, preserving your ability to browse your library even when the "tapes" are offline.
+
+---
