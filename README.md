@@ -24,14 +24,22 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 *   **Bit-Rot Scrubber:** Cryptographically verify the integrity of your offline storage with a single command.
 *   **Garbage Collection (Repacker):** Reclaim space from deleted files or old versions by dynamically repacking tapes.
 
----
-## 🏗️ Hardware-Aware Architecture
+### Architecture Overview
+Husk is divided into three main components:
+*   **The Interceptor:** A lightweight event loop listening to fanotify. It detects when an application requests a stubbed file, blocks the application for a few milliseconds, restores the data, and lets the application continue.
+*   **The Janitor:** A background SQLite-driven policy engine. It scans for files that haven't been touched in max_age_days and feeds them to the Archive Worker.
+*   **The Archive Worker:** Streams the file through BLAKE3 and Zstd, multiplexes the write across your Primary, Failover, and Cloud (rclone) volumes, and punches a hole in the original file to free up your SSD.
 
-### 🧊 SMR-Native by Design (Shingled Magnetic Recording)
+
+
+---
+## Hardware-Aware Architecture
+
+##  SMR-Native by Design (Shingled Magnetic Recording)
 Modern high-capacity SMR drives, suffer from a "write wall" during random writes. HuskHoard embraces this by using a **Strict Log-Structured Format**. By writing in one continuous, sequential stream, HuskHoard eliminates shingle-overlap overhead, allowing budget-friendly USB drives to perform like enterprise-grade hardware. Works with standard CMR drives, NVMe and USB attached SSDs too.
 
 
-### Sustainability & Drive Longevity
+## Sustainability & Drive Longevity
 *   **Reduced Duty Cycle:** Batching archival tasks allows your archive drives to stay spun down and idle 99% of the time.
 *   **Eco-Acoustic Storage:** Minimizing active seeks reduces mechanical heat, noise, and vibration fatigue.
 *   **Energy Efficient:** Large media collections don't need dozens of drives spinning 24/7. HuskHoard lets them sleep until you hit "Play."
@@ -109,12 +117,6 @@ Repack (Garbage Collect) an old Volume to a new one
 ```bash
 ./target/release/husk repack --source-tape my_hoard.img --dest-tape my_new_hoard.img
 ```
-### Architecture Overview
-Husk is divided into three main components:
-*   **The Interceptor:** A lightweight event loop listening to fanotify. It detects when an application requests a stubbed file, blocks the application for a few milliseconds, restores the data, and lets the application continue.
-*   **The Janitor:** A background SQLite-driven policy engine. It scans for files that haven't been touched in max_age_days and feeds them to the Archive Worker.
-*   **The Archive Worker:** Streams the file through BLAKE3 and Zstd, multiplexes the write across your Primary, Failover, and Cloud (rclone) volumes, and punches a hole in the original file to free up your SSD.
-
 ###  Contributing & Roadmap
 We are building the ultimate open-source storage tiering solution. Pull requests are welcome!
 
