@@ -13,7 +13,7 @@ It acts like an Enterprise Tape Library, but built for the modern homelab and da
 Enterprise storage vendors charge thousands of dollars for automated storage tiering and lock your data inside proprietary black boxes. HuskHoard does it for free, right in user-space, using standard open-source formats.
 
 *   **Bring Your Own Hardware:** HuskHoard doesn't care if your "Tape Library" is a $10,000 SAN, a dusty USB drive, a raw `.img` file, or an Amazon S3 bucket. If you can mount it or pipe to it, HuskHoard can use it.
-*   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API. When a file gets cold, HuskHoard punches a hole in it. The file still appears in `ls` and takes up 4 bytes of SSD space. 
+*   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API. When a file gets cold, HuskHoard punches a hole in it. The file still appears in `ls` and takes up 4 Kbytes of SSD space. 
 *   **Instant Recalls:** If you try to open an archived file, HuskHoard instantly intercepts the read, pulls the data back from "tape," and hands it to the application so fast the app doesn't even know it was missing.
 *   **The "Easy Exit" Promise (No Vendor Lock-in):** We don't hold your data hostage. The index is a standard **SQLite** database. The payloads are standard **Zstd** streams verified by **BLAKE3**. If HuskHoard ceased to exist tomorrow, you could extract all your data using a 50-line Python script.
 
@@ -25,7 +25,8 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 *   **Garbage Collection (Repacker):** Reclaim space from deleted files or old versions by dynamically repacking tapes.
 
 ### Architecture Overview
-Husk is divided into three main components:
+Husk is divided into four main components:
+*   **The Catalog:** A SQLite record of every file, when it was created and the storage voulume where it resides, online or offline. 
 *   **The Interceptor:** A lightweight event loop listening to fanotify. It detects when an application requests a stubbed file, blocks the application for a few milliseconds, restores the data, and lets the application continue.
 *   **The Janitor:** A background SQLite-driven policy engine. It scans for files that haven't been touched in max_age_days and feeds them to the Archive Worker.
 *   **The Archive Worker:** Streams the file through BLAKE3 and Zstd, multiplexes the write across your Primary, Failover, and Cloud (rclone) volumes, and punches a hole in the original file to free up your SSD.
