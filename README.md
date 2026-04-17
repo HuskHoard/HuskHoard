@@ -73,7 +73,7 @@ Husk needs specific kernel capabilities to intercept file reads via fanotify wit
 
 ```bash
 cargo build --release
-sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/husk
+sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
 ```
 ### 3. Configure for "Test Mode"
 Create a folder for your "Hot" SSD files, and a dummy file to act as your physical "Tape Volume":
@@ -83,7 +83,7 @@ fallocate -l 100M my_hoard.img
 ```
 Next, format the volume. (Note: Running this command for the first time will automatically generate a default husk_config.toml file for you!)
 ```bash
-./target/release/husk format --tape-dev my_hoard.img
+./target/release/huskhoard format --tape-dev my_hoard.img
 ```
 Open the newly generated husk_config.toml in your text editor. Update these lines to enable Instant Archiving so you can see it work immediately:
 
@@ -95,27 +95,28 @@ janitor_interval_secs = 10
 ### 4. Launch the Daemon
 Start the Husk background engine:
 ```bash
-./target/release/husk daemon
+./target/release/huskhoard daemon
 ```
-Test it: Drop a large file into hot_tier. Wait 10 seconds. Run ls -ls hot_tier. You will see the file's allocated size drop to 0, while its logical size remains intact. It has become a Husk. Open the file, and watch the Daemon instantly recall it from my_hoard.img.
+### 5. Test it
+Drop a large file into hot_tier. Wait 10 seconds. Run ls -ls hot_tier. You will see the file's allocated size drop to 4Kb, while its logical size remains intact. Run du -h hot_tier. It has become a Husk. Open the file, and watch the Daemon instantly recall it from my_hoard.img.
 
 ### 🕹️ Command Center
 Husk includes built-in tools to manage your storage volumes.
-Check "Tank Gauge" (Capacity, Usage & Reclaimable Space)
+Check Capacity, Usage & Reclaimable Space
 ```bash
-./target/release/husk info --tape-dev my_hoard.img
+./target/release/huskhoard info --tape-dev my_hoard.img
 ```
 Scrub a Volume for Bit-Rot
 ```bash
-./target/release/husk scrub --tape-dev my_hoard.img
+./target/release/huskhoard scrub --tape-dev my_hoard.img
 ```
 Manual PITR Restore (Rollback to Version 1)
 ```bash
-./target/release/husk restore --file-path $(pwd)/hot_tier/report.pdf --version 1 --dest-path ./recovered.pdf
+./target/release/huskhoard restore --file-path $(pwd)/hot_tier/[your file name] --version 1 --dest-path ./[your new file name]
 ```
 Repack (Garbage Collect) an old Volume to a new one
 ```bash
-./target/release/husk repack --source-tape my_hoard.img --dest-tape my_new_hoard.img
+./target/release/huskhoard repack --source-tape my_hoard.img --dest-tape my_new_hoard.img
 ```
 ###  Contributing & Roadmap
 We are building the ultimate open-source storage tiering solution. Pull requests are welcome!
