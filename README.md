@@ -13,7 +13,7 @@ It acts like an Enterprise Tape Library, but built for the modern homelab and da
 Enterprise storage vendors charge thousands of dollars for automated storage tiering and lock your data inside proprietary black boxes. HuskHoard does it for free, right in user-space, using standard open-source formats.
 
 *   **Bring Your Own Hardware:** HuskHoard doesn't care if your "Tape Library" is a $10,000 SAN, a dusty USB drive, a raw `.img` file, or an Amazon S3 bucket. If you can mount it or pipe to it, HuskHoard can use it.
-*   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API. When a file gets cold, HuskHoard punches a hole in it. The file still appears in `ls` and takes up 0 bytes of SSD space. 
+*   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API. When a file gets cold, HuskHoard punches a hole in it. The file still appears in `ls` and takes up 4 bytes of SSD space. 
 *   **Instant Recalls:** If you try to open an archived file, HuskHoard instantly intercepts the read, pulls the data back from "tape," and hands it to the application so fast the app doesn't even know it was missing.
 *   **The "Easy Exit" Promise (No Vendor Lock-in):** We don't hold your data hostage. The index is a standard **SQLite** database. The payloads are standard **Zstd** streams verified by **BLAKE3**. If HuskHoard ceased to exist tomorrow, you could extract all your data using a 50-line Python script.
 
@@ -30,6 +30,7 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 ### 🧊 SMR-Native by Design (Shingled Magnetic Recording)
 Modern high-capacity SMR drives, suffer from a "write wall" during random writes. HuskHoard embraces this by using a **Strict Log-Structured Format**. By writing in one continuous, sequential stream, HuskHoard eliminates shingle-overlap overhead, allowing budget-friendly USB drives to perform like enterprise-grade hardware. Works with standard CMR drives, NVMe and USB attached SSDs too.
 
+
 ### Sustainability & Drive Longevity
 *   **Reduced Duty Cycle:** Batching archival tasks allows your archive drives to stay spun down and idle 99% of the time.
 *   **Eco-Acoustic Storage:** Minimizing active seeks reduces mechanical heat, noise, and vibration fatigue.
@@ -44,10 +45,10 @@ HuskHoard treats the cloud as a massive, sequential tape drive. Using **rclone**
 
 
 ##  The Hoard: Ransomware & Bit-Rot Defense
-*   **The "Hole" Defense:** When an attacker hits a Husked file, they are merely encrypting a "hole." The actual data remains safely stored in the append-only Vault.
+*   **The "Hole" Defense:** When an attacker hits a Husked file, they are merely encrypting a "hole." The actual data remains safely stored in the append-only Hoard.
 *   **Point-in-Time Rollback:** HuskHoard maintains historic file versions. If a file is deleted or corrupted, the `restore` command allows you to roll back to any previous version.
-*   * Bit-Rot Protection:** Every block is **BLAKE3-hashed**. The built-in Scrubber periodically verifies the entire archive, detecting "bit-flips" before they become permanent.
-    * 
+*   **Bit-Rot Protection:** Every block is **BLAKE3-hashed**. The built-in Scrubber periodically verifies the entire archive, detecting "bit-flips" before they become permanent.
+      
 ## 🚀 Quick Start (Ubuntu 24.04)
 
 ### 1. Prerequisites
@@ -70,16 +71,16 @@ sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/husk
 Create a folder for your "Hot" SSD files, and a dummy file to act as your physical "Tape Volume":
 ```bash
 mkdir hot_tier
-fallocate -l 100M my_vault.img
+fallocate -l 100M my_hoard.img
 ```
 Next, format the volume. (Note: Running this command for the first time will automatically generate a default husk_config.toml file for you!)
 ```bash
-./target/release/husk format --tape-dev my_vault.img
+./target/release/husk format --tape-dev my_hoard.img
 ```
 Open the newly generated husk_config.toml in your text editor. Update these lines to enable Instant Archiving so you can see it work immediately:
 
 ```Toml
-primary_volumes = ["my_vault.img"]
+primary_volumes = ["my_hoard.img"]
 max_age_days = 0 # TEST MODE: Archive files immediately
 janitor_interval_secs = 10
 ```
@@ -88,17 +89,17 @@ Start the Husk background engine:
 ```bash
 ./target/release/husk daemon
 ```
-Test it: Drop a large file into hot_tier. Wait 10 seconds. Run ls -ls hot_tier. You will see the file's allocated size drop to 0, while its logical size remains intact. It has become a Husk. Open the file, and watch the Daemon instantly recall it from my_vault.img.
+Test it: Drop a large file into hot_tier. Wait 10 seconds. Run ls -ls hot_tier. You will see the file's allocated size drop to 0, while its logical size remains intact. It has become a Husk. Open the file, and watch the Daemon instantly recall it from my_hoard.img.
 
 ### 🕹️ Command Center
 Husk includes built-in tools to manage your storage volumes.
 Check "Tank Gauge" (Capacity, Usage & Reclaimable Space)
 ```bash
-./target/release/husk info --tape-dev my_vault.img
+./target/release/husk info --tape-dev my_hoard.img
 ```
 Scrub a Volume for Bit-Rot
 ```bash
-./target/release/husk scrub --tape-dev my_vault.img
+./target/release/husk scrub --tape-dev my_hoard.img
 ```
 Manual PITR Restore (Rollback to Version 1)
 ```bash
@@ -106,18 +107,21 @@ Manual PITR Restore (Rollback to Version 1)
 ```
 Repack (Garbage Collect) an old Volume to a new one
 ```bash
-./target/release/husk repack --source-tape my_vault.img --dest-tape my_new_vault.img
+./target/release/husk repack --source-tape my_hoard.img --dest-tape my_new_hoard.img
 ```
 ### Architecture Overview
 Husk is divided into three main components:
-The Interceptor: A lightweight event loop listening to fanotify. It detects when an application requests a stubbed file, blocks the application for a few milliseconds, restores the data, and lets the application continue.
-The Janitor: A background SQLite-driven policy engine. It scans for files that haven't been touched in max_age_days and feeds them to the Archive Worker.
-The Archive Worker: Streams the file through BLAKE3 and Zstd, multiplexes the write across your Primary, Failover, and Cloud (rclone) volumes, and punches a hole in the original file to free up your SSD.
+*   **The Interceptor:** A lightweight event loop listening to fanotify. It detects when an application requests a stubbed file, blocks the application for a few milliseconds, restores the data, and lets the application continue.
+*   **The Janitor:** A background SQLite-driven policy engine. It scans for files that haven't been touched in max_age_days and feeds them to the Archive Worker.
+*   **The Archive Worker:** Streams the file through BLAKE3 and Zstd, multiplexes the write across your Primary, Failover, and Cloud (rclone) volumes, and punches a hole in the original file to free up your SSD.
 
 ###  Contributing & Roadmap
 We are building the ultimate open-source storage tiering solution. Pull requests are welcome!
+
 [Planned] Web UI / Dashboard for real-time Tank Gauge monitoring.
+
 [Planned] Prometheus metrics endpoint (/metrics) for Grafana integration.
+
 [Planned] Pre-packaged Docker container / Appliance OS.
 
 ### License
