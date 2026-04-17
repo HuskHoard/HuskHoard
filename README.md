@@ -1,3 +1,40 @@
+# 🌾 Husk (Hybrid User-Space Storage Kernel)
+
+![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)
+![Built with Rust](https://img.shields.io/badge/Built_with-Rust-orange.svg)
+
+**Husk** is an automated, transparent data-tiering engine for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives, raw disk images, or cloud buckets—while keeping the files fully visible and accessible to your OS.
+
+It acts like an Enterprise Tape Library, but built for the modern homelab and data hoarder.
+
+## 🔥 Why Husk?
+
+Enterprise storage vendors charge thousands of dollars for automated storage tiering and lock your data inside proprietary black boxes. Husk does it for free, right in user-space, using standard open-source formats.
+
+*   **The "Scrap Metal" Philosophy:** Bring your own hardware. Husk doesn't care if your "Tape Library" is a $10,000 SAN, a dusty USB drive, a raw `.img` file, or an Amazon S3 bucket. If you can mount it or pipe to it, Husk can use it.
+*   **Zero-Overhead Transparent Stubbing:** Husk does **not** use FUSE. It uses the Linux `fanotify` kernel API. When a file gets cold, Husk punches a hole in it. The file still appears in `ls` and takes up 0 bytes of SSD space. 
+*   **Instant Recalls:** If you try to open an archived file, Husk instantly intercepts the read, pulls the data back from "tape," and hands it to the application so fast the app doesn't even know it was missing.
+*   **The "Easy Exit" Promise (No Vendor Lock-in):** We don't hold your data hostage. The index is a standard **SQLite** database. The payloads are standard **Zstd** streams verified by **BLAKE3**. If Husk ceased to exist tomorrow, you could extract all your data using a 50-line Python script.
+
+## 🛠️ Features
+
+*   **N-Way Replication:** Automatically mirror cold data across local drives and cloud buckets simultaneously via `rclone`.
+*   **Point-in-Time Recovery (PITR):** Husk keeps historical versions of modified files. Roll back any file to yesterday's version instantly.
+*   **Bit-Rot Scrubber:** Cryptographically verify the integrity of your offline storage with a single command.
+*   **Garbage Collection (Repacker):** Reclaim space from deleted files or old versions by dynamically repacking tapes.
+
+---
+
+## 🚀 Quick Start (Ubuntu 24.04 / Debian)
+
+### 1. Prerequisites
+Install the required system tools and the Rust compiler:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential rclone libcap2-bin attr pkg-config libsqlite3-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
 # HuskHoard: The Infinite Hybrid SSD
 ### Enterprise-Grade HSM for Data Hoarders & Media Professionals.
 
