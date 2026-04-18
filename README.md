@@ -36,7 +36,7 @@ Husk is divided into four main components:
 ---
 ## Hardware-Aware Architecture
 
-##  SMR-Native by Design (Shingled Magnetic Recording)
+##  Supports all drive technologies including SMR drives
 Modern high-capacity SMR drives, suffer from a "write wall" during random writes. HuskHoard embraces this by using a **Strict Log-Structured Format**. By writing in one continuous, sequential stream, HuskHoard eliminates shingle-overlap overhead, allowing budget-friendly USB drives to perform like enterprise-grade hardware. Works with standard CMR drives, NVMe and USB attached SSDs too.
 
 
