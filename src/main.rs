@@ -1800,7 +1800,7 @@ fn main() {
             if unsafe { libc::geteuid() } != 0 {
                 info!("⚠️ Running Husk without root privileges.");
                 info!("   If fanotify fails, grant capabilities to the binary using:");
-                info!("   sudo setcap cap_sys_admin,cap_dac_read_search+ep ./target/release/husk");
+                info!("   sudo setcap cap_sys_admin,cap_dac_read_search+ep ./target/release/huskhoard");
             }
 
             std::fs::create_dir_all(&config_arc.hot_tier).unwrap();
