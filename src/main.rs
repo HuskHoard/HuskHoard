@@ -88,6 +88,15 @@ struct Cli {
 enum Commands {
     /// Start the USTD daemon (Interceptor + Queue Worker)
     Daemon,
+    /// Stream a file from tape directly to Standard Output (Zero-Disk extraction)
+    Cat {
+        #[arg(long)]
+        file_path: String,
+        #[arg(long, default_value = "0")]
+        offset: u64,
+        #[arg(long)]
+        length: Option<u64>,
+    },
     /// Format a raw block device, writing the Volume Header to LBA 0
     Format {
         #[arg(long)]
@@ -210,7 +219,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, u64, u64)> {
-    // Intercept rclone pseudo-paths to prevent POSIX stat failures
+    // 1. Rclone Cloud Targets
     if tape_dev.starts_with("rclone:") {
         let mut used_capacity = ALIGNMENT as u64;
         let mut active_data = 0;
@@ -228,7 +237,6 @@ fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, u64,
                 if let Ok(act_data) = conn.query_row(query_active, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) { active_data = act_data as u64; }
             }
         }
-        // Cloud targets have unlimited physical capacity. Mock 1 PB.
         return Ok((used_capacity, 1_125_899_906_842_624, active_data)); 
     }
 
@@ -237,12 +245,29 @@ fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, u64,
     })?;
 
     let is_block_dev = (meta.mode() & libc::S_IFMT) == libc::S_IFBLK;
+    let is_char_dev = (meta.mode() & libc::S_IFMT) == libc::S_IFCHR;
 
+    // 2. Physical SCSI Tape Targets (Character Device)
+    if is_char_dev {
+        // Mock LTO-8 capacity (12TB) for now. Future updates will read hardware specs via sg_inq.
+        let lto_capacity = 12_000_000_000_000; 
+        let mut used_capacity = ALIGNMENT as u64;
+        let active_data = 0; // Unused for now to prevent compiler warnings
+        
+        if Path::new(db_path).exists() {
+            if let Ok(conn) = Connection::open(db_path) {
+                let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog";
+                if let Ok(max_used) = conn.query_row(query, [], |row| row.get::<_, i64>(0)) { used_capacity = max_used as u64; }
+            }
+        }
+        return Ok((used_capacity, lto_capacity, active_data));
+    }
+
+    // 3. Local Block Devices (.img files, /dev/sdb)
     let total_capacity = if is_block_dev {
         let mut file = File::open(tape_dev)?;
-        file.seek(SeekFrom::End(0))?
+        file.seek(SeekFrom::End(0)).unwrap_or(meta.len())
     } else {
-        // For image files, the capacity is the size of the file itself
         meta.len()
     };
 
@@ -258,27 +283,17 @@ fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, u64,
                 if &vol_header.magic_bytes == b"USTDVOL\0" {
                     let tape_uuid_hex = vol_header.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
                     
-                    // 1. Used Capacity (Physical High-Water Mark / EOF)
                     let query_eof = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
-                    if let Ok(max_used) = conn.query_row(query_eof, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) {
-                        used_capacity = max_used as u64;
-                    }
+                    if let Ok(max_used) = conn.query_row(query_eof, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) { used_capacity = max_used as u64; }
 
-                    // 2. Active Data (Only the latest version of files currently indexed)
-                    let query_active = "SELECT COALESCE(SUM(((compressed_size + 4095) / 4096) * 4096 + 4096), 0)
-                                        FROM catalog c1
-                                        INNER JOIN (SELECT file_path, MAX(version) as max_ver FROM catalog GROUP BY file_path) c2
-                                        ON c1.file_path = c2.file_path AND c1.version = c2.max_ver
-                                        WHERE tape_uuid = ?1";
-                    if let Ok(act_data) = conn.query_row(query_active, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) {
-                        active_data = act_data as u64;
-                    }
+                    let query_active = "SELECT COALESCE(SUM(((compressed_size + 4095) / 4096) * 4096 + 4096), 0) FROM catalog c1 INNER JOIN (SELECT file_path, MAX(version) as max_ver FROM catalog GROUP BY file_path) c2 ON c1.file_path = c2.file_path AND c1.version = c2.max_ver WHERE tape_uuid = ?1";
+                    if let Ok(act_data) = conn.query_row(query_active, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) { active_data = act_data as u64; }
                 }
             }
         }
     } else if !is_block_dev {
         used_capacity = std::cmp::max(meta.len(), ALIGNMENT as u64);
-        active_data = used_capacity; // Guess if no DB
+        active_data = used_capacity; 
     }
 
     used_capacity = std::cmp::min(used_capacity, total_capacity);
@@ -315,13 +330,47 @@ fn print_tape_gauge(tape_dev: &str, db_path: &str) {
 }
 
 // ---------------------------------------------------------
+// Linux MTIO (Magnetic Tape I/O) Definitions
+// ---------------------------------------------------------
+#[repr(C)]
+pub struct mtop {
+    pub mt_op: libc::c_short,
+    pub mt_count: libc::c_int,
+}
+
+pub const MTIOCTOP: libc::c_ulong = 0x40086d01;
+pub const MTREW: libc::c_short = 1;   // Rewind tape
+pub const MTWEOF: libc::c_short = 4;  // Write filemark
+pub const MTFSF: libc::c_short = 11;  // Forward space file
+pub const MTEOM: libc::c_short = 12;  // Space to end of recorded data
+
+pub fn send_mtio_cmd(fd: i32, op: libc::c_short, count: libc::c_int) -> std::io::Result<()> {
+    let mut mt_cmd = mtop { mt_op: op, mt_count: count };
+    let ret = unsafe { libc::ioctl(fd, MTIOCTOP, &mut mt_cmd) };
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------
 // Helper: Safe Tape Opener with O_DIRECT Fallback
 // ---------------------------------------------------------
 fn open_tape_device(tape_dev: &str, read: bool, write: bool, create: bool, use_direct_io: bool) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(read).write(write).create(create);
 
-    if use_direct_io {
+    // Detect character devices (e.g., /dev/nst0 physical SCSI tape)
+    let is_char_dev = std::fs::metadata(tape_dev)
+        .map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR)
+        .unwrap_or(false);
+
+    // O_DIRECT on Linux `st` character devices requires exact block size matching.
+    // We disable it here to let the kernel handle SCSI frame buffering safely.
+    let effective_direct = if is_char_dev { false } else { use_direct_io };
+
+    if effective_direct {
         opts.custom_flags(libc::O_DIRECT);
         match opts.open(tape_dev) {
             Ok(file) => return Ok(file),
@@ -341,6 +390,17 @@ fn open_tape_device(tape_dev: &str, read: bool, write: bool, create: bool, use_d
 fn format_tape(tape_dev: &str, use_direct_io: bool) -> std::io::Result<()> {
     info!("Formatting Volume '{}'...", tape_dev);
     let mut tape = open_tape_device(tape_dev, false, true, true, use_direct_io)?;
+
+    let is_char_dev = std::fs::metadata(tape_dev)
+        .map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR)
+        .unwrap_or(false);
+
+    if is_char_dev {
+        info!("📼 Physical Tape Drive detected. Issuing SCSI Rewind (MTREW)...");
+        if let Err(e) = send_mtio_cmd(tape.as_raw_fd(), MTREW, 1) {
+            error!("⚠️ Tape rewind failed: {}. Ensure device is ready.", e);
+        }
+    }
 
     let new_uuid = Uuid::new_v4();
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
@@ -421,15 +481,23 @@ struct MultiTapeWriter<'a> {
 
 impl<'a> MultiTapeWriter<'a> {
     fn new(tapes: Vec<&'a mut dyn std::io::Write>) -> Self {
-        Self { tapes, buffer: AlignedBuffer::new(ALIGNMENT), cursor: 0, bytes_written: 0 }
+        // Buffer 256KB in RAM to force optimal LTO Hardware Block writes
+        Self { tapes, buffer: AlignedBuffer::new(262144), cursor: 0, bytes_written: 0 }
     }
     fn pad_and_flush(&mut self) -> std::io::Result<()> {
         if self.cursor > 0 {
-            self.buffer.as_mut_slice()[self.cursor..].fill(0);
+            // Only pad forward to the nearest 4KB alignment, not the whole 256KB buffer
+            let padded_cursor = if self.cursor % ALIGNMENT == 0 {
+                self.cursor
+            } else {
+                self.cursor + ALIGNMENT - (self.cursor % ALIGNMENT)
+            };
+            
+            self.buffer.as_mut_slice()[self.cursor..padded_cursor].fill(0);
             for tape in &mut self.tapes {
-                tape.write_all(self.buffer.as_slice())?;
+                tape.write_all(&self.buffer.as_slice()[..padded_cursor])?;
             }
-            self.bytes_written += self.buffer.capacity as u64;
+            self.bytes_written += padded_cursor as u64;
             self.cursor = 0;
         }
         Ok(())
@@ -464,6 +532,7 @@ impl<'a> std::io::Write for MultiTapeWriter<'a> {
 // ---------------------------------------------------------
 pub enum StorageBackend {
     Local(File),
+    Tape(File), // NEW: Physical SCSI Tape Hardware
     Rclone { 
         child: std::process::Child,
         stdin: std::process::ChildStdin,
@@ -474,12 +543,14 @@ impl std::io::Write for StorageBackend {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             StorageBackend::Local(f) => f.write(buf),
+            StorageBackend::Tape(f) => f.write(buf),
             StorageBackend::Rclone { stdin, .. } => stdin.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             StorageBackend::Local(f) => f.flush(),
+            StorageBackend::Tape(f) => f.flush(),
             StorageBackend::Rclone { stdin, .. } => stdin.flush(),
         }
     }
@@ -489,25 +560,31 @@ impl StorageBackend {
     pub fn seek_to(&mut self, offset: u64) -> std::io::Result<()> {
         match self {
             StorageBackend::Local(f) => { f.seek(SeekFrom::Start(offset))?; Ok(()) },
-            StorageBackend::Rclone { .. } => Ok(()), // Streams cannot seek, ignore safely
+            StorageBackend::Tape(_) => Ok(()), // Hardware tapes are Append-Only. Seek ignored.
+            StorageBackend::Rclone { .. } => Ok(()), 
         }
     }
     pub fn sync(&mut self) -> std::io::Result<()> {
         match self {
             StorageBackend::Local(f) => f.sync_all(),
+            StorageBackend::Tape(f) => f.sync_all(),
             StorageBackend::Rclone { stdin, .. } => stdin.flush(),
         }
     }
-
-    // New method to ensure rclone finishes the upload
     pub fn close(self) -> std::io::Result<()> {
         match self {
             StorageBackend::Local(f) => f.sync_all(),
+            StorageBackend::Tape(f) => {
+                f.sync_all()?;
+                // CRITICAL: Write SCSI Filemark (End of File) to hardware
+                send_mtio_cmd(f.as_raw_fd(), MTWEOF, 1)?;
+                Ok(())
+            },
             StorageBackend::Rclone { mut child, stdin } => {
-                drop(stdin); // Close the pipe to tell rclone we are done
-                let status = child.wait()?; // WAIT for rclone to finish the AWS upload
+                drop(stdin); // Close pipe
+                let status = child.wait()?; 
                 if !status.success() {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "rclone failed to finalize upload"));
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "rclone failed"));
                 }
                 Ok(())
             }
@@ -552,7 +629,7 @@ pub struct ActiveTape {
     pub uuid_hex: String,
     pub volume_uuid: [u8; 16],
     pub start_offset: u64,
-    pub is_rclone: bool,
+    pub is_append_only: bool, // Unified boolean for Cloud AND Physical Tapes
 }
 
 // Returns a Vector of successful replicas: (Tape_Offset, Payload_Size, Compressed_Size, Compression_Type, Blake3_Hash_Hex, Tape_UUID, Device_Path)
@@ -583,12 +660,17 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
 
             if let Ok(backend) = spawn_rclone_writer(&object_path) {
                 info!("[Archiver] Selected Cloud Target: {} (Virtual Offset: {})", dev_path, start_offset);
-                active_tapes.push(ActiveTape { backend, dev_path: dev_path.to_string(), uuid_hex, volume_uuid: uuid_bytes, start_offset, is_rclone: true });
+                active_tapes.push(ActiveTape { backend, dev_path: dev_path.to_string(), uuid_hex, volume_uuid: uuid_bytes, start_offset, is_append_only: true });
                 return true;
             }
         } else {
             if let Ok(mut tape) = open_tape_device(dev_path, true, true, true, use_direct_io) {
-                if tape.seek(SeekFrom::Start(0)).is_err() { return false; }
+                let tape_meta = tape.metadata().unwrap();
+                let is_char_dev = (tape_meta.mode() & libc::S_IFMT) == libc::S_IFCHR;
+
+                if !is_char_dev && tape.seek(SeekFrom::Start(0)).is_err() { return false; }
+                if is_char_dev { let _ = send_mtio_cmd(tape.as_raw_fd(), MTREW, 1); }
+
                 let mut vol_buf = AlignedBuffer::new(ALIGNMENT);
                 if tape.read_exact(vol_buf.as_mut_slice()).is_err() { return false; }
                 
@@ -600,16 +682,25 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
                 let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
                 let start_offset = if logical_eof % ALIGNMENT as u64 == 0 { logical_eof } else { logical_eof + ALIGNMENT as u64 - (logical_eof % ALIGNMENT as u64) };
 
-                let tape_meta = tape.metadata().unwrap();
                 let is_block_dev = (tape_meta.mode() & libc::S_IFMT) == libc::S_IFBLK;
                 let total_capacity = if is_block_dev {
                     let mut f2 = std::fs::File::open(dev_path).unwrap();
                     f2.seek(SeekFrom::End(0)).unwrap_or(0)
+                } else if is_char_dev {
+                    12_000_000_000_000 // Mock 12TB for Tape
                 } else { tape_meta.len() };
 
                 if start_offset + estimated_need <= total_capacity {
+                    let backend = if is_char_dev {
+                        info!("📼 Appending to End of Data (MTEOM) on {}...", dev_path);
+                        let _ = send_mtio_cmd(tape.as_raw_fd(), MTEOM, 1);
+                        StorageBackend::Tape(tape)
+                    } else {
+                        StorageBackend::Local(tape)
+                    };
+
                     info!("[Archiver] Selected Local Target: {} (UUID: {})", dev_path, uuid_hex);
-                    active_tapes.push(ActiveTape { backend: StorageBackend::Local(tape), dev_path: dev_path.to_string(), uuid_hex, volume_uuid: vol_header.volume_uuid, start_offset, is_rclone: false });
+                    active_tapes.push(ActiveTape { backend, dev_path: dev_path.to_string(), uuid_hex, volume_uuid: vol_header.volume_uuid, start_offset, is_append_only: is_char_dev });
                     return true;
                 }
             }
@@ -787,6 +878,116 @@ impl<W: std::io::Write> HashWriter<W> {
     fn finalize_hash(self) -> blake3::Hash { self.hasher.finalize() }
 }
 
+// ---------------------------------------------------------
+// StreamGate: RAM-Buffered Offset Skipper
+// ---------------------------------------------------------
+struct SkipWriter<W: std::io::Write> {
+    inner: W,
+    bytes_to_skip: u64,
+    bytes_written: u64,
+    limit: Option<u64>,
+}
+
+impl<W: std::io::Write> std::io::Write for SkipWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut start = 0;
+        // 1. Skip bytes if we haven't reached the target offset yet
+        if self.bytes_to_skip > 0 {
+            let skip = std::cmp::min(self.bytes_to_skip as usize, buf.len());
+            self.bytes_to_skip -= skip as u64;
+            start = skip;
+        }
+
+        // 2. Write the remaining bytes to the destination
+        if start < buf.len() {
+            let mut to_write = buf.len() - start;
+            if let Some(lim) = self.limit {
+                if self.bytes_written >= lim {
+                    return Ok(buf.len()); // Pretend we wrote it so the Zstd decoder doesn't panic
+                }
+                to_write = std::cmp::min(to_write, (lim - self.bytes_written) as usize);
+            }
+            if to_write > 0 {
+                self.inner.write_all(&buf[start..start + to_write])?;
+                self.bytes_written += to_write as u64;
+            }
+        }
+        Ok(buf.len()) // Always return full length to keep the decompression stream pumping
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+}
+
+fn cat_file(db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool) -> std::io::Result<()> {
+    let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB Open Failed"))?;
+    
+    // Locate the latest version of the file
+    let (tape_uuid, tape_offset, db_comp, db_type, padded_size): (String, u64, u64, u8, u64) = conn.query_row(
+        "SELECT tape_uuid, tape_offset, compressed_size, compression_type, ((compressed_size + 4095) / 4096) * 4096 
+         FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 1",
+        params![file_path],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+    ).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "File not found in catalog"))?;
+
+    let tape_dev: String = conn.query_row(
+        "SELECT device_path FROM tapes WHERE tape_uuid = ?1",
+        params![tape_uuid], |row| row.get(0)
+    ).unwrap_or_default();
+
+    let is_char_dev = std::fs::metadata(&tape_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
+
+    let mut tape: StorageReader = if tape_dev.starts_with("rclone:") {
+        let clean_remote = tape_dev.strip_prefix("rclone:").unwrap();
+        let object_path = format!("{}/husk_{}.bin", clean_remote, tape_offset);
+        let mut child = Command::new("rclone").arg("cat").arg(&object_path).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        StorageReader::Rclone(child.stdout.take().unwrap(), child)
+    } else if is_char_dev {
+        let f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
+        let fd = f.as_raw_fd();
+        let file_index: i32 = conn.query_row("SELECT COUNT(*) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2", params![tape_uuid, tape_offset], |row| row.get(0)).unwrap_or(0);
+        let _ = send_mtio_cmd(fd, MTREW, 1);
+        if file_index > 0 { let _ = send_mtio_cmd(fd, MTFSF, file_index); }
+        StorageReader::Local(f)
+    } else {
+        let mut f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
+        f.seek(SeekFrom::Start(tape_offset))?;
+        StorageReader::Local(f)
+    };
+
+    let mut header_buf = AlignedBuffer::new(ALIGNMENT);
+    tape.read_exact(header_buf.as_mut_slice())?; // Discard header (we just need the payload)
+
+    let stdout = std::io::stdout();
+    let mut out_handle = stdout.lock();
+    
+    // Wrap stdout in our SkipWriter to handle seeking
+    let skip_writer = SkipWriter { inner: &mut out_handle, bytes_to_skip: offset, bytes_written: 0, limit: length };
+    let mut io_buf = AlignedBuffer::new(ALIGNMENT * 256);
+    let mut bytes_read: u64 = 0;
+
+    if db_type == 1 {
+        let mut decoder = zstd::stream::write::Decoder::new(skip_writer)?;
+        while bytes_read < padded_size {
+            let chunk = std::cmp::min(padded_size - bytes_read, io_buf.capacity as u64) as usize;
+            tape.read_exact(&mut io_buf.as_mut_slice()[..chunk])?;
+            let valid_compressed = if bytes_read + chunk as u64 > db_comp { db_comp.saturating_sub(bytes_read) as usize } else { chunk };
+            if valid_compressed > 0 { decoder.write_all(&io_buf.as_slice()[..valid_compressed])?; }
+            bytes_read += chunk as u64;
+        }
+        decoder.flush()?;
+    } else {
+        let mut raw_writer = skip_writer;
+        while bytes_read < padded_size {
+            let chunk = std::cmp::min(padded_size - bytes_read, io_buf.capacity as u64) as usize;
+            tape.read_exact(&mut io_buf.as_mut_slice()[..chunk])?;
+            raw_writer.write_all(&io_buf.as_slice()[..chunk])?;
+            bytes_read += chunk as u64;
+        }
+        raw_writer.flush()?;
+    }
+
+    Ok(())
+}
+
 fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, tape_offset: u64, use_direct_io: bool, is_manual: bool) -> std::io::Result<()> {
     info!("\nRestoring from Volume'{}'...", tape_dev);
 
@@ -800,6 +1001,10 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
     
     let padded_size = ((db_comp + 4095) / 4096) * 4096;
 
+    let is_char_dev = std::fs::metadata(tape_dev)
+        .map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR)
+        .unwrap_or(false);
+
     // 2. Open correct stream backend
     let mut tape: StorageReader = if tape_dev.starts_with("rclone:") {
         let clean_remote = tape_dev.strip_prefix("rclone:").unwrap();
@@ -811,6 +1016,24 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
             .stderr(Stdio::null())
             .spawn()?;
         StorageReader::Rclone(child.stdout.take().unwrap(), child)
+    } else if is_char_dev {
+        let f = open_tape_device(tape_dev, true, false, false, use_direct_io)?;
+        let fd = f.as_raw_fd();
+        
+        let tape_uuid: String = conn.query_row(
+            "SELECT tape_uuid FROM catalog WHERE file_path = ?1 AND tape_offset = ?2",
+            params![file_path, tape_offset], |row| row.get(0)
+        ).unwrap_or_default();
+
+        let file_index: i32 = conn.query_row(
+            "SELECT COUNT(*) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2",
+            params![tape_uuid, tape_offset], |row| row.get(0)
+        ).unwrap_or(0);
+
+        info!("📼 Physical Tape: Rewinding and advancing {} Filemarks...", file_index);
+        let _ = send_mtio_cmd(fd, MTREW, 1);
+        if file_index > 0 { let _ = send_mtio_cmd(fd, MTFSF, file_index); }
+        StorageReader::Local(f)
     } else {
         let mut f = open_tape_device(tape_dev, true, false, false, use_direct_io)?;
         f.seek(SeekFrom::Start(tape_offset))?;
@@ -820,8 +1043,8 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
     let mut header_buf = AlignedBuffer::new(ALIGNMENT);
     let mut header: ObjectHeader;
 
-    if tape_dev.starts_with("rclone:") {
-        // Rclone streams contain: 4KB dummy -> Payload -> 4KB Real Header
+    if tape_dev.starts_with("rclone:") || is_char_dev {
+        // Append-Only Media streams contain: 4KB dummy -> Payload -> 4KB Real Header
         tape.read_exact(header_buf.as_mut_slice())?; // Discard dummy
         header = unsafe { std::mem::zeroed() }; // Mock header to pass into the decoding loop
         header.payload_size = db_payload;
@@ -899,8 +1122,8 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
         raw_writer.finalize_hash()
     };
 
-    // Fetch Real Header for rclone streams now that payload is consumed
-    if tape_dev.starts_with("rclone:") {
+    // Fetch Real Header for Append-Only media now that payload is consumed
+    if tape_dev.starts_with("rclone:") || is_char_dev {
         tape.read_exact(header_buf.as_mut_slice())?;
         header = *bytemuck::from_bytes(header_buf.as_slice());
         
@@ -909,9 +1132,9 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
         let mut crc = Crc32Hasher::new();
         crc.update(bytemuck::bytes_of(&header));
         if crc.finalize() != stored_crc {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Cloud Header CRC mismatch!"));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Footer Header CRC mismatch!"));
         }
-        info!("Cloud Header verified! Expected Payload: {} bytes.", header.payload_size);
+        info!("Footer Header verified! Expected Payload: {} bytes.", header.payload_size);
     }
 
     if final_hash.as_bytes() != &header.data_checksum {
@@ -1480,8 +1703,11 @@ fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::i
 // 7.5 The Repacker: Tape Garbage Collection 
 // ---------------------------------------------------------
 fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_io: bool) -> std::io::Result<()> {
-    if source_dev.starts_with("rclone:") || dest_dev.starts_with("rclone:") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Repacking cloud volumes is currently not supported via local tool."));
+    let src_is_char = std::fs::metadata(source_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
+    let dest_is_char = std::fs::metadata(dest_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
+    
+    if source_dev.starts_with("rclone:") || dest_dev.starts_with("rclone:") || src_is_char || dest_is_char {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Repacking Append-Only/Cloud volumes is not yet supported."));
     }
     info!(" Starting Repacker: Moving active data from '{}' to '{}'...", source_dev, dest_dev);
     
@@ -1588,8 +1814,9 @@ fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_io: b
 // 8. Data Integrity: The Scrubber 
 // ---------------------------------------------------------
 fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Result<()> {
-    if tape_dev.starts_with("rclone:") {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Scrubbing cloud volumes via rclone is not yet supported."));
+    let is_char_dev = std::fs::metadata(tape_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
+    if tape_dev.starts_with("rclone:") || is_char_dev {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Scrubbing Append-Only/Cloud volumes is not yet supported."));
     }
     info!(" Starting Scrubber on Volume: {}...", tape_dev);
     
@@ -1738,6 +1965,8 @@ fn rescan_tape_drives(conn: &Connection) {
 
     for (uuid, serial, old_path) in rows {
         let mut found = false;
+        
+        // 1. Scan Block Devices (HDDs / SSDs / USBs)
         if let Ok(entries) = std::fs::read_dir("/sys/block") {
             for entry in entries.flatten() {
                 let dev_name = entry.file_name().to_string_lossy().to_string();
@@ -1757,8 +1986,30 @@ fn rescan_tape_drives(conn: &Connection) {
                 }
             }
         }
+
+        // 2. Scan SCSI Tape Drives if not found in block
         if !found {
-            error!("⚠️ Drive {} (Serial: {}) is OFFLINE. Restores from it will fail.", old_path, serial);
+            if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_tape") {
+                for entry in entries.flatten() {
+                    let dev_name = entry.file_name().to_string_lossy().to_string();
+                    let sys_path = format!("/sys/class/scsi_tape/{}/device/model", dev_name);
+                    if let Ok(current_serial) = std::fs::read_to_string(&sys_path) {
+                        if current_serial.trim() == serial {
+                            let new_path = format!("/dev/{}", dev_name);
+                            if new_path != old_path {
+                                info!("Tape Drive Moved! UUID {} is now safely tracked at {}", uuid, new_path);
+                                conn.execute("UPDATE tapes SET device_path = ?1 WHERE tape_uuid = ?2", params![new_path, uuid]).unwrap();
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found {
+            error!("⚠️ Drive {} (Serial/Model: {}) is OFFLINE. Restores from it will fail.", old_path, serial);
         }
     }
 }
@@ -1800,7 +2051,7 @@ fn main() {
             if unsafe { libc::geteuid() } != 0 {
                 info!("⚠️ Running Husk without root privileges.");
                 info!("   If fanotify fails, grant capabilities to the binary using:");
-                info!("   sudo setcap cap_sys_admin,cap_dac_read_search+ep ./target/release/huskhoard");
+                info!("   sudo setcap cap_sys_admin,cap_dac_read_search+ep ./target/release/husk");
             }
 
             std::fs::create_dir_all(&config_arc.hot_tier).unwrap();
@@ -1882,6 +2133,14 @@ fn main() {
                 error!("Manual restore failed: {}", e);
             }
         }
+        
+        Commands::Cat { file_path, offset, length } => {
+            // Disable logging so it doesn't corrupt stdout binary streams
+            log::set_max_level(log::LevelFilter::Off);
+            if let Err(e) = cat_file(&config_arc.db_path, file_path, *offset, *length, use_direct_io) {
+                eprintln!("Cat failed: {}", e);
+            }
+        }
         Commands::Repack { source_tape, dest_tape } => {
             if let Err(e) = repack_tape(&config_arc.db_path, source_tape, dest_tape, use_direct_io) {
                 error!("Repacker failed: {}", e);
@@ -1945,7 +2204,15 @@ fn get_drive_serial(tape_dev: &str) -> String {
     let dev_name = std::path::Path::new(tape_dev)
         .file_name().unwrap_or_default().to_string_lossy();
     
-    // Strip partition numbers (e.g., sdb1 -> sdb) to get the parent drive
+    // 1. Check for physical SCSI Tape Drives (e.g., /dev/nst0)
+    if dev_name.starts_with("nst") || dev_name.starts_with("st") {
+        let sys_path = format!("/sys/class/scsi_tape/{}/device/model", dev_name);
+        return std::fs::read_to_string(&sys_path)
+            .unwrap_or_else(|_| "SCSI_TAPE_DRIVE".to_string())
+            .trim().to_string();
+    }
+    
+    // 2. Check for standard Block Devices (e.g., /dev/sdb)
     let parent_dev = dev_name.trim_end_matches(char::is_numeric);
     let sys_path = format!("/sys/block/{}/device/serial", parent_dev);
     
