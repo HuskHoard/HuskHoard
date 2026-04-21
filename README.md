@@ -34,7 +34,7 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 ---
 ## Hardware-Aware Architecture
 
-### Supports SMR & LTO Tape Hardware
+### Supports CMR, NVMe, SMR & LTO Tape Hardware
 Modern storage requires specialized handling. HuskHoard uses a **Strict Log-Structured Format**:
 *   **For SMR Hard Drives:** Eliminates the "write wall" by writing in one continuous, sequential stream.
 *   **For Physical Tapes:** Uses optimal **256KB SCSI Framing** to prevent "shoe-shining" (frequent stopping/starting), maximizing both performance and the lifespan of your tape heads.
