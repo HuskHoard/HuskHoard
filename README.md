@@ -47,31 +47,98 @@ Modern storage requires specialized handling. HuskHoard uses a **Strict Log-Stru
 Using **rclone** as its transport layer, HuskHoard streams archives to over 40 providers (S3, B2, etc.) in a single pass. Data is packed into optimal 16MB Zstd frames to minimize API "PUT" requests and storage costs.
 
 ---
+Hi JM. This project looks incredibly cool. Storage tiering is usually a massive headache, and using `fanotify` for a modern, transparent user-space solution is a brilliant approach.
 
-## 🚀 Quick Start (Ubuntu 24.04)
+The reason your beta testers are installing things in the root directory (or unexpected places) is due to **Assumed Context**. As the developer, you naturally start in your project folder. But when a user opens a fresh terminal, they start in their Home directory (`~`). If they run `sudo` commands or navigate away, they can easily end up in `/` or `/root`.
 
-### 1. Build and Grant Capabilities
-Husk needs specific kernel capabilities to intercept file reads without running as full root.
+Here are the specific missing links in your current guide:
+1. **No Clone/Directory Step:** The guide never actually tells them to download the code and `cd` into the folder. 
+2. **Relative Paths:** Commands like `./target/release/huskhoard` rely heavily on the user being in the exact right folder. If they aren't, it breaks.
+3. **Ambiguous Configuration:** It's not explicitly clear *where* `husk_config.toml` gets generated or if the paths inside it should be absolute or relative.
+
+Here is a rewritten **Quick Start** section. I have added "guardrails" to ensure they stay in their user directory and know exactly where they are.
+
+***
+
+### Suggested Rewrite for your README
+
+```markdown
+🚀 Quick Start (Ubuntu 24.04)
+
+**⚠️ Important:** Run all commands as your standard user. Do not log in as `root`. HuskHoard is designed to run in user-space.
+
+#### 1. Prerequisites
+Install the required system tools and the Rust compiler on Ubuntu 24.04 LTS:
 
 ```bash
+sudo apt update
+sudo apt install -y build-essential rclone libcap2-bin attr pkg-config libsqlite3-dev git
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+#### 2. Download and Build
+Clone the repository and move into the project directory. **You must remain in this directory for the rest of the tutorial.**
+
+```bash
+git clone -b tape https://github.com/huskhoard/huskhoard.git
+cd huskhoard
+
+# Build the project
 cargo build --release
+```
+
+#### 3. Grant Kernel Capabilities
+HuskHoard needs specific capabilities to intercept file reads via `fanotify` without needing to run as a dangerous root process. Apply these to the newly built binary:
+
+```bash
 sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
 ```
 
-### 2. Format a Volume (Disk or Tape)
-Run this command to initialize a storage target. This also generates your `husk_config.toml`.
+#### 4. Configure Your "Test Environment"
+Let's set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Tape Volume".
+
 ```bash
-# Format a local disk image
+# Ensure you are still in the 'huskhoard' project directory
+mkdir -p hot_tier
+fallocate -l 100M my_hoard.img
+```
+
+Next, format the tape volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
+
+```bash
 ./target/release/huskhoard format --tape-dev my_hoard.img
 
 # OR: Format a physical LTO tape drive
 ./target/release/huskhoard format --tape-dev /dev/nst0
 ```
 
-### 3. Launch the Daemon
+Open the newly generated `husk_config.toml` in your text editor. Update these lines to enable **Instant Archiving** so you can see it work immediately. *(Note: Using absolute paths is highly recommended so the daemon always knows where your data is).*
+
+```toml
+primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_hoard.img"]
+watch_dir = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to your hot tier
+max_age_days = 0 # TEST MODE: Archive files immediately
+janitor_interval_secs = 10
+```
+
+#### 5. Launch the Daemon
+Start the HuskHoard background engine:
+
 ```bash
 ./target/release/huskhoard daemon
 ```
+
+#### 6. Test it
+Leave the daemon running and open a **second terminal window**. 
+
+Drop a large file into `hot_tier`. Wait 10 seconds. 
+* Run `ls -ls hot_tier`. You will see the file's allocated size drop to 4Kb, while its logical size remains intact. 
+* Run `du -h hot_tier`. It has become a Husk. 
+* Open the file, and watch the Daemon instantly recall it from `my_hoard.img`.
+
+---
+
 
 ### 🕹️ Command Center
 
