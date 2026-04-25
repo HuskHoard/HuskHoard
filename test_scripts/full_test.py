@@ -1,9 +1,7 @@
 # This tests all of the main features. run it with sudo. it will launch the huskhoard main and create storage volumes and catalogs.
 # It then populates the volumes and creates replica versions. 
 # the log will print all actions 
-
-
-
+# i know it is a bit heavy on emojis, the test code is %100 ai, but i decided to leave them i now kind of like them
 
 
 
@@ -213,6 +211,159 @@ def main():
             logging.info("   ✅ SUCCESS: Extended attributes survived the tape round-trip!")
         else:
             logging.error(f"❌ FAILED: Xattrs lost! Got: {res.stdout}")
+            
+        # 5.3 Test StreamGate (O(1) Partial Reads across ALL backends)
+        logging.info("🚪 Testing StreamGate (Cross-Volume Verification)...")
+        sg_file = os.path.realpath(os.path.join(HOT_TIER, "streamgate_test.bin"))
+        abs_sg_file = sg_file
+        
+        target_offset = 18 * 1024 * 1024  # 18 MB offset to force it into Frame 2
+        secret_payload = "STREAMGATE_SECRET_PAYLOAD_DATA"
+        
+        # Generate the test file so that it has multiple 16MB frames
+        logging.info("   Writing ~35MB StreamGate test file...")
+        with open(sg_file, "wb") as f:
+            f.write(b"A" * target_offset)
+            f.write(secret_payload.encode("utf-8"))
+            f.write(b"B" * (17 * 1024 * 1024))
+            
+        wait_for_stubbing(sg_file)
+        
+        # Get all Tape UUIDs that hold this file
+        conn = sqlite3.connect(DB_PATH)
+        uuids = conn.execute("SELECT tape_uuid FROM catalog WHERE file_path = ?", (sg_file,)).fetchall()
+        conn.close()
+
+        for (u_id,) in uuids:
+            logging.info(f"   Testing StreamGate on Volume UUID: {u_id}")
+            cat_res = subprocess.run([
+                "sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "cat",
+                "--file-path", sg_file,
+                "--offset", str(target_offset),
+                "--length", str(len(secret_payload)),
+                "--tape-uuid", u_id
+            ], capture_output=True, text=True)
+            
+            if cat_res.stdout == secret_payload:
+                logging.info(f"      ✅ SUCCESS for Volume {u_id}")
+            else:
+                logging.error(f"      ❌ FAILED for Volume {u_id}!")
+        
+        # --- NEW: Dump the DB Jump Table to the test log before we run ---
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT uncompressed_offset, compressed_offset, compressed_size FROM object_frames WHERE file_path = ?", (abs_sg_file,))
+            frames = c.fetchall()
+            logging.info(f"   [DB TELEMETRY] StreamGate Jump Table for {abs_sg_file}:")
+            for idx, f in enumerate(frames):
+                logging.info(f"      Frame {idx}: Uncompressed Start: {f[0]}, Compressed Start: {f[1]}, Compressed Size: {f[2]}")
+            conn.close()
+        except Exception as e:
+            logging.error(f"   [DB TELEMETRY] Failed to read jump table: {e}")
+
+        # --- NEW: Inject RUST_LOG so the Cat process talks to us ---
+        cat_env = os.environ.copy()
+        cat_env["RUST_LOG"] = "debug"
+        cat_env["RUST_BACKTRACE"] = "1"
+
+        cat_res = subprocess.run([
+            "sudo", "-E", "./target/release/huskhoard", "--config", CONFIG_FILE, "cat",
+            "--file-path", abs_sg_file,
+            "--offset", str(target_offset),
+            "--length", str(len(secret_payload))
+        ], capture_output=True, text=True, env=cat_env)
+        
+        if cat_res.stdout == secret_payload:
+            logging.info("   ✅ SUCCESS: StreamGate instantly extracted the exact bytes from Frame 2!")
+        else:
+            logging.error("❌ FAILED: StreamGate extraction error!")
+            logging.error(f"   --- CAT STDOUT ---\n{cat_res.stdout}\n   ------------------")
+            logging.error(f"   --- CAT STDERR ---\n{cat_res.stderr}\n   ------------------")
+        # ---------------------------------------------------------
+        # EDGE CASE BATTERY
+        # ---------------------------------------------------------
+        
+        # Edge Case A: Zero-Byte Files
+        logging.info("👻 Edge Case A: Testing Zero-Byte File Handling...")
+        empty_file = os.path.join(HOT_TIER, "empty_ghost.mp4") # .mp4 triggers immediate archive
+        with open(empty_file, "w") as f:
+            pass # Literally zero bytes
+            
+        if not wait_for_stubbing(empty_file, timeout=30):
+            logging.error("   ❌ FAILED: Zero-byte file failed to stub (Daemon fallocate kernel rejection?)")
+        else:
+            with open(empty_file, "r") as f:
+                if f.read() != "":
+                    logging.error("   ❌ FAILED: Zero-byte file contains garbage data after rehydration!")
+                else:
+                    logging.info("   ✅ SUCCESS: Zero-byte file archived and rehydrated flawlessly.")
+
+        # Edge Case B: O_TRUNC Fast-Path Bypass
+        logging.info("⚡ Edge Case B: Testing O_TRUNC Overwrite Bypass...")
+        bypass_file = os.path.join(HOT_TIER, "fast_bypass.mp4")
+        with open(bypass_file, "w") as f:
+            f.write("OLD DATA")
+        wait_for_stubbing(bypass_file)
+        
+        start_time = time.time()
+        with open(bypass_file, "w") as f: # Python 'w' uses O_TRUNC natively
+            f.write("NEW DATA OVERWRITE")
+        elapsed = time.time() - start_time
+        
+        if elapsed < 0.5:
+            logging.info(f"   ✅ SUCCESS: O_TRUNC instantly bypassed tape read! (Took {elapsed:.4f}s)")
+        else:
+            logging.error(f"   ❌ FAILED: O_TRUNC took too long, likely triggered an unnecessary tape restore. ({elapsed:.4f}s)")
+
+        # Edge Case C: Concurrent Rehydration (Mutex check)
+        import threading
+        logging.info("🏃 Edge Case C: Testing Concurrent Rehydration (Mutex Lock Check)...")
+        race_file = os.path.join(HOT_TIER, "race_condition.mp4")
+        with open(race_file, "w") as f:
+            f.write("RACE_DATA " * 50)
+        wait_for_stubbing(race_file)
+        
+        race_results = []
+        def concurrent_read(tid):
+            try:
+                with open(race_file, "r") as f:
+                    race_results.append(f.read(9) == "RACE_DATA")
+            except Exception as e:
+                logging.error(f"      Thread {tid} crashed: {e}")
+                race_results.append(False)
+                
+        threads = [threading.Thread(target=concurrent_read, args=(i,)) for i in range(5)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        
+        if all(race_results) and len(race_results) == 5:
+            logging.info("   ✅ SUCCESS: 5 concurrent reads safely queued and rehydrated without crashing or locking up!")
+        else:
+            logging.error(f"   ❌ FAILED: Concurrent reads caused corruption or deadlock! Results: {race_results}")
+
+        # Edge Case D: Physical Media Failure (Replica Failover)
+        logging.info("🔥 Edge Case D: Simulating Primary Drive Failure (Seamless Failover)...")
+        failover_file = os.path.join(HOT_TIER, "mission_critical.mp4")
+        with open(failover_file, "w") as f:
+            f.write("CRITICAL DATA")
+        wait_for_stubbing(failover_file)
+        
+        # "Unplug" the primary tape by renaming it
+        logging.info("   'Unplugging' Primary Tape...")
+        run_cmd(["sudo", "mv", TAPE_PRIMARY, TAPE_PRIMARY + ".offline"])
+        
+        try:
+            with open(failover_file, "r") as f:
+                if f.read() == "CRITICAL DATA":
+                    logging.info("   ✅ SUCCESS: Daemon seamlessly caught the missing primary and read from the Replica!")
+                else:
+                    logging.error("   ❌ FAILED: Bad data read during failover.")
+        except Exception as e:
+            logging.error(f"   ❌ FAILED: Application crashed during failover attempt! {e}")
+        finally:
+            # "Plug" it back in so Steps 7 and 8 (Scrubber/Repacker) can finish later
+            run_cmd(["sudo", "mv", TAPE_PRIMARY + ".offline", TAPE_PRIMARY])        
     finally:
         # Stop Daemon Gracefully
         logging.info("🛑 Stopping HuskHoard Daemon safely...")
