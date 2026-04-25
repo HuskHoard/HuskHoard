@@ -17,27 +17,24 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 *   **StreamGate (Direct Streaming):** Watch 4K video or search massive log files directly from Tape or S3 without ever writing the data back to your SSD.
 *   **The "Easy Exit" Promise (No Vendor Lock-in):** Payload data is stored in standard **Zstd** streams verified by **BLAKE3**. You can extract your data using only standard Linux tools (`dd` and `zstd`).
 
-## Features
-
-*   **Native SCSI Tape Driver:** Native hardware-level support for LTO-5 through LTO-9 drives via `/dev/nstX`. Handles rewinding, positioning, and filemarks automatically.
-*   **StreamGate:** Zero-Disk extraction. Pipe archived files directly into `mpv`, `grep`, or `ffmpeg` without taking up any local disk space.
-*   **N-Way Replication:** Automatically mirror cold data across local drives, physical tapes, and cloud buckets simultaneously.
+#### Features
+*   **StreamGate (Indexed Direct Access):** Zero-Disk extraction. Use a Jump-Table to instantly seek to any byte in a 10TB file stored on Tape or S3 without downloading the whole thing. Pipe directly into `mpv`, `grep`, or `ffmpeg`.
+*   **Native SCSI Tape Driver:** Professional-grade support for LTO-5 through LTO-9 drives via `/dev/nstX`. Handles hardware positioning, filemarks, and 256KB block-alignment to prevent "shoe-shining."
+*   **N-Way Replication:** Automatically mirror cold data across local drives, physical tapes, and cloud buckets (via rclone) simultaneously.
 *   **Point-in-Time Recovery (PITR):** Roll back any file to a previous version using the built-in versioning engine.
-*   **Bit-Rot Scrubber:** Cryptographically verify the integrity of your offline storage with BLAKE3 hashes.
+*   **Bit-Rot Scrubber:** Cryptographically verify the integrity of offline storage using BLAKE3 hashes.
 
+#### Hardware-Aware Architecture
+Modern storage requires specialized handling. HuskHoard treats your media differently based on its physics:
+*   **For Physical Tapes:** Writes in 256KB optimal SCSI frames and uses **Filemarks** to navigate. StreamGate uses the catalog to skip hardware blocks, reaching your data in seconds rather than minutes.
+*   **For SMR Hard Drives:** Eliminates the "write wall" by using a Strict Log-Structured Format—data is only ever written sequentially.
+*   **For Cloud (rclone):** Packs data into 16MB Zstd-compressed frames. This optimizes "PUT" request costs and allows for high-speed partial reads via HTTP Range requests.
+*   
 ### Architecture Overview
 *   **The Catalog:** A SQLite "Brain" tracking every file, its version history, and its exact byte-offset on physical media.
 *   **The Interceptor:** A lightweight fanotify loop that detects when an application requests a stubbed file and triggers an instant recall.
 *   **The Janitor:** A background policy engine that identifies cold data based on age, extension, or directory rules.
 *   **The Archive Worker:** The heavy-lifter. It compresses data into seekable frames, multiplexes writes across the storage pool, and manages SCSI hardware commands.
-
----
-## Hardware-Aware Architecture
-
-### Supports CMR, NVMe, SMR & LTO Tape Hardware
-Modern storage requires specialized handling. HuskHoard uses a **Strict Log-Structured Format**:
-*   **For SMR Hard Drives:** Eliminates the "write wall" by writing in one continuous, sequential stream.
-*   **For Physical Tapes:** Uses optimal **256KB SCSI Framing** to prevent "shoe-shining" (frequent stopping/starting), maximizing both performance and the lifespan of your tape heads.
 
 ### Sustainability & Drive Longevity
 *   **Reduced Duty Cycle:** Batching allows archive drives to stay spun down and idle 99% of the time.
@@ -46,23 +43,6 @@ Modern storage requires specialized handling. HuskHoard uses a **Strict Log-Stru
 ### Hybrid Cloud Replication
 Using **rclone** as its transport layer, HuskHoard streams archives to over 40 providers (S3, B2, etc.) in a single pass. Data is packed into optimal 16MB Zstd frames to minimize API "PUT" requests and storage costs.
 
----
-Hi JM. This project looks incredibly cool. Storage tiering is usually a massive headache, and using `fanotify` for a modern, transparent user-space solution is a brilliant approach.
-
-The reason your beta testers are installing things in the root directory (or unexpected places) is due to **Assumed Context**. As the developer, you naturally start in your project folder. But when a user opens a fresh terminal, they start in their Home directory (`~`). If they run `sudo` commands or navigate away, they can easily end up in `/` or `/root`.
-
-Here are the specific missing links in your current guide:
-1. **No Clone/Directory Step:** The guide never actually tells them to download the code and `cd` into the folder. 
-2. **Relative Paths:** Commands like `./target/release/huskhoard` rely heavily on the user being in the exact right folder. If they aren't, it breaks.
-3. **Ambiguous Configuration:** It's not explicitly clear *where* `husk_config.toml` gets generated or if the paths inside it should be absolute or relative.
-
-Here is a rewritten **Quick Start** section. I have added "guardrails" to ensure they stay in their user directory and know exactly where they are.
-
-***
-
-### Suggested Rewrite for your README
-
-```markdown
 🚀 Quick Start (Ubuntu 24.04)
 
 **⚠️ Important:** Run all commands as your standard user. Do not log in as `root`. HuskHoard is designed to run in user-space.
@@ -96,7 +76,7 @@ sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
 ```
 
 #### 4. Configure Your "Test Environment"
-Let's set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Tape Volume".
+Set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Tape Volume".
 
 ```bash
 # Ensure you are still in the 'huskhoard' project directory
