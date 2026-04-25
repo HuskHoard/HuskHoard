@@ -43,7 +43,7 @@ Modern storage requires specialized handling. HuskHoard treats your media differ
 ### Hybrid Cloud Replication
 Using **rclone** as its transport layer, HuskHoard streams archives to over 40 providers (S3, B2, etc.) in a single pass. Data is packed into optimal 16MB Zstd frames to minimize API "PUT" requests and storage costs.
 
-🚀 Quick Start (Ubuntu 24.04)
+###🚀 Quick Start (Ubuntu 24.04)
 
 **⚠️ Important:** Run all commands as your standard user. Do not log in as `root`. HuskHoard is designed to run in user-space.
 
