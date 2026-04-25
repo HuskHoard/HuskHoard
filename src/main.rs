@@ -96,6 +96,8 @@ enum Commands {
         offset: u64,
         #[arg(long)]
         length: Option<u64>,
+        #[arg(long)] // <--- ADD THIS
+        tape_uuid: Option<String>,
     },
     /// Format a raw block device, writing the Volume Header to LBA 0
     Format {
@@ -632,8 +634,8 @@ pub struct ActiveTape {
     pub is_append_only: bool, // Unified boolean for Cloud AND Physical Tapes
 }
 
-// Returns a Vector of successful replicas: (Tape_Offset, Payload_Size, Compressed_Size, Compression_Type, Blake3_Hash_Hex, Tape_UUID, Device_Path)
-fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, use_direct_io: bool) -> std::io::Result<Vec<(u64, u64, u64, u8, String, String, String)>> {
+// Returns a tuple: (Vector of replicas, Vector of StreamGate Frames (UncompressedOffset, CompressedOffset, CompressedSize))
+fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, use_direct_io: bool) -> std::io::Result<(Vec<(u64, u64, u64, u8, String, String, String)>, Vec<(u64, u64, u64)>)> {
     info!("Archiving '{}'...", source_path);
 
     let mut src_file = File::open(source_path)?;
@@ -743,6 +745,8 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
     let final_compressed_size: u64;
     let final_padded_size: u64;
 
+    let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
+
     {
         let tape_refs: Vec<&mut dyn std::io::Write> = active_tapes
             .iter_mut()
@@ -754,6 +758,9 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
         let mut io_buf = vec![0; 1024 * 1024]; // 1MB buffer
         let chunk_size = 16 * 1024 * 1024; // 16MB Frame boundaries for StreamGate
         let mut current_frame_bytes = 0;
+        
+        let mut uncompressed_start = 0;
+        let mut compressed_start = 0;
 
         let mut encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?; 
 
@@ -765,16 +772,29 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
             encoder.write_all(&io_buf[..n])?;
             current_frame_bytes += n;
             
-            // Break the "Zstd Wall": Finish independent frames every 16MB
             if current_frame_bytes >= chunk_size {
                 encoder.finish()?;
-                encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?;
+                
+                let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
+                let compressed_size = current_compressed_offset - compressed_start;
+                jump_table.push((uncompressed_start, compressed_start, compressed_size));
+                
+                uncompressed_start += current_frame_bytes as u64;
+                compressed_start = current_compressed_offset;
                 current_frame_bytes = 0;
+                
+                encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?;
             }
         }
         encoder.finish()?;
+        
+        let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
+        let compressed_size = current_compressed_offset - compressed_start;
+        if compressed_size > 0 {
+            jump_table.push((uncompressed_start, compressed_start, compressed_size));
+        }
 
-        final_compressed_size = tape_writer.bytes_written + tape_writer.cursor as u64;
+        final_compressed_size = current_compressed_offset;
         tape_writer.pad_and_flush()?;
         final_padded_size = tape_writer.bytes_written;
     }
@@ -830,6 +850,22 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
             }
         }
 
+        // NEW Type 0x03: Pack StreamGate Jump Table (Array of u32 compressed sizes)
+        // Note: 16MB frames mean we only need 4 bytes per frame. A 10GB file only needs ~600 frames (2.4KB).
+        let frames_payload_len = jump_table.len() * 4;
+        if tlv_offset + 4 + frames_payload_len <= header.tlv_data.len() {
+            header.tlv_data[tlv_offset] = 0x00; header.tlv_data[tlv_offset+1] = 0x03;
+            header.tlv_data[tlv_offset+2..tlv_offset+4].copy_from_slice(&(frames_payload_len as u16).to_be_bytes());
+            
+            let mut p = tlv_offset + 4;
+            for (_, _, c_size) in &jump_table {
+                // Compress size fits easily in u32 since max frame is ~16MB
+                header.tlv_data[p..p+4].copy_from_slice(&(*c_size as u32).to_be_bytes());
+                p += 4;
+            }
+            // tlv_offset += 4 + frames_payload_len; // Removed to silence compiler warning
+        }
+
         let mut crc = Crc32Hasher::new();
         crc.update(bytemuck::bytes_of(&header));
         header.header_crc32 = crc.finalize();
@@ -857,7 +893,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
         payload_size, 
         final_compressed_size
     );
-    Ok(results)
+    Ok((results, jump_table))
 }
 // ---------------------------------------------------------
 // 4. The "RawRead" Restorer Logic (With Zstd Decoder)
@@ -917,16 +953,23 @@ impl<W: std::io::Write> std::io::Write for SkipWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
-fn cat_file(db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool) -> std::io::Result<()> {
+fn cat_file(db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool, target_uuid: Option<&str>) -> std::io::Result<()> {
     let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB Open Failed"))?;
     
-    // Locate the latest version of the file
-    let (tape_uuid, tape_offset, db_comp, db_type, padded_size): (String, u64, u64, u8, u64) = conn.query_row(
-        "SELECT tape_uuid, tape_offset, compressed_size, compression_type, ((compressed_size + 4095) / 4096) * 4096 
-         FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 1",
-        params![file_path],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-    ).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "File not found in catalog"))?;
+    // Locate the latest version of the file, optionally on a specific tape
+    let query = if target_uuid.is_some() {
+        "SELECT tape_uuid, tape_offset, compressed_size, compression_type, payload_size, version 
+         FROM catalog WHERE file_path = ?1 AND tape_uuid = ?2 ORDER BY version DESC LIMIT 1"
+    } else {
+        "SELECT tape_uuid, tape_offset, compressed_size, compression_type, payload_size, version 
+         FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 1"
+    };
+
+    let (tape_uuid, tape_offset, db_comp, db_type, payload_size, version): (String, u64, u64, u8, u64, u32) = if let Some(uuid) = target_uuid {
+        conn.query_row(query, params![file_path, uuid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+    } else {
+        conn.query_row(query, params![file_path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+    }.map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "File/Tape combination not found"))?;
 
     let tape_dev: String = conn.query_row(
         "SELECT device_path FROM tapes WHERE tape_uuid = ?1",
@@ -935,54 +978,182 @@ fn cat_file(db_path: &str, file_path: &str, offset: u64, length: Option<u64>, us
 
     let is_char_dev = std::fs::metadata(&tape_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
 
+    // --- STREAMGATE MATH (Jump Table Lookup) ---
+    let req_start = offset;
+    let req_end = length.map(|l| offset + l).unwrap_or(payload_size);
+    
+    let mut stmt = conn.prepare("SELECT uncompressed_offset, compressed_offset, compressed_size FROM object_frames WHERE file_path = ?1 AND version = ?2 ORDER BY uncompressed_offset ASC").unwrap();
+    let frames: Vec<(u64, u64, u64)> = stmt.query_map(params![file_path, version], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().filter_map(Result::ok).collect();
+
+    let mut target_c_offset = 0;
+    let mut target_c_len = ((db_comp + 4095) / 4096) * 4096; // Default to reading padded EOF
+    let mut skip_bytes = offset;
+
+    info!("[StreamGate] Requested file: {}, version: {}, offset: {}, length: {:?}", file_path, version, offset, length);
+
+    if db_type == 1 && !frames.is_empty() {
+        let mut start_idx = 0;
+        let mut end_idx = frames.len() - 1;
+
+        for (i, f) in frames.iter().enumerate() {
+            if f.0 <= req_start { start_idx = i; }
+            if f.0 < req_end { end_idx = i; }
+        }
+
+        target_c_offset = frames[start_idx].1;
+        let final_frame = &frames[end_idx];
+        target_c_len = (final_frame.1 + final_frame.2) - target_c_offset;
+        skip_bytes = req_start - frames[start_idx].0;
+        
+        info!("[StreamGate] Frames found: {}. Selected range {} to {}", frames.len(), start_idx, end_idx);
+        info!("[StreamGate] Compressed Target Offset: {}, Target Length: {}", target_c_offset, target_c_len);
+        info!("[StreamGate] Uncompressed Bytes to Skip from Frame Start: {}", skip_bytes);
+    }
+
+    let abs_start_offset = tape_offset + 4096 + target_c_offset;
+
+    // --- FIX: O_DIRECT BLOCK ALIGNMENT ---
+    // We must seek and read in multiples of 4096.
+    let aligned_offset = abs_start_offset - (abs_start_offset % 4096);
+    let alignment_skew = (abs_start_offset % 4096) as usize;
+    
+    info!("[StreamGate] Absolute Start Offset: {} (Aligned: {}, Skew: {})", abs_start_offset, aligned_offset, alignment_skew);
+    
+    let total_bytes_to_read = alignment_skew as u64 + target_c_len;
+    let padded_target_c_len = if total_bytes_to_read % 4096 == 0 {
+        total_bytes_to_read
+    } else {
+        total_bytes_to_read + 4096 - (total_bytes_to_read % 4096)
+    };
+
+    // --- STORAGE READER SPAWN ---
     let mut tape: StorageReader = if tape_dev.starts_with("rclone:") {
         let clean_remote = tape_dev.strip_prefix("rclone:").unwrap();
         let object_path = format!("{}/husk_{}.bin", clean_remote, tape_offset);
-        let mut child = Command::new("rclone").arg("cat").arg(&object_path).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        
+        // FIX: Rclone objects are individual files, not one giant tape. 
+        // We must convert the absolute virtual tape offset into a file-relative offset!
+        let file_relative_offset = aligned_offset - tape_offset;
+        
+        info!("[StreamGate] Spawning Rclone -> cat {} --offset {} --count {}", object_path, file_relative_offset, padded_target_c_len);
+        
+        let mut cmd = Command::new("rclone");
+        cmd.arg("cat")
+           .arg("--offset").arg(file_relative_offset.to_string())
+           .arg("--count").arg(padded_target_c_len.to_string())
+           .arg(&object_path);
+           
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         StorageReader::Rclone(child.stdout.take().unwrap(), child)
+        
     } else if is_char_dev {
-        let f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
+        let mut f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
         let fd = f.as_raw_fd();
         let file_index: i32 = conn.query_row("SELECT COUNT(*) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2", params![tape_uuid, tape_offset], |row| row.get(0)).unwrap_or(0);
         let _ = send_mtio_cmd(fd, MTREW, 1);
         if file_index > 0 { let _ = send_mtio_cmd(fd, MTFSF, file_index); }
+        
+        let mut discard_buf = AlignedBuffer::new(ALIGNMENT * 256);
+        let mut bytes_to_discard = (4096 + target_c_offset) - alignment_skew as u64;
+        while bytes_to_discard > 0 {
+            let chunk = std::cmp::min(bytes_to_discard, discard_buf.capacity as u64) as usize;
+            f.read_exact(&mut discard_buf.as_mut_slice()[..chunk])?;
+            bytes_to_discard -= chunk as u64;
+        }
         StorageReader::Local(f)
     } else {
         let mut f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
-        f.seek(SeekFrom::Start(tape_offset))?;
+        f.seek(SeekFrom::Start(aligned_offset))?;
         StorageReader::Local(f)
     };
-
-    let mut header_buf = AlignedBuffer::new(ALIGNMENT);
-    tape.read_exact(header_buf.as_mut_slice())?; // Discard header (we just need the payload)
 
     let stdout = std::io::stdout();
     let mut out_handle = stdout.lock();
     
-    // Wrap stdout in our SkipWriter to handle seeking
-    let skip_writer = SkipWriter { inner: &mut out_handle, bytes_to_skip: offset, bytes_written: 0, limit: length };
-    let mut io_buf = AlignedBuffer::new(ALIGNMENT * 256);
-    let mut bytes_read: u64 = 0;
+    let mut skip_writer = SkipWriter { inner: &mut out_handle, bytes_to_skip: skip_bytes, bytes_written: 0, limit: length };
+
+    // Struct encapsulating O_DIRECT blocks, skews, and EOF logic safely.
+    struct AlignedTapeReader<'a> {
+        tape: &'a mut StorageReader,
+        io_buf: AlignedBuffer,
+        buf_start: usize,
+        buf_end: usize,
+        alignment_skew: usize,
+        skew_discarded: usize, // <--- NEW: Tracks fragmented skew discarding
+        target_c_len: usize,
+        bytes_produced: usize,
+    }
+
+    impl<'a> std::io::Read for AlignedTapeReader<'a> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // Stop providing bytes once we've fulfilled the exact compressed frame length
+            if self.bytes_produced >= self.target_c_len {
+                return Ok(0); 
+            }
+
+            // 1. Safely discard the alignment skew, tolerating highly fragmented stream reads
+            while self.skew_discarded < self.alignment_skew {
+                if self.buf_start >= self.buf_end {
+                    let to_read = self.io_buf.capacity;
+                    let n = self.tape.read(&mut self.io_buf.as_mut_slice()[..to_read])?;
+                    if n == 0 { return Ok(0); } // Unexpected early EOF
+                    self.buf_start = 0;
+                    self.buf_end = n;
+                }
+                
+                let available = self.buf_end - self.buf_start;
+                let to_discard = std::cmp::min(available, self.alignment_skew - self.skew_discarded);
+                
+                self.buf_start += to_discard;
+                self.skew_discarded += to_discard;
+            }
+
+            // 2. Read actual compressed payload (Replenish if buffer empty)
+            if self.buf_start >= self.buf_end {
+                let to_read = self.io_buf.capacity;
+                let n = self.tape.read(&mut self.io_buf.as_mut_slice()[..to_read])?;
+                if n == 0 { return Ok(0); }
+                self.buf_start = 0;
+                self.buf_end = n;
+            }
+
+            // 3. Serve the target payload, clamped by remaining target_c_len
+            let available = self.buf_end - self.buf_start;
+            let remaining = self.target_c_len - self.bytes_produced;
+            let chunk = std::cmp::min(std::cmp::min(buf.len(), available), remaining);
+
+            if chunk > 0 {
+                buf[..chunk].copy_from_slice(&self.io_buf.as_slice()[self.buf_start .. self.buf_start + chunk]);
+                self.buf_start += chunk;
+                self.bytes_produced += chunk;
+            }
+            
+            Ok(chunk)
+        }
+    }
+
+    let mut aligned_reader = AlignedTapeReader {
+        tape: &mut tape,
+        io_buf: AlignedBuffer::new(ALIGNMENT * 256), // 1MB properly aligned block for O_DIRECT
+        buf_start: 0,
+        buf_end: 0,
+        alignment_skew,
+        skew_discarded: 0, // <--- Initialize our new tracker
+        target_c_len: target_c_len as usize,
+        bytes_produced: 0,
+    };
 
     if db_type == 1 {
-        let mut decoder = zstd::stream::write::Decoder::new(skip_writer)?;
-        while bytes_read < padded_size {
-            let chunk = std::cmp::min(padded_size - bytes_read, io_buf.capacity as u64) as usize;
-            tape.read_exact(&mut io_buf.as_mut_slice()[..chunk])?;
-            let valid_compressed = if bytes_read + chunk as u64 > db_comp { db_comp.saturating_sub(bytes_read) as usize } else { chunk };
-            if valid_compressed > 0 { decoder.write_all(&io_buf.as_slice()[..valid_compressed])?; }
-            bytes_read += chunk as u64;
-        }
-        decoder.flush()?;
+        info!("[StreamGate] Launching Zstd Read-Decoder on Target Frames...");
+        let mut decoder = zstd::stream::read::Decoder::new(aligned_reader)?;
+        std::io::copy(&mut decoder, &mut skip_writer)?;
+        skip_writer.flush()?;
+        info!("[StreamGate] StreamGate Extraction Complete!");
     } else {
-        let mut raw_writer = skip_writer;
-        while bytes_read < padded_size {
-            let chunk = std::cmp::min(padded_size - bytes_read, io_buf.capacity as u64) as usize;
-            tape.read_exact(&mut io_buf.as_mut_slice()[..chunk])?;
-            raw_writer.write_all(&io_buf.as_slice()[..chunk])?;
-            bytes_read += chunk as u64;
-        }
-        raw_writer.flush()?;
+        info!("[StreamGate] Copying raw uncompressed bytes...");
+        std::io::copy(&mut aligned_reader, &mut skip_writer)?;
+        skip_writer.flush()?;
+        info!("[StreamGate] StreamGate Extraction Complete!");
     }
 
     Ok(())
@@ -1535,7 +1706,7 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                 if !is_stubbed {
                     info!("[Worker] Processing Cold File: {}", path_str);
                     match archive_file(&conn, &path_str, &config, use_direct_io) {
-                        Ok(replica_list) => {
+                        Ok((replica_list, jump_table)) => {
                             let next_version: i64 = conn.query_row(
                                 "SELECT COALESCE(MAX(version), 0) + 1 FROM catalog WHERE file_path = ?1",
                                 params![path_str], |row| row.get(0),
@@ -1557,8 +1728,23 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                                 );
                             }
 
+                            // NEW: Store Jump Table for StreamGate
+                            for (u_off, c_off, c_size) in jump_table {
+                                let _ = conn.execute(
+                                    "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                    params![path_str, next_version, u_off, c_off, c_size]
+                                );
+                            }
+
                             let _ = conn.execute(
                                 "DELETE FROM catalog WHERE file_path = ?1 AND version NOT IN (
+                                    SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
+                                )", params![path_str, config.max_versions]
+                            );
+                            
+                            // Cleanup old StreamGate frames
+                            let _ = conn.execute(
+                                "DELETE FROM object_frames WHERE file_path = ?1 AND version NOT IN (
                                     SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
                                 )", params![path_str, config.max_versions]
                             );
@@ -1585,7 +1771,7 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                     let _ = std::fs::remove_file(&backup_path);
                     
                     if conn.execute(&format!("VACUUM INTO '{}'", backup_path), []).is_ok() {
-                        if let Ok(results) = archive_file(&conn, &backup_path, &config, use_direct_io) {
+                        if let Ok((results, _)) = archive_file(&conn, &backup_path, &config, use_direct_io) {
                             let special_path = "__HUSK_CATALOG_BACKUP__";
                             let next_ver: i64 = conn.query_row(
                                 "SELECT COALESCE(MAX(version), 0) + 1 FROM catalog WHERE file_path = ?1",
@@ -1682,9 +1868,39 @@ fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::i
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash) 
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![filename, 1, tape_dev, offset, header.payload_size, header.compressed_size, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
+                params![&filename, 1, tape_dev, offset, header.payload_size, header.compressed_size, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
             );
             
+            // NEW: Recover StreamGate Jump Table from TLV
+            let mut tlv_offset = 0;
+            while tlv_offset + 4 <= header.tlv_data.len() {
+                let t_type = u16::from_be_bytes([header.tlv_data[tlv_offset], header.tlv_data[tlv_offset+1]]);
+                let t_len = u16::from_be_bytes([header.tlv_data[tlv_offset+2], header.tlv_data[tlv_offset+3]]) as usize;
+                if t_type == 0 || tlv_offset + 4 + t_len > header.tlv_data.len() { break; }
+                
+                if t_type == 0x03 {
+                    let frame_count = t_len / 4;
+                    let mut p = tlv_offset + 4;
+                    let mut u_off: u64 = 0;
+                    let mut c_off: u64 = 0;
+                    
+                    for _ in 0..frame_count {
+                        if p + 4 > header.tlv_data.len() { break; }
+                        let c_size = u32::from_be_bytes([header.tlv_data[p], header.tlv_data[p+1], header.tlv_data[p+2], header.tlv_data[p+3]]) as u64;
+                        
+                        let _ = conn.execute(
+                            "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![&filename, 1, u_off, c_off, c_size]
+                        );
+                        
+                        u_off += 16 * 1024 * 1024; // 16MB steps
+                        c_off += c_size;
+                        p += 4;
+                    }
+                }
+                tlv_offset += 4 + t_len;
+            }
+
             recovered_count += 1;
             
             // Jump forward by the padded size + the header size
@@ -2134,10 +2350,9 @@ fn main() {
             }
         }
         
-        Commands::Cat { file_path, offset, length } => {
-            // Disable logging so it doesn't corrupt stdout binary streams
-            log::set_max_level(log::LevelFilter::Off);
-            if let Err(e) = cat_file(&config_arc.db_path, file_path, *offset, *length, use_direct_io) {
+        Commands::Cat { file_path, offset, length, tape_uuid } => {
+            log::set_max_level(log::LevelFilter::Debug);
+            if let Err(e) = cat_file(&config_arc.db_path, file_path, *offset, *length, use_direct_io, tape_uuid.as_deref()) {
                 eprintln!("Cat failed: {}", e);
             }
         }
@@ -2165,14 +2380,16 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     let fd = file.as_raw_fd();
 
     // 1. Punch a hole through the entire file using Linux fallocate
-    // FALLOC_FL_PUNCH_HOLE (0x02) | FALLOC_FL_KEEP_SIZE (0x01)
-    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-    let ret = unsafe {
-        libc::fallocate(fd, mode, 0, file_size as libc::off_t)
-    };
+    // Kernel rejects fallocate length of 0 with EINVAL, so skip it for empty files
+    if file_size > 0 {
+        let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        let ret = unsafe {
+            libc::fallocate(fd, mode, 0, file_size as libc::off_t)
+        };
 
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     
     // Explicitly drop/close the file descriptor before restoring timestamps
@@ -2283,6 +2500,19 @@ fn init_catalog(db_path: &str) -> SqlResult<Connection> {
         )",
         [],
     )?;
+    
+    // NEW: StreamGate Frame Index
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS object_frames (
+            file_path TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            uncompressed_offset INTEGER NOT NULL,
+            compressed_offset INTEGER NOT NULL,
+            compressed_size INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_frames ON object_frames (file_path, version);", [])?;
     
     Ok(conn)
 }
