@@ -67,8 +67,15 @@ Here are the specific missing links in your current guide:
 2. **Relative Paths:** Commands like `./target/release/huskhoard` rely heavily on the user being in the exact right folder. If they aren't, it breaks.
 3. **Ambiguous Configuration:** It's not explicitly clear *where* `husk_config.toml` gets generated or if the paths inside it should be absolute or relative.
 
+### 🐧 OS Compatibility & Requirements
+HuskHoard relies on the Linux **fanotify** kernel API. It is compatible with almost any modern Linux distribution using **Kernel 5.1 or higher**.
 
-##🚀 Quick Start (Ubuntu 24.04)
+*   **Primary Support:** Ubuntu 22.04 LTS, 24.04 LTS (Recommended)
+*   **Enterprise/Server:** Debian 11/12, Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9
+*   **Desktop/Rolling:** Arch Linux, Fedora 38+, openSUSE Tumbleweed
+*   **Incompatible:** WSL2 (Windows Subsystem for Linux), CentOS 7 (Kernel too old), Synology/QNAP (unless using custom kernels).
+
+##🚀 Quick Start** (Ubuntu 24.04)
 
 **⚠️ Important:** Run all commands as your standard user. Do not log in as `root`. HuskHoard is designed to run in user-space.
 
