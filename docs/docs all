@@ -1,0 +1,709 @@
+
+
+### Section 1: Introduction & Philosophy (`index.md`)
+
+# Introduction
+
+**HuskHoard** is a Hybrid User-Space Storage Kernel designed to solve the "NVMe Capacity Gap." It provides transparent, automated data tiering for Linux, allowing you to treat slow, high-capacity storage (**HDDs, Physical LTO Tape, Cloud Buckets**) as a seamless extension of your high-speed SSD.
+
+## The Problem
+Modern storage is polarized. NVMe SSDs are fast but small. Enterprise storage (LTO Tape, S3, Cold HDDs) is cheap and massive but requires specialized tools and manual management.
+
+## The HuskHoard Solution
+HuskHoard automates this process using **Transparent Stubbing** and **StreamGate**:
+1.  **The Husk:** Moves cold data to a storage pool and "punches a hole" in the SSD file.
+2.  **The Recall:** Intercepts reads and rehydrates files in real-time.
+3.  **StreamGate:** Allows you to stream massive files (videos, logs) directly from tape/cloud to an application **without** ever writing them back to your SSD.
+
+## Our Philosophy
+*   **Sequential-First:** We treat all archive media like Tape. By writing sequentially, we eliminate the "write-wall" of SMR drives and natively support LTO-5 through LTO-9 hardware.
+*   **Zero-Disk Footprint:** With StreamGate, your SSD capacity no longer limits the size of the files you can "watch" or "process."
+*   **Hardware Native:** Direct SCSI `ioctl` support for physical tape drives and `O_DIRECT` for block devices.
+
+
+---
+
+
+### Section 2: Architecture (`architecture.md`)
+
+# Architecture
+
+## Core Components
+
+### 0. The HTTP Gateway (VLC / Plex Bridge)
+The Gateway is a lightweight, zero-copy HTTP/1.1 server that listens on `127.0.0.1`. It translates standard HTTP Range requests from media players into StreamGate seek commands. This allows HuskHoard to act as a local "Cloud Provider" for media servers without using a FUSE mount.
+
+### 1. The Interceptor (fanotify)
+Uses the Linux `fanotify` kernel API to block processes attempting to read "Stubbed" files. It triggers the **Rehydration** engine and releases the process once the data is available.
+
+#### 2. StreamGate: The Indexed Direct Pipe
+Unlike standard archivers that require you to decompress a file from the beginning, HuskHoard implements **StreamGate**. 
+*   **Frame-Based Compression:** Files are compressed into independent 16MB Zstd frames.
+*   **The Jump Table:** During the archival process, HuskHoard records the exact byte-offset of every 16MB frame in the SQLite catalog.
+*   **O(1) Seeking:** When you request a partial read (e.g., via `cat --offset`), HuskHoard calculates which frame contains that byte, seeks the hardware (Tape/Disk) or Cloud stream directly to that frame, and begins decoding. This enables instant seeking in massive media files.
+
+### 3. The Archive Worker (SCSI & Cloud Driver)
+The Worker manages the hardware interface:
+*   **LTO Tape Driver:** Sends SCSI commands (`Rewind`, `Space to End`, `Filemark`) to physical tape drives.
+*   **SCSI Block Driver:** Optimized 256KB-aligned writes for hardware compatibility.
+*   **Cloud Driver:** Multiplexed streaming to `rclone` remotes.
+
+### 4. The Catalog (SQLite)
+The Catalog is the "Brain." It tracks every version of every file and its exact byte-offset on your "tapes." 
+> **Resilience Note:** The Catalog is periodically backed up to the archive volumes themselves. This creates a "Database Anchor," allowing for total disaster recovery even if the host SSD is wiped.
+
+#### 5. Disaster Recovery: The "Database Anchor"
+HuskHoard follows the **Easy Exit** philosophy. You are never locked into the database.
+*   **Catalog Mirroring:** After every archive session, the SQLite database is vacuumed and mirrored onto the primary archive volumes themselves. 
+*   **Deep Scan Rebuild:** In the event of a total host SSD failure, HuskHoard can perform a "Deep Scan" of any tape or archive disk. It reads the 4KB Object Headers directly from the media to reconstruct a perfect, version-accurate SQLite catalog from scratch.
+
+---
+
+### Section 3: Getting Started (`installation.md`)
+
+# Getting Started
+
+## Prerequisites
+HuskHoard requires a modern Linux Kernel (5.1+ recommended) with `fanotify` support enabled.
+
+### Required Tools
+On Ubuntu 24.04 or similar, install the following:
+```bash
+sudo apt update
+sudo apt install -y build-essential rclone libcap2-bin pkg-config libsqlite3-dev
+```
+
+## 1. Installation
+Currently, HuskHoard is distributed as source. Clone the repository and build using Rust:
+
+```bash
+git clone https://github.com/your-username/huskhoard
+cd huskhoard
+cargo build --release
+```
+
+## 2. Granting Permissions
+HuskHoard needs to intercept kernel events. While you can run it as `root`, we recommend granting specific capabilities to the binary so it can run securely:
+
+```bash
+sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
+```
+
+## 3. Initial Configuration
+Running the binary for the first time will generate a `husk_config.toml` file in your current directory.
+
+```bash
+./target/release/huskhoard daemon
+```
+
+Edit `husk_config.toml` to define your tiers and policies:
+*   `hot_tier`: The folder on your SSD you want to manage.
+*   `primary_volumes`: The path to your primary HDD or disk images.
+*   `failover_volumes`: (Optional) Drives to use automatically if the primary is full or disconnected.
+*   `replication_volumes`: (Optional) Your `rclone` cloud remotes (e.g., `["rclone:s3:my-bucket"]`).
+*   `janitor_schedule_time`: Set a specific time for archival (e.g., `"02:00"` for 2 AM), or `"none"` to use an interval.
+
+## 4. Formatting your First Volume
+Before HuskHoard can write to a disk or image, it must be formatted with the **USTD Volume Header**:
+Note this is for test for production see 8. production.md
+
+```bash
+# Create a 1GB dummy volume for testing
+fallocate -l 1G my_archive.img
+
+# Format it
+./target/release/huskhoard format --tape-dev my_archive.img
+```
+
+## 5. Running the Daemon
+Start the engine:
+```bash
+./target/release/huskhoard daemon
+```
+
+
+
+### Section 4: Volume Management (`volumes.md`)
+
+# Volume Management
+
+## 1. Physical LTO Tape Support
+HuskHoard provides native support for professional LTO Tape drives.
+*   **Device Path:** Use the non-rewinding character device (e.g., `/dev/nst0`).
+*   **Hardware Management:** HuskHoard automatically manages tape positioning. It uses `MTREW` to rewind, `MTEOM` to find the end of data for appending, and `MTFSF` (Forward Space File) to instantly jump to specific files using hardware filemarks.
+*   **SCSI Framing:** Writes are buffered into 256KB frames, the industry standard for preventing "shoe-shining" (frequent stopping/starting) and maximizing tape head life.
+
+## 2. Hard Drives (SMR vs. CMR)
+HuskHoard is **SMR-Native**. By writing data in one continuous log, it avoids the performance issues associated with Shingled Magnetic Recording.
+
+## 3. Hardware Identity (Serials & Models)
+HuskHoard tracks your "tapes" regardless of how they are connected:
+*   **HDDs:** Tracked by factory serial number via `/sys/block`.
+*   **LTO Tapes:** Tracked by SCSI Model/Inquiry data via `/sys/class/scsi_tape`.
+*   **Cloud:** Tracked by a unique Hash-UUID generated from the `rclone` remote path.
+
+
+## 4. Hardware Identity (UUIDs & Serials)
+HuskHoard does not rely on fragile Linux device paths like `/dev/sdb1`. 
+*   **Volume UUIDs:** Every formatted volume has a unique ID stored in its 4KB header.
+*   **Hardware Serials:** For physical drives, HuskHoard records the factory serial number.
+*   **Auto-Rescan:** If you move a USB drive to a different port, HuskHoard will scan `/sys/block` at startup, find the serial number, and automatically update the Catalog with the new path.
+
+## 5. The Cold Library: Shelf Management
+HuskHoard was designed with the understanding that you may have more data than you have SATA ports. It treats your archive drives like a **Tape Library**, where volumes can be "Ejected" and stored on a shelf.
+
+### Persistent Hardware Identity
+When you format a volume, HuskHoard captures two critical pieces of metadata:
+1.  **Volume UUID:** A unique software identifier stored in the USTD Header.
+2.  **Drive Serial Number:** The factory hardware ID (e.g., `WDC_WD140EDGZ_ZEK12345`) pulled from the disk controller.
+
+This information is stored permanently in your `husk_catalog.db`. If you unplug a drive, the Catalog does not forget it; it simply marks it as **OFFLINE**.
+
+### Handling Offline Recalls
+If a user or application attempts to read a "Husk" file that resides on a drive currently sitting on your shelf, the following happens:
+
+1.  **The Interceptor Pauses:** The application requesting the file is placed in a "wait" state by the Kernel.
+2.  **The Daemon Alerts:** The HuskHoard daemon detects that the required Volume UUID is not currently mounted.
+3.  **The CLI Prompt:** The daemon logs a high-priority alert to the terminal and system logs:
+    > `⚠️  OFFLINE RECALL: File 'family_photo_2012.raw' is stored on an offline volume.`  
+    > `👉  PLEASE INSERT: Volume UUID [c659bb93] (Drive Serial: ZEK12345)`
+4.  **Auto-Resume:** As soon as you plug the drive into **any** USB or SATA port, the daemon rescans, identifies the Serial/UUID, and automatically resumes the rehydration. The application that was "frozen" will suddenly receive its data and continue without crashing.
+
+### Ejecting Drives Safely
+Because HuskHoard uses `O_DIRECT` and performs sequential writes, it is very "safe" for removable media. To eject a drive:
+1. Ensure the **Archive Worker** is idle (check logs).
+2. Use standard Linux eject commands: `sudo eject /dev/sdX`.
+3. HuskHoard will continue to show the files in your `hot_tier`, preserving your ability to browse your library even when the "tapes" are offline.
+
+
+### Section 5: User Guides (`usage.md`)
+
+# User Guides
+
+Once the HuskHoard daemon is running, it operates largely in the background. However, you have full control over the archival policies and recovery process.
+
+## 1. Controlling Archival Policies
+Archive behavior is defined in `husk_config.toml`.
+
+### Scheduling the Janitor
+You can control exactly when HuskHoard consumes system resources to archive data. For production, schedule it to run at night. For testing, use an interval.
+```toml
+# Run once a day at 2:00 AM
+janitor_schedule_time = "02:00" 
+```
+
+Or set to "none" to run continuously based on an interval
+```toml
+janitor_schedule_time = "none"
+janitor_interval_secs = 60
+```
+### Age-Based Archiving
+The most common use case is archiving files once they haven't been touched for a certain period.
+
+```Toml
+max_age_days = 30 # Files not accessed in 30 days become Husks
+```
+### Immediate Archiving
+Some files (like raw video footage or ISOs) should never take up SSD space. You can force these to archive as soon as the Janitor sees them:
+```toml
+immediate_archive_extensions = ["mp4", "mkv", "iso", "zip"]
+immediate_archive_dirs = ["/ArchiveDrop/"]
+```
+
+## 2. Restoring Data
+HuskHoard provides two ways to get your data back.
+
+### A. Transparent Rehydration (The "Just Open It" Method)
+Simply open the file in any application (VLC, Image Viewer, Text Editor). HuskHoard will intercept the read, fetch the data from the Hoard, and fill the "Hole" on your SSD. The application will continue as if the file was always there.
+
+### B. Manual CLI Restore (PITR)
+HuskHoard maintains a history of your files. If you accidentally overwrite a file and want the version from three days ago, use the `restore` command:
+```bash
+./huskhoard restore --file-path /home/jm/report.pdf --dest-path ./recovered.pdf --version 1
+```
+
+## 3. Monitoring Volume Health
+Use the `info` command to see the "Tank Gauge" of your storage volumes.
+```bash
+./huskhoard info --tape-dev /dev/sdb
+```
+This will display:
+*   **Physical Usage:** How much of the drive is physically written.
+*   **Active Data:** How much of that data represents current files.
+*   **Reclaimable Space:** Space occupied by old versions or deleted files that can be recovered by running a **Repack**.
+
+## 4. Understanding Log Levels
+If you are troubleshooting, change the `log_level` in your config:
+*   `error`: Only show critical failures.
+*   `info`: Default. Shows archival and restore activity.
+*   `debug`: Shows detailed fanotify events and database queries.
+
+#### 5. StreamGate: Direct Access vs. Rehydration
+HuskHoard offers two distinct ways to access your archived data:
+
+| Feature | **Transparent Rehydration** | **StreamGate (CLI)** |
+|:---|:---|:---|
+| **Trigger** | Double-click or `cp` the file | `huskhoard cat` |
+| **SSD Space** | File is written back to SSD | **Zero SSD space used** |
+| **Best For** | Editing files, small documents | 4K Video, Log analysis, ISOs |
+
+#### 6. Partial Reads & Seeking (StreamGate)
+Because HuskHoard uses indexed 16MB Zstd frames, you can jump to specific parts of massive files instantly.
+
+**Extract the last 500MB of a 50GB Archive:**
+```bash
+# Calculate your offset and pipe to a local file
+./huskhoard cat --file-path big_backup.tar --offset 49500000000 > tail_fragment.tar
+```
+
+**Watch a movie starting at the 1-hour mark:**
+```bash
+# Assuming 1GB roughly equals 30 mins for high-bitrate video
+./huskhoard cat --file-path movie.mkv --offset 2000000000 | mpv -
+```
+
+**Verify data on a specific Replica:**
+If you have multiple tapes and suspect one is failing, you can force StreamGate to read from a specific Volume UUID:
+```bash
+./huskhoard cat --file-path sensitive_data.bin --tape-uuid "550e8400-e29b-41d4-a716-446655440000"
+```
+
+
+
+
+---
+
+
+
+### Section 6: Maintenance & Disaster Recovery (`maintenance.md`)
+
+# Maintenance & Disaster Recovery
+
+HuskHoard is built with a "Data-First" mentality. We assume that SSDs will fail, databases will get corrupted, and bit-rot is inevitable. These tools are designed to protect you from those realities.
+
+## 1. Bit-Rot Protection (The Scrubber)
+Over years of storage, magnetic bits on a hard drive can "flip," causing silent data corruption. HuskHoard stops this by cryptographically signing every object with a **BLAKE3 hash**.
+
+Run the scrubber periodically (e.g., once a month) to verify your archive:
+```bash
+./huskhoard scrub --tape-dev /dev/sdb
+```
+The Scrubber will:
+1. Read every header and verify the CRC32 checksum.
+2. Decompress the data stream in memory.
+3. Re-calculate the BLAKE3 hash and compare it to the original.
+4. Report exactly which files (if any) have been corrupted.
+
+## 2. Reclaiming Space (The Repacker)
+Because HuskHoard uses a **Log-Structured** format, it never deletes data from the middle of a volume (which would be slow and wear out the drive). Instead, it just marks old versions as "Wasteland."
+
+When your `info` command shows a high percentage of **Reclaimable Space**, run the Repacker:
+```bash
+./huskhoard repack --source-tape /old_drive.img --dest-tape /new_drive.img
+```
+The Repacker performs "Garbage Collection":
+* It identifies only the **latest active version** of every file on the source.
+* It copies those files to the destination.
+* It updates the Catalog to point to the new offsets.
+* The old drive can then be wiped and reused.
+
+## 3. Disaster Recovery (The Rebuild)
+If your SSD dies and you lose your `husk_catalog.db`, do not panic. Your data is not lost.
+*   **For Disks:** HuskHoard scans for "USTD" magic bytes across the LBA range.
+*   **For Tapes:** HuskHoard reads every hardware Filemark, extracts the 4KB header at the start of each file, and re-indexes the tape's contents into a new SQLite database.
+
+Because every 4KB header on the archive volume contains the filename and metadata, HuskHoard can perform a **Deep Scan** to rebuild your database from scratch:
+```bash
+./huskhoard rebuild --tape-dev /dev/sdb --output-db husk_recovered.db
+```
+HuskHoard will scan the entire physical surface of the drive, identify "USTD" magic bytes, and re-index every file it finds.
+
+## 4. The "Easy Exit" (Manual Extraction)
+We believe you should never be locked into a storage tool. If you need to get your data out and don't want to use HuskHoard, you can use standard Linux tools:
+1. Use `dd` or a hex editor to find the offset of a file (skipping the 4096-byte header).
+2. Pipe the raw data into the standard `zstd` utility:
+   `dd if=/dev/sdb bs=4096 skip=[offset+1] | zstd -d > recovered_file`
+# Maintenance
+
+## 1. Physical Tape Maintenance
+When using physical LTO tapes, the **Scrubber** and **Repacker** currently require the volume to be on a standard Disk/Image. Support for native sequential scrubbing of LTO hardware is currently in the roadmap.
+
+
+---
+
+### Section 7: Technical Reference (`reference.md`)
+
+# Technical Reference
+
+This section provides the low-level specifications for the HuskHoard storage format and CLI.
+
+## 1. The USTD Object Header (4096 bytes)
+Every object on a HuskHoard volume begins with a 4KB header, aligned to the disk's physical sectors.
+
+| Offset | Size | Field | Description |
+| :--- | :--- | :--- | :--- |
+| 0 | 8B | `magic_bytes` | `USTD\x00\x01\x02\x03` |
+| 8 | 2B | `format_version` | Current version: 1 |
+| 10 | 2B | `flags` | Operational flags (e.g., deleted, partial) |
+| 12 | 1B | `compression_type` | 0=None, 1=Zstd |
+| 13 | 3B | `reserved_pad` | Structural padding to maintain 64-bit alignment |
+| 16 | 8B | `payload_size` | Uncompressed size in bytes |
+| 24 | 8B | `compressed_size` | Compressed size in bytes |
+| 32 | 8B | `padded_size` | Total size aligned to 4KB sectors |
+| 40 | 16B | `object_uuid` | Unique ID for this specific version |
+| 56 | 16B | `tape_uuid` | ID of the volume this object belongs to |
+| 72 | 8B | `mtime` | Original POSIX modified time |
+| 80 | 8B | `ctime` | Original POSIX created time |
+| 88 | 4B | `posix_mode` | Original read/write/execute permissions |
+| 92 | 4B | `uid` | Original POSIX User ID |
+| 96 | 4B | `gid` | Original POSIX Group ID |
+| 100 | 32B | `data_checksum` | BLAKE3 cryptographic hash of payload |
+| 132 | 4B | `header_crc32` | CRC32 integrity check for bytes 0-131 |
+| 136 | 3960B| `tlv_data` | Type-Length-Value packed variable metadata |
+
+### TLV Metadata Packing
+The `tlv_data` block stores variable-length information:
+*   **Type 0x01:** Original Filename.
+*   **Type 0x02:** Linux Extended Attributes (xattrs).
+
+## 2. CLI Command Summary
+
+| Command | Argument | Description |
+| :--- | :--- | :--- |
+| `daemon` | None | Starts the interceptor, policy engine, and HTTP Gateway. |
+| `format` | `--tape-dev` | Writes a Volume Header to LBA 0 of a drive. |
+| `info` | `--tape-dev` | Displays capacity and "Wasteland" statistics. |
+| `scrub` | `--tape-dev` | Verifies BLAKE3 hashes for all data on volume. |
+| `restore` | `--file-path` | Manually extracts a file (supports `--version`). |
+| `repack` | `--source`, `--dest` | Reclaims space by migrating active data. |
+| `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. |
+
+## Storage Interface Specs
+*   **Block Size:** 4096 bytes (Logical), 262,144 bytes (Physical SCSI Tape Frame).
+*   **Tape Markers:** Uses standard SCSI `EOF` filemarks between every archived object.
+*   **Seek Method:** `lseek()` for disks, `MTFSF` (Forward Space File) for physical tape.
+
+## 3. Performance Tuning
+*   **Alignment:** HuskHoard enforces 4096-byte alignment. This ensures compatibility with **4Kn Advanced Format** drives and prevents "Partial Sector Writes."
+*   **O_DIRECT:** HuskHoard uses `O_DIRECT` to bypass the Linux Page Cache. This prevents archival tasks from "starving" your system RAM, keeping your desktop responsive while large backups occur.
+*   **Zstd Window:** HuskHoard uses a sliding Zstd window optimized for 16MB frames, balancing high compression ratios with fast random-access rehydration.
+*   **HTTP Stream Squelching:** The gateway detects BrokenPipe errors during seeks. This allows for rapid timeline scrubbing in VLC without spamming system logs or resource leaks.
+
+---
+
+
+### Section 8: Production Deployment Guide (`production.md`)
+
+# Production Deployment
+
+While testing with `.img` files is useful for development, a production HuskHoard setup involves physical block devices and real-time cloud replication. This guide walk you through a professional-grade deployment.
+
+## 1. Preparing Production Hardware
+
+### Identifying Drives by Serial
+In Linux, device paths like `/dev/sdb` can change after a reboot. For production, **always identify your drives by their hardware ID**.
+
+Find your drive's persistent path:
+```bash
+ls -l /dev/disk/by-id/
+```
+Look for the path that includes the brand and serial number (e.g., `/dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345`).
+
+### Initializing the Physical Drive
+Unlike the test environment where we used `fallocate`, in production we format the **raw block device**. 
+
+!!! danger "Warning: Data Loss"
+    The `format` command will overwrite the beginning of the disk. Ensure you have selected the correct drive.
+
+```bash
+# Format a physical 14TB Hard Drive
+sudo ./huskhoard format --tape-dev /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
+```
+
+## 2. Setting up the Cloud Replication Tier
+HuskHoard can replicate every byte to a cloud provider in real-time.
+
+1.  **Configure rclone:** Run `rclone config` and create a remote (e.g., named `backblaze_b2`).
+2.  **Verify access:** Ensure you can see the bucket: `rclone ls backblaze_b2:my-husk-bucket`.
+3.  **Add to Husk:** Use the `rclone:` prefix in your config (see step 3).
+
+## 3. Production Configuration Example
+An example setup may involve a "Hot" NVMe SSD, many local "Primary" HDDs, and a "Cloud" replica. HuskHoard can support as many drives as you can address with your server. 
+
+Edit `husk_config.toml`:
+```toml
+# --- SSD Tier ---
+hot_tier = "/mnt/nvme_data/media"
+db_path = "/var/lib/husk/husk_catalog.db"
+
+# --- Hard Drive Tier (Local Archive) ---
+primary_volumes = [
+    "/dev/disk/by-id/ata-WDC_WD140EDGZ-SERIAL1",
+    "/dev/disk/by-id/ata-WDC_WD140EDGZ-SERIAL2",
+    "/dev/disk/by-id/ata-WDC_WD140EDGZ-SERIAL3"
+]
+
+# --- Cloud Tier (Replication) ---
+replication_volumes = ["rclone:backblaze_b2:my-husk-bucket/vault1"]
+replicas = 1 # Keep 1 local copy + 1 cloud copy
+
+# --- Production Policy ---
+janitor_schedule_time = "02:00" # Run the scan every night at 2 AM
+max_age_days = 60              # Keep files on SSD for 2 months
+max_versions = 5               # Keep 5 historical versions for rollback
+```
+
+## 4. Running as a System Service (systemd)
+In production, you want HuskHoard to start automatically when the server boots. Create a systemd unit file:
+
+`sudo nano /etc/systemd/system/huskhoard.service`
+
+```ini
+[Unit]
+Description=HuskHoard Data Tiering Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=huskuser
+Group=huskuser
+WorkingDirectory=/home/huskuser/husk
+ExecStart=/home/huskuser/husk/target/release/huskhoard daemon
+Restart=always
+RestartSec=5
+
+# Ensure the binary has fanotify capabilities
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Enable and Start:**
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable huskhoard
+sudo systemctl start huskhoard
+```
+# Production Deployment
+
+## 5. LTO Tape Setup
+To use a physical tape drive, ensure your user has permissions for the generic SCSI character devices.
+```bash
+# Add user to the tape group
+sudo usermod -aG tape $USER
+```
+In your `husk_config.toml`, point to the **non-rewinding** device:
+```toml
+primary_volumes = ["/dev/nst0"] # Use 'n' prefix to prevent auto-rewind on close
+```
+
+## 6. Managing the "Offline Library"
+HuskHoard excels at managing a "Shelf" of disconnected drives and tapes. 
+*   **Identify by Model:** For LTO drives, HuskHoard records the drive model (e.g., `IBM-LTO8`) in the database.
+*   **The Recall Prompt:** If an app tries to access a file on a tape that is currently in a box on your shelf, the daemon will block the app and log:
+    > `👉 PLEASE INSERT: Volume UUID [a1b2c3d4] (SCSI Model: HP LTO-7 ULTRIUM)`
+*   **Resume:** Once the tape is inserted and the drive is ready, HuskHoard automatically continues the stream.
+
+## 7. Performance Tuning for High Capacity
+When dealing with multi-terabyte drives, performance tuning is key:
+
+*   **O_DIRECT:** Production mode defaults to `O_DIRECT`. This ensures that archiving 10TB of data won't "pollute" your Linux RAM cache, leaving your system snappy for other tasks.
+*   **Disk Spindown:** If you are using standard HDDs, you can set an idle spindown timer using `hdparm -S`. HuskHoard will automatically wake the drive when a "Husk" is accessed.
+*   **Database Location:** Always keep your `husk_catalog.db` on your fastest SSD. This ensures that `ls` commands and file metadata lookups remain instantaneous, even if the data is on a sleeping hard drive.
+
+---
+
+
+### Section 9: The Catalog (SQLite Deep Dive) (`catalog.md`)
+
+# The Catalog Database
+
+HuskHoard follows the **"Open Data"** principle. All file metadata, version history, and hardware tracking are stored in a standard **SQLite 3** database. We don't hide your information in proprietary binary blobs.
+
+## 1. Locating the Database
+The path to your catalog is defined in your `husk_config.toml`:
+```toml
+db_path = "husk_catalog.db"
+```
+HuskHoard uses **WAL (Write-Ahead Logging)** mode for performance. You may see two extra files (`-shm` and `-wal`) alongside your database while the daemon is running. Do not delete these!
+
+## 2. Viewing the Database
+Since it is a standard SQLite file, you can open it with any standard tool:
+*   **CLI:** `sqlite3 husk_catalog.db`
+*   **GUI (Recommended):** [DB Browser for SQLite](https://sqlitebrowser.org/) (Available on Linux, Mac, and Windows).
+
+## 3. The Schema (Where the Data Lives)
+The database consists of three primary tables:
+
+### `catalog`
+This is the master index of every file version.
+*   `file_path`: The original path on your SSD.
+*   `version`: Incremental version number (for Point-in-Time Recovery).
+*   `tape_uuid`: Which volume contains this file.
+*   `tape_offset`: The exact byte-offset on the volume where the file starts.
+*   `blake3_hash`: The cryptographic fingerprint of the file.
+
+### `tapes`
+The registry of all physical and virtual archive volumes.
+*   `tape_uuid`: Unique identifier.
+*   `device_path`: Last known Linux path (e.g., `/dev/sdb`).
+*   `drive_serial`: The hardware serial number used for the **Offline Recall** prompts.
+
+### `active_tracking`
+The "Cooling Room." This tracks files on your SSD that the daemon is currently monitoring for age/access.
+
+## 4. Useful SQL Queries
+You can run these commands via `sqlite3` to get deep insights into your Hoard:
+
+**Find the 10 Largest Files in the Archive:**
+```sql
+SELECT file_path, payload_size / 1024 / 1024 AS MB 
+FROM catalog 
+ORDER BY payload_size DESC LIMIT 10;
+```
+
+**Check which Physical Drive a file is on:**
+```sql
+SELECT c.file_path, t.device_path, t.drive_serial 
+FROM catalog c 
+JOIN tapes t ON c.tape_uuid = t.tape_uuid 
+WHERE c.file_path LIKE '%my_video.mp4%';
+```
+
+**Calculate Total Space Saved on SSD:**
+```sql
+SELECT SUM(payload_size) / 1024 / 1024 / 1024 AS GB_SAVED FROM catalog;
+```
+
+## 5. The "Easy Exit" Recovery (Manual)
+If you ever want to leave HuskHoard or recover a file manually, the database gives you the "treasure map."
+
+1.  **Get the Map:** Run `SELECT tape_offset, compressed_size FROM catalog WHERE file_path = 'your_file.txt'`.
+2.  **Locate the Tape:** Find the physical drive matching the `tape_uuid`.
+3.  **Extract with Standard Tools:**
+    Since HuskHoard uses 4096-byte headers and standard Zstd streams, you can extract your data using only the `dd` and `zstd` commands:
+    ```bash
+    # Skip the 4KB header and extract the payload
+    dd if=/dev/sdb bs=4096 skip=([tape_offset / 4096] + 1) count=[compressed_size / 4096 + 1] | zstd -d > recovered_file.txt
+    ```
+
+## 6. Database Backups
+Because the database is the "Brain" of the system, HuskHoard performs **Database Anchoring**:
+*   Every time the Archive Worker finishes a batch, it performs a `VACUUM INTO` to create a clean backup.
+*   That backup is then **archived onto the tape itself**.
+*   This ensures that even if your computer and its SSD are destroyed in a fire, as long as you have your archive drives, you can recover the Catalog and every file within it.
+
+---
+
+
+### Section 10: High-Performance Search (`search.md`)
+
+# High-Performance Search
+
+As your "Hoard" grows to millions of files and multiple petabytes, traditional Linux search tools like `find` or `locate` become painfully slow. HuskHoard solves this by providing **Instant Metadata Search** via the Catalog.
+
+## 1. Indexed vs. Recursive Search
+*   **The Old Way (`find`):** To find a file, the OS must recursively traverse every directory. This involves thousands of random I/O operations. On a cold hard drive, this can take minutes.
+*   **The Husk Way (SQL):** HuskHoard maintains a **B-Tree Index** on the `file_path` and `blake3_hash` columns. Search results are returned in **milliseconds**, regardless of whether the archive drives are even plugged in.
+
+## 2. Searching the Hoard
+You can perform complex, high-speed queries that are impossible with standard filesystem tools.
+
+### Instant Path Search
+Find every file in your archive with "2015" in the name, across all volumes:
+```sql
+-- Results in < 0.01 seconds
+SELECT file_path, version FROM catalog WHERE file_path LIKE '%2015%';
+```
+
+### Searching by Bit-Rot Fingerprint (BLAKE3)
+HuskHoard allows you to search by the **content**, not just the name. If you have a file and want to know if it already exists in your archive (even if renamed), you can search by its BLAKE3 hash:
+```sql
+-- Find duplicates or renamed versions instantly
+SELECT file_path, tape_uuid FROM catalog WHERE blake3_hash = 'd37a...8b2f';
+```
+
+### Metadata & Ownership Search
+Find all files belonging to a specific user (UID 1000) that are larger than 1GB:
+```sql
+SELECT file_path, payload_size / 1024 / 1024 / 1024 AS GB 
+FROM catalog 
+WHERE uid = 1000 AND payload_size > 1073741824;
+```
+
+## 3. "Ghost" Search (Searching Offline Volumes)
+This is the most powerful aspect of the HuskHoard Catalog. 
+
+Standard Linux search tools can only see files that are currently "online." If you unplug a USB drive, `find` can no longer see its contents. 
+**HuskHoard remembers everything.** 
+
+Because the Catalog is stored on your SSD, you can search your entire library—including drives sitting on your shelf—without plugging them in. Once you find the file you need, HuskHoard will tell you exactly which drive serial number to go grab.
+
+## 4. Future Tooling: `husk search`
+While you can currently search using the `sqlite3` CLI, the HuskHoard roadmap includes a dedicated `husk search` command to make this even easier:
+
+```bash
+# [Planned Feature]
+./huskhoard search "*.mkv" --min-size 10G --offline
+```
+
+## 5. Integration with External Tools
+Because the search is so fast and the database is standard, you can point other tools at the HuskHoard Catalog:
+*   **Python:** Build a web-based "File Gallery" by querying the SQLite DB.
+*   **Reporting:** Generate a weekly "Storage Report" showing which users are consuming the most archive space.
+*   **Security:** Scan the `blake3_hash` list against known malware databases without ever having to "read" the files from the slow hard drives.
+
+---
+
+
+# Section 11: Streaming Gateway (`streaming.md`)
+
+# HTTP Streaming Gateway
+
+The **HuskHoard Streaming Gateway** is designed to solve the problem of "Massive Media on Slow Hardware." Instead of waiting for a 80GB 4K Blu-ray rip to rehydrate from tape to your SSD, you can stream it directly into your player.
+
+## 1. How it Works
+The gateway acts as a "Translator." 
+1. **The Player** (VLC/Plex) asks for: `GET /stream/movie.mkv` with a header `Range: bytes=500MB-600MB`.
+2. **HuskHoard** looks up the Jump-Table in the Catalog.
+3. **StreamGate** identifies the exact 16MB Zstd frames on the Physical Tape or Cloud.
+4. **The Engine** extracts only those bytes, decodes them in RAM, and pipes them directly into the HTTP Socket.
+
+**Result:** You get O(1) seeking (instant jumps) on files stored on linear media like LTO Tape or S3.
+
+## 2. Configuration
+In your `husk_config.toml`, you can set the port:
+```toml
+http_port = 8080
+```
+By default, the gateway binds to `127.0.0.1`. This is a security feature to ensure your archive isn't exposed to the internet. If you need to access it from another machine, we recommend using an Nginx reverse proxy or a VPN (Tailscale).
+
+## 3. Media Server Integration
+
+### VLC / MPV
+To watch a file instantly, simply point your player at the HuskHoard URL:
+```bash
+vlc http://127.0.0.1:8080/stream/my_movie.mp4
+```
+
+### Plex / Jellyfin
+To use HuskHoard as a backend for a media server:
+1. Create a `.strm` file (e.g., `Gladiator.strm`).
+2. Inside that file, paste the HuskHoard URL: `http://127.0.0.1:8080/stream/Movies/Gladiator.mkv`.
+3. Add the folder containing the `.strm` files to your Plex/Jellyfin library.
+
+Plex will now treat the LTO Tape or S3 bucket as a standard high-speed stream.
+
+## 4. Performance & Hardware Safety
+*   **Zero-Disk Footprint:** Data flows from the archive media -> RAM -> Socket. The "Stub" file on your SSD is never overwritten during streaming, preserving your SSD's lifespan and capacity.
+*   **Shoe-Shining Prevention:** When streaming from physical LTO tape, HuskHoard uses its 256KB buffer. If the player pauses the video, the gateway applies "Backpressure," pausing the tape hardware cleanly to prevent head wear.
+*   **Broken Pipe Handling:** Media players frequently drop connections when seeking. HuskHoard gracefully kills the extraction thread and starts a new one at the new offset, preventing "Database Locked" errors or daemon crashes.
+
+## 5. Security & Stability
+*   **Path Traversal Protection:** The gateway strictly validates URLs. You cannot use `../` to escape the `hot_tier` and read system files like `/etc/shadow`.
+*   **Localhost Enforcement:** The gateway is designed for local-to-local communication. This keeps your metadata and file content off the open web.
+*   **Graceful 503s:** If you try to stream a file from a tape that is currently sitting on your shelf (offline), the gateway will return an `HTTP 503 Service Unavailable` with a log entry telling you exactly which drive to plug in.
+```
+
+---
