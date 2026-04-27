@@ -155,7 +155,7 @@ Drop a large file into `hot_tier`. Wait 10 seconds.
 ---
 
 ### 🚀 Roadmap
-*   [In-Progress] **StreamGate HTTP:** A local web-gateway allowing video players to seek through tapes via HTTP Range requests.
+*   [Complete] **StreamGate HTTP:** A local web-gateway allowing video players to seek through tapes via HTTP Range requests.
 *   [Planned] **Web Dashboard:** Real-time visual "Tank Gauge" monitoring.
 *   [Planned] **Prometheus Integration:** `/metrics` endpoint for Grafana.
 
