@@ -14,7 +14,7 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 
 *   **Bring Your Own Hardware:** HuskHoard doesn't care if your "Tape Library" is a $10,000 SAN, a **Physical LTO-9 Tape Drive**, a dusty USB drive, or an Amazon S3 bucket.
 *   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API to block and resume processes in real-time.
-*  *   **StreamGate HTTP Gateway:** Watch 4K video directly from Tape or S3 via a local HTTP bridge. This allows Plex, Jellyfin, or VLC to seek through massive files instantly with zero SSD impact.
+*   **StreamGate HTTP Gateway:** Watch 4K video directly from Tape or S3 via a local HTTP bridge. This allows Plex, Jellyfin, or VLC to seek through massive files instantly with zero SSD impact.
 *   **The "Easy Exit" Promise (No Vendor Lock-in):** Payload data is stored in standard **Zstd** streams verified by **BLAKE3**. You can extract your data using only standard Linux tools (`dd` and `zstd`).
 
 #### Features
