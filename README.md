@@ -29,7 +29,7 @@ Modern storage requires specialized handling. HuskHoard treats your media differ
 *   **For Physical Tapes:** Writes in 256KB optimal SCSI frames and uses **Filemarks** to navigate. StreamGate uses the catalog to skip hardware blocks, reaching your data in seconds rather than minutes.
 *   **For SMR Hard Drives:** Eliminates the "write wall" by using a Strict Log-Structured Format—data is only ever written sequentially.
 *   **For Cloud (rclone):** Packs data into 16MB Zstd-compressed frames. This optimizes "PUT" request costs and allows for high-speed partial reads via HTTP Range requests.
-*   
+    
 ### Architecture Overview
 *   **The Catalog:** A SQLite "Brain" tracking every file, its version history, and its exact byte-offset on physical media.
 *   **The Interceptor:** A lightweight fanotify loop that detects when an application requests a stubbed file and triggers an instant recall.
@@ -123,7 +123,7 @@ Start the HuskHoard background engine:
 Leave the daemon running and open a **second terminal window**. 
 
 Drop a large file into `hot_tier`. Wait 10 seconds. 
-* Run `ls -ls hot_tier`. You will see the file's allocated size drop to 4Kb, while its logical size remains intact. 
+* Run `ls -ls hot_tier`. You will see the file's allocated size drop to near 0 bytes, while its logical size remains intact. 
 * Run `du -h hot_tier`. It has become a Husk. 
 * Open the file, and watch the Daemon instantly recall it from `my_hoard.img`.
 
