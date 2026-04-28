@@ -5,7 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
-use log::{info, error}; // removed 'warn' to stop that warning
+use log::{info, error}; 
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread;
 
@@ -20,6 +20,8 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::sync::mpsc;
+use serde_json::json;
+use std::os::unix::net::UnixStream;
 
 const ALIGNMENT: usize = 4096;
 
@@ -31,16 +33,65 @@ pub struct HuskConfig {
     pub failover_volumes: Vec<String>,
     pub replication_volumes: Vec<String>,
     pub replicas: usize,
-    pub janitor_schedule_time: Option<String>, // <--- NEW: e.g. "02:00"
-    pub janitor_interval_secs: u64,            // <--- Testing fallback
+    pub janitor_schedule_time: Option<String>,
+    pub janitor_interval_secs: u64,           
     pub max_age_days: u64,
     pub max_versions: u32,
     pub exclude_dirs: Vec<String>,
     pub temp_extensions: Vec<String>,
     pub immediate_archive_extensions: Vec<String>,
     pub immediate_archive_dirs: Vec<String>,
+    pub no_compress_extensions: Vec<String>, 
     pub log_level: String,
-    pub http_port: Option<u16>, // <--- NEW
+    pub http_port: Option<u16>,
+    pub sidecar_socket_path: Option<String>, 
+}
+
+// ---------------------------------------------------------
+// NEW: Enterprise Sidecar IPC Bridge
+// ---------------------------------------------------------
+pub struct SidecarBridge {
+    socket_path: Option<String>,
+}
+
+impl SidecarBridge {
+    pub fn new(config: &Arc<HuskConfig>) -> Self {
+        Self { socket_path: config.sidecar_socket_path.clone() }
+    }
+
+    pub fn send_event(&self, payload: serde_json::Value) {
+        if let Some(ref path) = self.socket_path {
+            if let Ok(mut stream) = UnixStream::connect(path) {
+                let _ = stream.write_all(payload.to_string().as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        }
+    }
+
+    pub fn wake_volume(&self, tape_uuid: &str, device_path: &str, location_hint: &str) -> std::io::Result<()> {
+        let Some(ref path) = self.socket_path else { return Ok(()); };
+        let mut stream = UnixStream::connect(path)?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(60))); 
+        
+        let msg = json!({
+            "action": "WAKE_VOLUME",
+            "tape_uuid": tape_uuid,
+            "device_path": device_path,
+            "location_hint": location_hint
+        });
+        
+        stream.write_all(msg.to_string().as_bytes())?;
+        stream.write_all(b"\n")?;
+        
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        let response = String::from_utf8_lossy(&buf[..n]);
+        if response.trim() == "READY" {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Sidecar hardware timeout or failure"))
+        }
+    }
 }
 
 const DEFAULT_TOML: &str = r#"# ==========================================
@@ -74,6 +125,7 @@ exclude_dirs = ["/.git/", "/node_modules/", "/__pycache__/"]
 temp_extensions = [".swp", ".tmp", ".crdownload", "~", ".part"]
 immediate_archive_extensions = ["mp4", "mov", "iso", "zip", "tar", "gz"]
 immediate_archive_dirs = ["/ArchiveDrop/"]
+no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "tar", "gz", "rar", "7z", "jpg", "png", "iso"]
 "#;
 
 
@@ -99,7 +151,7 @@ enum Commands {
         offset: u64,
         #[arg(long)]
         length: Option<u64>,
-        #[arg(long)] // <--- ADD THIS
+        #[arg(long)] 
         tape_uuid: Option<String>,
     },
     /// Format a raw block device, writing the Volume Header to LBA 0
@@ -537,11 +589,12 @@ impl<'a> std::io::Write for MultiTapeWriter<'a> {
 // ---------------------------------------------------------
 pub enum StorageBackend {
     Local(File),
-    Tape(File), // NEW: Physical SCSI Tape Hardware
+    Tape(File), 
     Rclone { 
         child: std::process::Child,
         stdin: std::process::ChildStdin,
     },
+    Grid(UnixStream), 
 }
 
 impl std::io::Write for StorageBackend {
@@ -550,6 +603,7 @@ impl std::io::Write for StorageBackend {
             StorageBackend::Local(f) => f.write(buf),
             StorageBackend::Tape(f) => f.write(buf),
             StorageBackend::Rclone { stdin, .. } => stdin.write(buf),
+            StorageBackend::Grid(stream) => stream.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -557,6 +611,7 @@ impl std::io::Write for StorageBackend {
             StorageBackend::Local(f) => f.flush(),
             StorageBackend::Tape(f) => f.flush(),
             StorageBackend::Rclone { stdin, .. } => stdin.flush(),
+            StorageBackend::Grid(stream) => stream.flush(),
         }
     }
 }
@@ -565,8 +620,9 @@ impl StorageBackend {
     pub fn seek_to(&mut self, offset: u64) -> std::io::Result<()> {
         match self {
             StorageBackend::Local(f) => { f.seek(SeekFrom::Start(offset))?; Ok(()) },
-            StorageBackend::Tape(_) => Ok(()), // Hardware tapes are Append-Only. Seek ignored.
+            StorageBackend::Tape(_) => Ok(()), 
             StorageBackend::Rclone { .. } => Ok(()), 
+            StorageBackend::Grid(_) => Ok(()), // Grid tunnels handle tracking internally
         }
     }
     pub fn sync(&mut self) -> std::io::Result<()> {
@@ -574,6 +630,7 @@ impl StorageBackend {
             StorageBackend::Local(f) => f.sync_all(),
             StorageBackend::Tape(f) => f.sync_all(),
             StorageBackend::Rclone { stdin, .. } => stdin.flush(),
+            StorageBackend::Grid(stream) => stream.flush(),
         }
     }
     pub fn close(self) -> std::io::Result<()> {
@@ -581,16 +638,19 @@ impl StorageBackend {
             StorageBackend::Local(f) => f.sync_all(),
             StorageBackend::Tape(f) => {
                 f.sync_all()?;
-                // CRITICAL: Write SCSI Filemark (End of File) to hardware
                 send_mtio_cmd(f.as_raw_fd(), MTWEOF, 1)?;
                 Ok(())
             },
             StorageBackend::Rclone { mut child, stdin } => {
-                drop(stdin); // Close pipe
+                drop(stdin); 
                 let status = child.wait()?; 
                 if !status.success() {
                     return Err(std::io::Error::new(std::io::ErrorKind::Other, "rclone failed"));
                 }
+                Ok(())
+            },
+            StorageBackend::Grid(mut stream) => {
+                stream.flush()?;
                 Ok(())
             }
         }
@@ -604,7 +664,7 @@ pub fn spawn_rclone_writer(remote_path: &str) -> std::io::Result<StorageBackend>
         .arg(remote_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit()) // <--- CHANGED THIS LINE
+        .stderr(Stdio::inherit()) 
         .spawn()?;
 
     let stdin = child.stdin.take().ok_or_else(|| {
@@ -617,6 +677,7 @@ pub fn spawn_rclone_writer(remote_path: &str) -> std::io::Result<StorageBackend>
 pub enum StorageReader {
     Local(File),
     Rclone(std::process::ChildStdout, std::process::Child),
+    Grid(UnixStream), // NEW: Multi-Node Read Hand-off
 }
 
 impl std::io::Read for StorageReader {
@@ -624,6 +685,7 @@ impl std::io::Read for StorageReader {
         match self {
             StorageReader::Local(f) => f.read(buf),
             StorageReader::Rclone(stdout, _) => stdout.read(buf),
+            StorageReader::Grid(stream) => stream.read(buf),
         }
     }
 }
@@ -640,16 +702,53 @@ pub struct ActiveTape {
 // Returns a tuple: (Vector of replicas, Vector of StreamGate Frames (UncompressedOffset, CompressedOffset, CompressedSize))
 fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, use_direct_io: bool) -> std::io::Result<(Vec<(u64, u64, u64, u8, String, String, String)>, Vec<(u64, u64, u64)>)> {
     info!("Archiving '{}'...", source_path);
-
+    
+    let sidecar = SidecarBridge::new(config);
     let mut src_file = File::open(source_path)?;
     let src_meta = src_file.metadata()?;
     let payload_size = src_meta.len();
     let estimated_need = payload_size + (ALIGNMENT as u64) * 2;
 
+    // Telemetry Broadcast
+    sidecar.send_event(json!({
+        "event": "ARCHIVE_START", 
+        "file": source_path, 
+        "size": payload_size
+    }));
+
     let mut active_tapes: Vec<ActiveTape> = Vec::new();
 
     // Reusable closure to evaluate and attach a drive/remote
     let mut try_attach_tape = |dev_path: &str| -> bool {
+        // Multi-Node Remote Hand-off Hook
+        if dev_path.starts_with("husk-grid://") {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(dev_path.as_bytes());
+            let uuid_bytes: [u8; 16] = hasher.finalize().as_bytes()[0..16].try_into().unwrap();
+            let uuid_hex = uuid_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+            
+            let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+            let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
+            let start_offset = if logical_eof % ALIGNMENT as u64 == 0 { logical_eof } else { logical_eof + ALIGNMENT as u64 - (logical_eof % ALIGNMENT as u64) };
+
+            if let Some(ref sock_path) = config.sidecar_socket_path {
+                if let Ok(mut stream) = UnixStream::connect(sock_path) {
+                    let msg = json!({"action": "GRID_TUNNEL_WRITE", "target": dev_path, "offset": start_offset});
+                    let _ = stream.write_all(msg.to_string().as_bytes());
+                    let _ = stream.write_all(b"\n");
+                    
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = std::io::Read::read(&mut stream, &mut buf) {
+                        if String::from_utf8_lossy(&buf[..n]).trim() == "READY" {
+                            info!("[Archiver] Selected Grid Target: {}", dev_path);
+                            active_tapes.push(ActiveTape { backend: StorageBackend::Grid(stream), dev_path: dev_path.to_string(), uuid_hex, volume_uuid: uuid_bytes, start_offset, is_append_only: true });
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
         if dev_path.starts_with("rclone:") {
             let mut hasher = blake3::Hasher::new();
             hasher.update(dev_path.as_bytes());
@@ -669,6 +768,18 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
                 return true;
             }
         } else {
+            // SIDE-CAR HARDWARE WAKE-UP HOOK
+            let location_hint: String = conn.query_row(
+                "SELECT location_hint FROM tapes WHERE device_path = ?1", 
+                params![dev_path], |row| row.get(0)
+            ).unwrap_or_default();
+            
+            if let Err(e) = sidecar.wake_volume("UNKNOWN", dev_path, &location_hint) {
+                error!("⚠️ Hardware timeout for {}: {}", dev_path, e);
+                sidecar.send_event(json!({"event": "HARDWARE_TIMEOUT", "device": dev_path}));
+                return false;
+            }
+
             if let Ok(mut tape) = open_tape_device(dev_path, true, true, true, use_direct_io) {
                 let tape_meta = tape.metadata().unwrap();
                 let is_char_dev = (tape_meta.mode() & libc::S_IFMT) == libc::S_IFCHR;
@@ -749,6 +860,11 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
     let final_padded_size: u64;
 
     let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
+    
+    // NEW LOGIC: Check config to bypass Zstd compression
+    let file_ext = std::path::Path::new(source_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let use_compression = !config.no_compress_extensions.contains(&file_ext);
+    let compression_type_flag: u8 = if use_compression { 1 } else { 0 };
 
     {
         let tape_refs: Vec<&mut dyn std::io::Write> = active_tapes
@@ -757,47 +873,55 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
             .collect();
             
         let mut tape_writer = MultiTapeWriter::new(tape_refs);
-        
         let mut io_buf = vec![0; 1024 * 1024]; // 1MB buffer
-        let chunk_size = 16 * 1024 * 1024; // 16MB Frame boundaries for StreamGate
-        let mut current_frame_bytes = 0;
         
-        let mut uncompressed_start = 0;
-        let mut compressed_start = 0;
+        if use_compression {
+            let chunk_size = 16 * 1024 * 1024; // 16MB Frame boundaries for StreamGate
+            let mut current_frame_bytes = 0;
+            let mut uncompressed_start = 0;
+            let mut compressed_start = 0;
 
-        let mut encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?; 
+            let mut encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?; 
 
-        loop {
-            let n = src_file.read(&mut io_buf)?;
-            if n == 0 { break; }
-            hasher.update(&io_buf[..n]);
-            
-            encoder.write_all(&io_buf[..n])?;
-            current_frame_bytes += n;
-            
-            if current_frame_bytes >= chunk_size {
-                encoder.finish()?;
+            loop {
+                let n = src_file.read(&mut io_buf)?;
+                if n == 0 { break; }
+                hasher.update(&io_buf[..n]);
                 
-                let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
-                let compressed_size = current_compressed_offset - compressed_start;
-                jump_table.push((uncompressed_start, compressed_start, compressed_size));
+                encoder.write_all(&io_buf[..n])?;
+                current_frame_bytes += n;
                 
-                uncompressed_start += current_frame_bytes as u64;
-                compressed_start = current_compressed_offset;
-                current_frame_bytes = 0;
-                
-                encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?;
+                if current_frame_bytes >= chunk_size {
+                    encoder.finish()?;
+                    let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
+                    let compressed_size = current_compressed_offset - compressed_start;
+                    jump_table.push((uncompressed_start, compressed_start, compressed_size));
+                    
+                    uncompressed_start += current_frame_bytes as u64;
+                    compressed_start = current_compressed_offset;
+                    current_frame_bytes = 0;
+                    encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?;
+                }
             }
-        }
-        encoder.finish()?;
-        
-        let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
-        let compressed_size = current_compressed_offset - compressed_start;
-        if compressed_size > 0 {
-            jump_table.push((uncompressed_start, compressed_start, compressed_size));
+            encoder.finish()?;
+            
+            let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
+            let compressed_size = current_compressed_offset - compressed_start;
+            if compressed_size > 0 {
+                jump_table.push((uncompressed_start, compressed_start, compressed_size));
+            }
+            final_compressed_size = current_compressed_offset;
+        } else {
+            // HIGH-PERFORMANCE RAW COPY (Compression Bypassed)
+            loop {
+                let n = src_file.read(&mut io_buf)?;
+                if n == 0 { break; }
+                hasher.update(&io_buf[..n]);
+                tape_writer.write_all(&io_buf[..n])?;
+            }
+            final_compressed_size = tape_writer.bytes_written + tape_writer.cursor as u64;
         }
 
-        final_compressed_size = current_compressed_offset;
         tape_writer.pad_and_flush()?;
         final_padded_size = tape_writer.bytes_written;
     }
@@ -809,7 +933,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
     let mut results = Vec::new();
     for tape in &mut active_tapes {
         let mut header = ObjectHeader {
-            magic_bytes: *b"USTD\x00\x01\x02\x03", format_version: 1, flags: 0, compression_type: 1,
+            magic_bytes: *b"USTD\x00\x01\x02\x03", format_version: 1, flags: 0, compression_type: compression_type_flag,
             reserved_pad: [0; 3], payload_size, compressed_size: final_compressed_size, padded_size: final_padded_size,
             object_uuid: [0; 16], tape_uuid: tape.volume_uuid,
             mtime: src_meta.mtime(), ctime: src_meta.ctime(), posix_mode: src_meta.mode(), uid: src_meta.uid(), gid: src_meta.gid(),
@@ -866,7 +990,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
                 header.tlv_data[p..p+4].copy_from_slice(&(*c_size as u32).to_be_bytes());
                 p += 4;
             }
-            // tlv_offset += 4 + frames_payload_len; // Removed to silence compiler warning
+            // tlv_offset += 4 + frames_payload_len; 
         }
 
         let mut crc = Crc32Hasher::new();
@@ -878,7 +1002,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
         tape.backend.seek_to(tape.start_offset)?;
         header_buf.as_mut_slice().copy_from_slice(bytemuck::bytes_of(&header));
         tape.backend.write_all(header_buf.as_slice())?;
-        results.push((tape.start_offset, payload_size, final_compressed_size, 1, hash_hex.clone(), tape.uuid_hex.clone(), tape.dev_path.clone()));
+        results.push((tape.start_offset, payload_size, final_compressed_size, compression_type_flag, hash_hex.clone(), tape.uuid_hex.clone(), tape.dev_path.clone()));
     }
 
     // CRITICAL: Wait for all uploads to finish before returning
@@ -896,6 +1020,14 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
         payload_size, 
         final_compressed_size
     );
+    
+    // Telemetry Success
+    sidecar.send_event(json!({
+        "event": "ARCHIVE_COMPLETE", 
+        "file": source_path, 
+        "replicas": results.len()
+    }));
+    
     Ok((results, jump_table))
 }
 // ---------------------------------------------------------
@@ -956,7 +1088,10 @@ impl<W: std::io::Write> std::io::Write for SkipWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
-fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool, target_uuid: Option<&str>, out_handle: &mut W) -> std::io::Result<()> {
+fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool, target_uuid: Option<&str>, out_handle: &mut W) -> std::io::Result<()> {
+    let sidecar = SidecarBridge::new(config);
+    sidecar.send_event(json!({"event": "STREAM_START", "file": file_path, "offset": offset}));
+    
     let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB Open Failed"))?;
     
     // Locate the latest version of the file, optionally on a specific tape
@@ -974,12 +1109,20 @@ fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, l
         conn.query_row(query, params![file_path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
     }.map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "File/Tape combination not found"))?;
 
-    let tape_dev: String = conn.query_row(
-        "SELECT device_path FROM tapes WHERE tape_uuid = ?1",
-        params![tape_uuid], |row| row.get(0)
-    ).unwrap_or_default();
+    let (tape_dev, location_hint): (String, String) = conn.query_row(
+        "SELECT device_path, COALESCE(location_hint, '') FROM tapes WHERE tape_uuid = ?1",
+        params![tape_uuid], |row| Ok((row.get(0)?, row.get(1)?))
+    ).unwrap_or((String::new(), String::new()));
 
     let is_char_dev = std::fs::metadata(&tape_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
+
+    // Pre-Flight Wake Hook
+    if !tape_dev.starts_with("rclone:") && !tape_dev.starts_with("husk-grid:") {
+        if let Err(e) = sidecar.wake_volume(&tape_uuid, &tape_dev, &location_hint) {
+            error!("⚠️ Hardware timeout for read {}: {}", tape_dev, e);
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hardware Wake Timeout"));
+        }
+    }
 
     // --- STREAMGATE MATH (Jump Table Lookup) ---
     let req_start = offset;
@@ -1011,6 +1154,12 @@ fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, l
         info!("[StreamGate] Frames found: {}. Selected range {} to {}", frames.len(), start_idx, end_idx);
         info!("[StreamGate] Compressed Target Offset: {}, Target Length: {}", target_c_offset, target_c_len);
         info!("[StreamGate] Uncompressed Bytes to Skip from Frame Start: {}", skip_bytes);
+    } else if db_type == 0 {
+        // INSTANT O(1) SEEK FOR RAW FILES!
+        target_c_offset = req_start;
+        target_c_len = req_end - req_start;
+        skip_bytes = 0;
+        info!("[StreamGate] Raw Uncompressed File. Direct O(1) seek to offset {}. Target Length: {}", target_c_offset, target_c_len);
     }
 
     let abs_start_offset = tape_offset + 4096 + target_c_offset;
@@ -1030,7 +1179,19 @@ fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, l
     };
 
     // --- STORAGE READER SPAWN ---
-    let mut tape: StorageReader = if tape_dev.starts_with("rclone:") {
+    let mut tape: StorageReader = if tape_dev.starts_with("husk-grid://") {
+        let mut stream = std::os::unix::net::UnixStream::connect(config.sidecar_socket_path.as_deref().unwrap_or("/tmp/husk_sidecar.sock"))?;
+        let msg = json!({"action": "GRID_TUNNEL_READ", "target": tape_dev, "offset": tape_offset, "count": padded_target_c_len});
+        let _ = stream.write_all(msg.to_string().as_bytes());
+        let _ = stream.write_all(b"\n");
+        
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if String::from_utf8_lossy(&buf[..n]).trim() != "READY" {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Grid tunnel failed"));
+        }
+        StorageReader::Grid(stream)
+    } else if tape_dev.starts_with("rclone:") {
         let clean_remote = tape_dev.strip_prefix("rclone:").unwrap();
         let object_path = format!("{}/husk_{}.bin", clean_remote, tape_offset);
         
@@ -1080,7 +1241,7 @@ fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, l
         buf_start: usize,
         buf_end: usize,
         alignment_skew: usize,
-        skew_discarded: usize, // <--- NEW: Tracks fragmented skew discarding
+        skew_discarded: usize, 
         target_c_len: usize,
         bytes_produced: usize,
     }
@@ -1139,7 +1300,7 @@ fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, l
         buf_start: 0,
         buf_end: 0,
         alignment_skew,
-        skew_discarded: 0, // <--- Initialize our new tracker
+        skew_discarded: 0, 
         target_c_len: target_c_len as usize,
         bytes_produced: 0,
     };
@@ -1161,14 +1322,17 @@ fn stream_file<W: std::io::Write>(db_path: &str, file_path: &str, offset: u64, l
 }
 
 // CLI Wrapper for stream_file mapping to standard output
-fn cat_file(db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool, target_uuid: Option<&str>) -> std::io::Result<()> {
+fn cat_file(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, offset: u64, length: Option<u64>, use_direct_io: bool, target_uuid: Option<&str>) -> std::io::Result<()> {
     let stdout = std::io::stdout();
     let mut out_handle = stdout.lock();
-    stream_file(db_path, file_path, offset, length, use_direct_io, target_uuid, &mut out_handle)
+    stream_file(config, db_path, file_path, offset, length, use_direct_io, target_uuid, &mut out_handle)
 }
 
-fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, tape_offset: u64, use_direct_io: bool, is_manual: bool) -> std::io::Result<()> {
-    info!("\nRestoring from Volume'{}'...", tape_dev);
+fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, tape_offset: u64, use_direct_io: bool, is_manual: bool) -> std::io::Result<()> {
+    info!("\nRestoring from Volume '{}'...", tape_dev);
+    
+    let sidecar = SidecarBridge::new(config);
+    sidecar.send_event(json!({"event": "RESTORE_START", "file": file_path}));
 
     // 1. Fetch exact object size from DB to drive the stream logic
     let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB Open Failed"))?;
@@ -1184,8 +1348,38 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
         .map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR)
         .unwrap_or(false);
 
+    // Fetch location hint and Wake Hardware
+    let tape_uuid: String = conn.query_row(
+        "SELECT tape_uuid FROM catalog WHERE file_path = ?1 AND tape_offset = ?2",
+        params![file_path, tape_offset], |row| row.get(0)
+    ).unwrap_or_default();
+    
+    let location_hint: String = conn.query_row(
+        "SELECT COALESCE(location_hint, '') FROM tapes WHERE tape_uuid = ?1",
+        params![tape_uuid], |row| row.get(0)
+    ).unwrap_or_default();
+
+    if !tape_dev.starts_with("rclone:") && !tape_dev.starts_with("husk-grid:") {
+        if let Err(e) = sidecar.wake_volume(&tape_uuid, tape_dev, &location_hint) {
+            error!("⚠️ Hardware timeout for read {}: {}", tape_dev, e);
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hardware Wake Timeout"));
+        }
+    }
+
     // 2. Open correct stream backend
-    let mut tape: StorageReader = if tape_dev.starts_with("rclone:") {
+    let mut tape: StorageReader = if tape_dev.starts_with("husk-grid://") {
+        let mut stream = std::os::unix::net::UnixStream::connect(config.sidecar_socket_path.as_deref().unwrap_or("/tmp/husk_sidecar.sock"))?;
+        let msg = json!({"action": "GRID_TUNNEL_READ", "target": tape_dev, "offset": tape_offset, "count": padded_size});
+        let _ = stream.write_all(msg.to_string().as_bytes());
+        let _ = stream.write_all(b"\n");
+        
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if String::from_utf8_lossy(&buf[..n]).trim() != "READY" {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Grid tunnel failed"));
+        }
+        StorageReader::Grid(stream)
+    } else if tape_dev.starts_with("rclone:") {
         let clean_remote = tape_dev.strip_prefix("rclone:").unwrap();
         let object_path = format!("{}/husk_{}.bin", clean_remote, tape_offset);
         let mut child = Command::new("rclone")
@@ -1353,7 +1547,7 @@ fn restore_file(db_path: &str, tape_dev: &str, file_path: &str, dest_fd: i32, ta
     Ok(())
 }
 
-fn manual_restore(db_path: &str, file_path: &str, dest_path: &str, version: Option<u32>, use_direct_io: bool) -> std::io::Result<()> {
+fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, dest_path: &str, version: Option<u32>, use_direct_io: bool) -> std::io::Result<()> {
     let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB open failed"))?;
     
     let mut query = String::from(
@@ -1378,7 +1572,7 @@ fn manual_restore(db_path: &str, file_path: &str, dest_path: &str, version: Opti
             let file = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_dest)?;
             let fd = file.as_raw_fd();
             
-            match restore_file(db_path, &device_path, file_path, fd, offset, use_direct_io, true) {
+            match restore_file(config, db_path, &device_path, file_path, fd, offset, use_direct_io, true) {
                 Ok(_) => {
                     // Atomically overwrite target file only when fully verified
                     std::fs::rename(&tmp_dest, dest_path)?;
@@ -1564,6 +1758,7 @@ fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io::Res
                                 let path_clone = path_str.clone();
                                 let db_path_clone = db_path.to_string();
                                 let active_restores_clone = Arc::clone(&active_restores);
+                                let interceptor_config = Arc::clone(&config);
                                 
                                 thread::spawn(move || {
                                     let mut is_primary = false;
@@ -1586,7 +1781,7 @@ fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io::Res
                                         let mut restored = false;
                                         for (db_tape, db_offset) in replicas {
                                             info!("[Daemon] Trying to wake Volume replica at '{}'...", db_tape);
-                                            if let Err(e) = restore_file(&db_path_clone, &db_tape, &path_clone, fd_raw, db_offset, use_direct_io, false) {
+                                            if let Err(e) = restore_file(&interceptor_config, &db_path_clone, &db_tape, &path_clone, fd_raw, db_offset, use_direct_io, false) {
                                                 error!("[Daemon] ⚠️ Replica at '{}' unavailable: {}. Trying next...", db_tape, e);
                                             } else {
                                                 restored = true;
@@ -1736,7 +1931,7 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                                 );
                             }
 
-                            // NEW: Store Jump Table for StreamGate
+                            //  Store Jump Table for StreamGate
                             for (u_off, c_off, c_size) in jump_table {
                                 let _ = conn.execute(
                                     "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1757,6 +1952,17 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                                 )", params![path_str, config.max_versions]
                             );
                             
+                            // ---------------------------------------------------------
+                            // POST-COMMIT CATALOG TRIGGER (Multi-Node Global Sync)
+                            // ---------------------------------------------------------
+                            let sidecar = SidecarBridge::new(&config);
+                            sidecar.send_event(json!({
+                                "event": "CATALOG_UPDATE", 
+                                "table": "catalog",
+                                "file_path": path_str,
+                                "version": next_version
+                            }));
+
                             if let Err(e) = stub_file(&path_str, payload_size_saved) {
                                 error!("[Worker] ❌ Failed to stub {}: {}", path_str, e);
                             } else {
@@ -1879,7 +2085,7 @@ fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::i
                 params![&filename, 1, tape_dev, offset, header.payload_size, header.compressed_size, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
             );
             
-            // NEW: Recover StreamGate Jump Table from TLV
+            //  Recover StreamGate Jump Table from TLV
             let mut tlv_offset = 0;
             while tlv_offset + 4 <= header.tlv_data.len() {
                 let t_type = u16::from_be_bytes([header.tlv_data[tlv_offset], header.tlv_data[tlv_offset+1]]);
@@ -2352,7 +2558,7 @@ fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_direct
 
     // 6. Zero-Disk Delivery (Requirement 3: Performance & Zero-Copy)
     info!("[Gateway] Streaming {} (Bytes {}-{})", clean_path, range_start, end);
-    if let Err(e) = stream_file(&config.db_path, &path_str, range_start, Some(length), use_direct_io, None, &mut stream) {
+    if let Err(e) = stream_file(&config, &config.db_path, &path_str, range_start, Some(length), use_direct_io, None, &mut stream) {
         // VITAL: Ignore "BrokenPipe". It just means the user closed VLC or scrubbed forward on the timeline.
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             error!("[Gateway] Streaming interrupted for {}: {}", clean_path, e);
@@ -2500,14 +2706,14 @@ fn main() {
             }
         }
         Commands::Restore { file_path, dest_path, version } => {
-            if let Err(e) = manual_restore(&config_arc.db_path, file_path, dest_path, *version, use_direct_io) {
+            if let Err(e) = manual_restore(&config_arc, &config_arc.db_path, file_path, dest_path, *version, use_direct_io) {
                 error!("Manual restore failed: {}", e);
             }
         }
         
         Commands::Cat { file_path, offset, length, tape_uuid } => {
             log::set_max_level(log::LevelFilter::Debug);
-            if let Err(e) = cat_file(&config_arc.db_path, file_path, *offset, *length, use_direct_io, tape_uuid.as_deref()) {
+            if let Err(e) = cat_file(&config_arc, &config_arc.db_path, file_path, *offset, *length, use_direct_io, tape_uuid.as_deref()) {
                 eprintln!("Cat failed: {}", e);
             }
         }
@@ -2632,13 +2838,14 @@ fn init_catalog(db_path: &str) -> SqlResult<Connection> {
         [],
     )?;
 
-    // NEW: Tape Pool Table (Maps UUID to device paths & hardware serials)
+    // Tape Pool Table (Maps UUID to device paths & hardware serials)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tapes (
             tape_uuid TEXT PRIMARY KEY,
             device_path TEXT NOT NULL,
             drive_serial TEXT DEFAULT 'VIRTUAL_IMAGE',
-            backend_type TEXT DEFAULT 'local'
+            backend_type TEXT DEFAULT 'local',
+            location_hint TEXT DEFAULT NULL
         )",
         [],
     )?;
@@ -2646,8 +2853,9 @@ fn init_catalog(db_path: &str) -> SqlResult<Connection> {
     // Alpha Patch: Add columns to existing DBs without wiping them
     let _ = conn.execute("ALTER TABLE tapes ADD COLUMN drive_serial TEXT DEFAULT 'VIRTUAL_IMAGE'", []);
     let _ = conn.execute("ALTER TABLE tapes ADD COLUMN backend_type TEXT DEFAULT 'local'", []);
+    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN location_hint TEXT DEFAULT NULL", []);
 
-    // NEW: Active File Tracking (Event-Driven Sweeper queue)
+    //  Active File Tracking (Event-Driven Sweeper queue)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS active_tracking (
             file_path TEXT PRIMARY KEY,
@@ -2656,7 +2864,7 @@ fn init_catalog(db_path: &str) -> SqlResult<Connection> {
         [],
     )?;
     
-    // NEW: StreamGate Frame Index
+    //  StreamGate Frame Index
     conn.execute(
         "CREATE TABLE IF NOT EXISTS object_frames (
             file_path TEXT NOT NULL,
