@@ -25,6 +25,14 @@ use std::os::unix::net::UnixStream;
 
 const ALIGNMENT: usize = 4096;
 
+fn default_no_compress() -> Vec<String> {
+    vec![
+        "mp4".into(), "mkv".into(), "avi".into(), "mov".into(), "zip".into(),
+        "tar".into(), "gz".into(), "rar".into(), "7z".into(), "jpg".into(),
+        "png".into(), "iso".into()
+    ]
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct HuskConfig {
     pub hot_tier: String,
@@ -41,6 +49,7 @@ pub struct HuskConfig {
     pub temp_extensions: Vec<String>,
     pub immediate_archive_extensions: Vec<String>,
     pub immediate_archive_dirs: Vec<String>,
+    #[serde(default = "default_no_compress")]
     pub no_compress_extensions: Vec<String>, 
     pub log_level: String,
     pub http_port: Option<u16>,
