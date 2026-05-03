@@ -110,7 +110,7 @@ def main():
     logging.info("📼 Formatting Primary and Local Replica Tapes...")
     for tape in [TAPE_PRIMARY, TAPE_REPLICA]:
         run_cmd(["fallocate", "-l", "500M", tape])
-        run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "format", "--tape-dev", tape])
+        run_cmd(["sudo", "hoard", "--config", CONFIG_FILE, "format", "--tape-dev", tape])
 
     # 2. Start the Daemon
     logging.info("🎧 Starting HuskHoard Daemon (Grid Mode: Primary + Replica + Cloud Mock)...")
@@ -460,7 +460,7 @@ def main():
 
     # 7. Scrubber Test
     logging.info("🩺 Running Scrubber on Primary Tape to verify BLAKE3 integrity...")
-    run_cmd(["sudo", "./target/release/husk", "--config", CONFIG_FILE, "scrub", "--tape-dev", TAPE_PRIMARY])
+    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "scrub", "--tape-dev", TAPE_PRIMARY])
 
     # 8. Repacker (Garbage Collection) Test
     logging.info("♻️ Testing Repacker (Garbage Collection)...")
@@ -469,16 +469,16 @@ def main():
     run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "format", "--tape-dev", TAPE_REPACK])
     
     run_cmd([
-        "sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "repack",
+        "sudo", "hoard", "--config", CONFIG_FILE, "repack",
         "--source-tape", TAPE_PRIMARY,
         "--dest-tape", TAPE_REPACK
     ])
     
     logging.info("📊 Final Tape Gauge (Repacked Tape):")
-    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "info", "--tape-dev", TAPE_REPACK])
+    run_cmd(["sudo", "hoard", "--config", CONFIG_FILE, "info", "--tape-dev", TAPE_REPACK])
     
     logging.info("☁️  Final Tape Gauge (Mock Cloud Target):")
-    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "info", "--tape-dev", f"rclone:{CLOUD_MOCK_DIR}"])
+    run_cmd(["sudo", "hoard", "--config", CONFIG_FILE, "info", "--tape-dev", f"rclone:{CLOUD_MOCK_DIR}"])
 # 9. Verify Auto-Catalog Mirroring (Idle Backup)
     logging.info("🪞 Verifying Auto-Catalog Mirroring (Idle Backup)...")
     try:
@@ -501,7 +501,7 @@ def main():
     
     # We use the primary tape to rebuild the catalog from scratch
     run_cmd([
-        "sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "rebuild", 
+        "sudo", "hoard", "--config", CONFIG_FILE, "rebuild", 
         "--tape-dev", TAPE_PRIMARY, 
         "--output-db", recovered_db
     ])
