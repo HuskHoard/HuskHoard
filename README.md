@@ -90,13 +90,15 @@ Set up a safe testing area right inside the project folder. We will create a `ho
 ```bash
 # Ensure you are still in the 'huskhoard' project directory
 mkdir -p hot_tier
-fallocate -l 100M my_hoard.img
+fallocate -l 100M my_archive.img
+fallocate -l 100M replication_archive.img
 ```
 
 Next, format the tape volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
 
 ```bash
-./target/release/huskhoard format --tape-dev my_hoard.img
+./target/release/huskhoard format --tape-dev my_archive.img
+./target/release/huskhoard format --tape-dev replication_archive.img
 
 # OR: Format a physical LTO tape drive
 ./target/release/huskhoard format --tape-dev /dev/nst0
@@ -105,8 +107,9 @@ Next, format the tape volume. Running this command for the first time will autom
 Open the newly generated `husk_config.toml` in your text editor. Update these lines to enable **Instant Archiving** so you can see it work immediately. *(Note: Using absolute paths is highly recommended so the daemon always knows where your data is).*
 
 ```toml
-primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_hoard.img"]
-watch_dir = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to your hot tier
+primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
+replication_volumes = ["/home/YOUR_USERNAME/huskhoard/replication_archive.img"]
+hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to your hot tier
 max_age_days = 0 # TEST MODE: Archive files immediately
 janitor_interval_secs = 10
 http_port = 8080 # Port for the Streaming Gateway
@@ -122,10 +125,16 @@ Start the HuskHoard background engine:
 #### 6. Test it
 Leave the daemon running and open a **second terminal window**. 
 
-Drop a large file into `hot_tier`. Wait 10 seconds. 
+Drop a large file into `hot_tier`.
+
+# Generate a 50MB dummy file filled with random data in /hot_tier
+```bash
+dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=50
+```
+Wait 10 seconds. 
 * Run `ls -ls hot_tier`. You will see the file's allocated size drop to near 0 bytes, while its logical size remains intact. 
 * Run `du -h hot_tier`. It has become a Husk. 
-* Open the file, and watch the Daemon instantly recall it from `my_hoard.img`.
+* Open the file, and watch the Daemon instantly recall it from `my_archive.img`.
 
 ---
 
@@ -144,7 +153,7 @@ Drop a large file into `hot_tier`. Wait 10 seconds.
 
 **Scrub a Volume for Bit-Rot:**
 ```bash
-./target/release/huskhoard scrub --tape-dev my_hoard.img
+./target/release/huskhoard scrub --tape-dev my_archive.img
 ```
 
 **Repack (Garbage Collect) an old Volume:**
