@@ -129,7 +129,7 @@ Drop a large file into `hot_tier`.
 
 #### Generate a 50MB dummy file filled with random data
 ```bash
-dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=50
+dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=12
 ```
 Wait 10 seconds. 
 * Run `ls -ls hot_tier`. You will see the file's allocated size drop to near 0 bytes, while its logical size remains intact. 
