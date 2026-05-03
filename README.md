@@ -12,7 +12,7 @@ It acts like an Enterprise Tape Library, but built for the modern homelab and da
 
 Enterprise storage vendors charge thousands of dollars for automated storage tiering and lock your data inside proprietary black boxes. HuskHoard does it for free, right in user-space, using standard open-source formats.
 
-*   **Bring Your Own Hardware:** HuskHoard doesn't care if your "Tape Library" is a $10,000 SAN, a **Physical LTO-9 Tape Drive**, a dusty USB drive, or an Amazon S3 bucket.
+*   **Bring Your Own Hardware:** HuskHoard doesn't care if your "Tape Library" is a $10,000 SAN, a **Physical LTO Tape Drive**, a dusty USB drive, or an Amazon S3 bucket.
 *   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API to block and resume processes in real-time.
 *   **StreamGate HTTP Gateway:** Watch 4K video directly from Tape or S3 via a local HTTP bridge. This allows Plex, Jellyfin, or VLC to seek through massive files instantly with zero SSD impact.
 *   **The "Easy Exit" Promise (No Vendor Lock-in):** Payload data is stored in standard **Zstd** streams verified by **BLAKE3**. You can extract your data using only standard Linux tools (`dd` and `zstd`).
