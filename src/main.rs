@@ -114,9 +114,9 @@ log_level = "info" # Options: debug, info, warn, error
 http_port = 8080   # HTTP Streaming Gateway Port
 
 # --- Volume Tiering ---
-primary_volumes = ["master_archive_tape.img"]
+primary_volumes = ["my_archive.img"]
 failover_volumes = ["failover_tape.img"]
-replication_volumes = ["rclone:s3:my-bucket"]
+replication_volumes = ["replication_archive.img"]
 replicas = 1
 
 # --- Policy Engine (The Janitor) ---
