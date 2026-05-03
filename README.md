@@ -127,7 +127,7 @@ Leave the daemon running and open a **second terminal window**.
 
 Drop a large file into `hot_tier`.
 
-#### Generate a 50MB dummy file filled with random data in /hot_tier
+#### Generate a 50MB dummy file filled with random data
 ```bash
 dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=50
 ```
