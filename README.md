@@ -70,7 +70,7 @@ source $HOME/.cargo/env
 Clone the repository and move into the project directory. **You must remain in this directory for the rest of the tutorial.**
 
 ```bash
-git clone -b tape https://github.com/huskhoard/huskhoard.git
+git clone https://github.com/huskhoard/huskhoard.git
 cd huskhoard
 
 # Build the project
