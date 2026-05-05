@@ -94,7 +94,7 @@ fallocate -l 100M my_archive.img
 fallocate -l 100M replication_archive.img
 ```
 
-Next, format the tape volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
+Next, format the volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
 
 ```bash
 ./target/release/huskhoard format --tape-dev my_archive.img
