@@ -337,8 +337,7 @@ fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, u64,
         let mut file = File::open(tape_dev)?;
         file.seek(SeekFrom::End(0)).unwrap_or(meta.len())
     } else {
-        // FIX: Standard test files grow dynamically. Mock 1TB capacity to bypass the 5GB safety limit.
-        1_000_000_000_000 
+        meta.len() // Respect the actual fallocate size of the .img file
     };
 
     let mut used_capacity = ALIGNMENT as u64; 
@@ -396,13 +395,13 @@ fn print_tape_gauge(tape_dev: &str, db_path: &str) {
             info!("   Reclaimable Space: {} ({:.1}% of used space is deleted/old versions)", format_bytes(wasteland), wasteland_pct);
             
             if percent >= 95.0 {
-                error!("⚠️ WARNING: Tape capacity is critically low!");
+                error!("!!WARNING: Tape capacity is critically low!");
             }
             if wasteland_pct >= 40.0 && used > (total / 4) {
                 info!(" TIP: Reclaimable Space is high. Consider running a Repacker to reclaim space.");
             }
         }
-        Err(e) => error!("❌ Failed to read Volume Health: {}", e),
+        Err(e) => error!(" Failed to read Volume Health: {}", e),
     }
 }
 
@@ -452,7 +451,7 @@ fn open_tape_device(tape_dev: &str, read: bool, write: bool, create: bool, use_d
         match opts.open(tape_dev) {
             Ok(file) => return Ok(file),
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                error!("⚠️ O_DIRECT is unsupported on '{}'. Falling back to buffered I/O. (Set DISABLE_O_DIRECT=1 to silence this)", tape_dev);
+                error!("!!O_DIRECT is unsupported on '{}'. Falling back to buffered I/O. (Set DISABLE_O_DIRECT=1 to silence this)", tape_dev);
                 let mut fallback_opts = OpenOptions::new();
                 fallback_opts.read(read).write(write).create(create);
                 return fallback_opts.open(tape_dev);
@@ -475,7 +474,7 @@ fn format_tape(tape_dev: &str, use_direct_io: bool) -> std::io::Result<()> {
     if is_char_dev {
         info!("📼 Physical Tape Drive detected. Issuing SCSI Rewind (MTREW)...");
         if let Err(e) = send_mtio_cmd(tape.as_raw_fd(), MTREW, 1) {
-            error!("⚠️ Tape rewind failed: {}. Ensure device is ready.", e);
+            error!("!!Tape rewind failed: {}. Ensure device is ready.", e);
         }
     }
 
@@ -720,7 +719,8 @@ pub struct ActiveTape {
 }
 
 // ---------------------------------------------------------
-// Volume Balancer: Sorts volumes by most free space available
+// Volume Allocation: Sequential Fill ( Core Default)
+// Fills volumes one by one by sorting by MOST used space first.
 // ---------------------------------------------------------
 fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) -> Vec<String> {
     let mut vols_with_space: Vec<(String, u64)> = volumes.iter().filter_map(|dev| {
@@ -728,7 +728,8 @@ fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) 
         if let Ok((used, total, _)) = check_tape_gauge(dev, db_path) {
             let free = total.saturating_sub(used);
             if free >= min_free_bytes {
-                Some((dev.clone(), free))
+                // CHANGED: Store 'used' space instead of 'free' space
+                Some((dev.clone(), used))
             } else {
                 None // Drive falls below minimum threshold
             }
@@ -737,7 +738,7 @@ fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) 
         }
     }).collect();
 
-    // Sort descending by free space (Drive with most free space goes first)
+    // CHANGED: Sort descending by used space (Sticky drive effect)
     vols_with_space.sort_by(|a, b| b.1.cmp(&a.1));
 
     vols_with_space.into_iter().map(|(dev, _)| dev).collect()
@@ -818,7 +819,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
             ).unwrap_or_default();
             
             if let Err(e) = sidecar.wake_volume("UNKNOWN", dev_path, &location_hint) {
-                error!("⚠️ Hardware timeout for {}: {}", dev_path, e);
+                error!("!!Hardware timeout for {}: {}", dev_path, e);
                 sidecar.send_event(json!({"event": "HARDWARE_TIMEOUT", "device": dev_path}));
                 return false;
             }
@@ -848,8 +849,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
                 } else if is_char_dev {
                     12_000_000_000_000 // Mock 12TB for Tape
                 } else { 
-                    // FIX: Standard test files grow dynamically. Mock 1TB capacity.
-                    1_000_000_000_000 
+                    tape_meta.len() // Respect the actual fallocate size of the .img file
                 };
 
                 if start_offset + estimated_need <= total_capacity {
@@ -881,7 +881,7 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
     }
     
     if !primary_secured {
-        error!("⚠️ Primary volumes unavailable or below {} GB free! Attempting Failover Tier...", config.min_free_space_gb.unwrap_or(5));
+        error!("!!Primary volumes unavailable or below {} GB free! Attempting Failover Tier...", config.min_free_space_gb.unwrap_or(5));
         let balanced_failover = get_balanced_volumes(&config.failover_volumes, &config.db_path, min_free_bytes);
         for dev in &balanced_failover {
             if try_attach_tape(dev) { break; }
@@ -1061,13 +1061,13 @@ fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, 
     // CRITICAL: Wait for all uploads to finish before returning
     for tape in active_tapes {
         if let Err(e) = tape.backend.close() {
-            error!("❌ Cloud finalization failed for {}: {}", tape.dev_path, e);
+            error!(" Cloud finalization failed for {}: {}", tape.dev_path, e);
             return Err(e);
         }
     }
 
     let destination_names: Vec<String> = results.iter().map(|r| r.6.clone()).collect();
-    info!("✅ Replicated {} times to [{}] ({} bytes -> {} bytes)", 
+    info!("Replicated {} times to [{}] ({} bytes -> {} bytes)", 
         results.len(), 
         destination_names.join(", "),
         payload_size, 
@@ -1172,7 +1172,7 @@ fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, file_
     // Pre-Flight Wake Hook
     if !tape_dev.starts_with("rclone:") && !tape_dev.starts_with("husk-grid:") {
         if let Err(e) = sidecar.wake_volume(&tape_uuid, &tape_dev, &location_hint) {
-            error!("⚠️ Hardware timeout for read {}: {}", tape_dev, e);
+            error!("!!Hardware timeout for read {}: {}", tape_dev, e);
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hardware Wake Timeout"));
         }
     }
@@ -1414,7 +1414,7 @@ fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, file_pa
 
     if !tape_dev.starts_with("rclone:") && !tape_dev.starts_with("husk-grid:") {
         if let Err(e) = sidecar.wake_volume(&tape_uuid, tape_dev, &location_hint) {
-            error!("⚠️ Hardware timeout for read {}: {}", tape_dev, e);
+            error!("!!Hardware timeout for read {}: {}", tape_dev, e);
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hardware Wake Timeout"));
         }
     }
@@ -1629,18 +1629,18 @@ fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, dest
                 Ok(_) => {
                     // Atomically overwrite target file only when fully verified
                     std::fs::rename(&tmp_dest, dest_path)?;
-                    info!("✅ Successfully rolled back to '{}'", dest_path);
+                    info!("Successfully rolled back to '{}'", dest_path);
                     Ok(())
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp_dest);
-                    error!("❌ Restore corrupted or failed. Cleaned up temporary file.");
+                    error!(" Restore corrupted or failed. Cleaned up temporary file.");
                     Err(e)
                 }
             }
         }
         Err(_) => {
-            error!("❌ File '{}' (Version: {:?}) not found in catalog.", file_path, version);
+            error!(" File '{}' (Version: {:?}) not found in catalog.", file_path, version);
             Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Version not found in catalog."))
         }
     }
@@ -1689,7 +1689,7 @@ fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io::Res
     };
     if fan_fd < 0 { 
         let err = std::io::Error::last_os_error();
-        error!("❌ fanotify_init failed: {}. Missing Root or Capabilities!", err);
+        error!(" fanotify_init failed: {}. Missing Root or Capabilities!", err);
         return Err(err); 
     }
 
@@ -1835,7 +1835,7 @@ fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io::Res
                                         for (db_tape, db_offset) in replicas {
                                             info!("[Daemon] Trying to wake Volume replica at '{}'...", db_tape);
                                             if let Err(e) = restore_file(&interceptor_config, &db_path_clone, &db_tape, &path_clone, fd_raw, db_offset, use_direct_io, false) {
-                                                error!("[Daemon] ⚠️ Replica at '{}' unavailable: {}. Trying next...", db_tape, e);
+                                                error!("[Daemon] !!Replica at '{}' unavailable: {}. Trying next...", db_tape, e);
                                             } else {
                                                 restored = true;
                                                 break;
@@ -1861,7 +1861,7 @@ fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io::Res
                                                 }
                                             }
                                             
-                                            info!("[Daemon] ✅ Restore complete for: {}", path_clone);
+                                            info!("[Daemon] Restore complete for: {}", path_clone);
                                         } else {
                                             error!("[Daemon] CRITICAL: All replicas for '{}' offline!", path_clone);
                                             if let Ok(meta) = std::fs::metadata(&path_clone) {
@@ -1914,7 +1914,7 @@ fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io::Res
                                 "INSERT OR REPLACE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)",
                                 params![path_str, now],
                             ) {
-                                error!("[Daemon] ❌ Failed to track modified file {}: {}", path_str, e);
+                                error!("[Daemon]  Failed to track modified file {}: {}", path_str, e);
                             } else {
                                 info!("[Daemon] Tracked modified file: {}", path_str);
                             }
@@ -2017,14 +2017,14 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                             }));
 
                             if let Err(e) = stub_file(&path_str, payload_size_saved) {
-                                error!("[Worker] ❌ Failed to stub {}: {}", path_str, e);
+                                error!("[Worker]  Failed to stub {}: {}", path_str, e);
                             } else {
                                 conn.execute("DELETE FROM active_tracking WHERE file_path = ?1", params![path_str]).unwrap();
-                                info!("[Worker] ✅ Stubbed and removed from queue.");
+                                info!("[Worker] Stubbed and removed from queue.");
                                 archived_since_last_mirror += 1;
                             }
                         },
-                        Err(e) => error!("[Worker] ❌ Failed to archive {}: {}", path_str, e),
+                        Err(e) => error!("[Worker]  Failed to archive {}: {}", path_str, e),
                     }
                 } else {
                     conn.execute("DELETE FROM active_tracking WHERE file_path = ?1", params![path_str]).unwrap();
@@ -2067,9 +2067,9 @@ fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_d
                             )", params![special_path]
                         );
 
-                        info!("[Worker] ✅ Catalog securely mirrored (retaining 3 versions).");
+                        info!("[Worker] Catalog securely mirrored (retaining 3 versions).");
                         } else {
-                            error!("[Worker] ❌ Failed to write Catalog Mirror.");
+                            error!("[Worker]  Failed to write Catalog Mirror.");
                         }
                         let _ = std::fs::remove_file(&backup_path);
                     }
@@ -2144,7 +2144,7 @@ fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::i
 
             let hash_hex = header.data_checksum.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-            info!("✅ Recovered: '{}' (Offset: {}, Size: {})", filename, offset, header.payload_size);
+            info!("Recovered: '{}' (Offset: {}, Size: {})", filename, offset, header.payload_size);
             
             // Re-insert into database
             let _ = conn.execute(
@@ -2210,6 +2210,7 @@ fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_io: b
     info!(" Starting Repacker: Moving active data from '{}' to '{}'...", source_dev, dest_dev);
     
     let conn = Connection::open(db_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(30)); // Wait for daemon locks instead of panicking
     
     // 1. Check Source Volume
     let mut src_tape = open_tape_device(source_dev, true, false, false, use_direct_io)?;
@@ -2297,7 +2298,7 @@ fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_io: b
         
         moved_count += 1;
         dest_offset += ALIGNMENT as u64 + padded_size;
-        info!("   ✅ Repacked: {}", path);
+        info!("   Repacked: {}", path);
     }
     
     // Purge old wasteland records from DB
@@ -2328,7 +2329,7 @@ fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Re
     let vol_header: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
     
     if &vol_header.magic_bytes != b"USTDVOL\0" {
-        error!("❌ Invalid Volume Header on {}. Cannot scrub.", tape_dev);
+        error!(" Invalid Volume Header on {}. Cannot scrub.", tape_dev);
         return Ok(());
     }
     
@@ -2355,14 +2356,14 @@ fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Re
         total_checked += 1;
         
         if tape.seek(SeekFrom::Start(offset)).is_err() {
-            error!("❌ [CORRUPT] Seek error at offset {} for '{}'", offset, file_path);
+            error!(" [CORRUPT] Seek error at offset {} for '{}'", offset, file_path);
             total_corrupted += 1;
             continue;
         }
         
         let mut header_buf = AlignedBuffer::new(ALIGNMENT);
         if tape.read_exact(header_buf.as_mut_slice()).is_err() {
-            error!("❌ [CORRUPT] Read error at offset {} for '{}'", offset, file_path);
+            error!(" [CORRUPT] Read error at offset {} for '{}'", offset, file_path);
             total_corrupted += 1;
             continue;
         }
@@ -2373,7 +2374,7 @@ fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Re
         let mut crc = Crc32Hasher::new();
         crc.update(bytemuck::bytes_of(&header));
         if crc.finalize() != stored_crc {
-            error!("❌ [CORRUPT] Header CRC mismatch for '{}' at offset {}", file_path, offset);
+            error!(" [CORRUPT] Header CRC mismatch for '{}' at offset {}", file_path, offset);
             total_corrupted += 1;
             continue;
         }
@@ -2386,7 +2387,7 @@ fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Re
             let mut decoder = match zstd::stream::write::Decoder::new(hash_writer) {
                 Ok(d) => d,
                 Err(_) => {
-                    error!("❌ [CORRUPT] Zstd init failed for '{}'", file_path);
+                    error!(" [CORRUPT] Zstd init failed for '{}'", file_path);
                     total_corrupted += 1;
                     continue;
                 }
@@ -2431,22 +2432,22 @@ fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Re
         match final_hash_res {
             Ok(hash) => {
                 if hash.to_hex().to_string() != expected_hash_hex {
-                    error!("❌ [CORRUPT] BLAKE3 mismatch for '{}' (Offset: {})", file_path, offset);
+                    error!(" [CORRUPT] BLAKE3 mismatch for '{}' (Offset: {})", file_path, offset);
                     total_corrupted += 1;
                 } else if total_checked % 50 == 0 {
                     info!("   ... {} objects scrubbed, 0 errors so far ...", total_checked);
                 }
             }
             Err(_) => {
-                error!("❌ [CORRUPT] Data stream error for '{}' (Offset: {})", file_path, offset);
+                error!(" [CORRUPT] Data stream error for '{}' (Offset: {})", file_path, offset);
                 total_corrupted += 1;
             }
         }
     }
     
     info!("Scrub Complete! Checked: {}, Corrupted: {}", total_checked, total_corrupted);
-    if total_corrupted == 0 && total_checked > 0 { info!("✅ Volume is 100% HEALTHY."); } 
-    else if total_checked == 0 { info!("⚠️ Volume index is empty."); }
+    if total_corrupted == 0 && total_checked > 0 { info!("Volume is 100% HEALTHY."); } 
+    else if total_checked == 0 { info!("!!Volume index is empty."); }
     
     Ok(())
 }
@@ -2507,7 +2508,7 @@ fn rescan_tape_drives(conn: &Connection) {
         }
 
         if !found {
-            error!("⚠️ Drive {} (Serial/Model: {}) is OFFLINE. Restores from it will fail.", old_path, serial);
+            error!("!!Drive {} (Serial/Model: {}) is OFFLINE. Restores from it will fail.", old_path, serial);
         }
     }
 }
@@ -2639,7 +2640,7 @@ fn run_http_gateway(config: Arc<HuskConfig>, use_direct_io: bool) {
     // Binds strictly to localhost to prevent open internet exposure (Requirement 4)
     let addr = format!("127.0.0.1:{}", port); 
     
-    let listener = TcpListener::bind(&addr).expect("❌ Failed to bind HTTP Gateway port");
+    let listener = TcpListener::bind(&addr).expect(" Failed to bind HTTP Gateway port");
     info!("[Gateway] Local HTTP Streaming Gateway active: http://{}/stream/", addr);
 
     for stream in listener.incoming() {
@@ -2670,7 +2671,7 @@ fn main() {
     let config: HuskConfig = if let Ok(contents) = std::fs::read_to_string(&cli.config) {
         toml::from_str(&contents).expect("Failed to parse config file")
     } else {
-        println!("⚠️ Config file not found. Generating default '{}'", cli.config);
+        println!("!!Config file not found. Generating default '{}'", cli.config);
         std::fs::write(&cli.config, DEFAULT_TOML).unwrap();
         toml::from_str(DEFAULT_TOML).unwrap()
     };
@@ -2688,7 +2689,7 @@ fn main() {
         }
         Commands::Daemon => {
             if unsafe { libc::geteuid() } != 0 {
-                info!("⚠️ Running Husk without root privileges.");
+                info!("!!Running Husk without root privileges.");
                 info!("   If fanotify fails, grant capabilities to the binary using:");
                 info!("   sudo setcap cap_sys_admin,cap_dac_read_search+ep ./target/release/husk");
             }
@@ -2733,7 +2734,7 @@ fn main() {
                                 info!("[Janitor] Production Mode: Sleeping until {} ({} seconds remaining)...", schedule, secs_to_wait);
                                 thread::sleep(std::time::Duration::from_secs(secs_to_wait));
                             } else {
-                                error!("[Janitor] ❌ Invalid schedule_time format '{}'. Use 'HH:MM'. Falling back to interval.", schedule);
+                                error!("[Janitor]  Invalid schedule_time format '{}'. Use 'HH:MM'. Falling back to interval.", schedule);
                                 thread::sleep(std::time::Duration::from_secs(scanner_config.janitor_interval_secs));
                             }
                         } else {
@@ -2873,6 +2874,7 @@ fn get_drive_serial(tape_dev: &str) -> String {
 // ---------------------------------------------------------
 fn init_catalog(db_path: &str) -> SqlResult<Connection> {
     let conn = Connection::open(db_path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
     
     // EXTREMELY IMPORTANT: Enable Write-Ahead Logging.
     // This allows the Sweeper (Thread) and Interceptor (Main) to write simultaneously 
