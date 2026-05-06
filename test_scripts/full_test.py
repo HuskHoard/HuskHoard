@@ -20,7 +20,8 @@ import sqlite3
 CONFIG_FILE = "huskhoard_test_config.toml"
 HOT_TIER = "hot_tier"
 DB_PATH = "huskhoard_test_catalog.db"
-TAPE_PRIMARY = "/tmp/tape_primary.img"
+TAPE_PRIMARY_1 = "/tmp/tape_primary_1.img"
+TAPE_PRIMARY_2 = "/tmp/tape_primary_2.img"
 TAPE_REPLICA = "/tmp/tape_replica.img"
 TAPE_REPACK = "/tmp/tape_repack.img"
 CLOUD_MOCK_DIR = "/tmp/huskhoard_cloud_remote" # Handled natively by rclone local adapter
@@ -69,8 +70,9 @@ def generate_toml():
         db_path = "{DB_PATH}"
         log_level = "info"
         http_port = 8080
+        min_free_space_gb = 0
         
-        primary_volumes = ["{TAPE_PRIMARY}"]
+        primary_volumes = ["{TAPE_PRIMARY_1}", "{TAPE_PRIMARY_2}"]
         failover_volumes = []
         replication_volumes = ["{TAPE_REPLICA}", "rclone:{CLOUD_MOCK_DIR}"]
         replicas = 2
@@ -84,6 +86,7 @@ def generate_toml():
         temp_extensions = [".swp", ".tmp", "~"]
         immediate_archive_extensions = ["mp4", "iso"]
         immediate_archive_dirs = ["/ArchiveDrop/"]
+        no_compress_extensions = ["mp4", "iso", "zip", "jpg"]
     """)
     with open(CONFIG_FILE, "w") as f:
         f.write(toml)
@@ -91,11 +94,141 @@ def generate_toml():
 def cleanup_environment():
     """Wipes old test files to ensure a clean run."""
     logging.info("🧹 Cleaning up old test environment...")
-    subprocess.run(["sudo", "rm", "-f", DB_PATH, f"{DB_PATH}-shm", f"{DB_PATH}-wal", TAPE_PRIMARY, TAPE_REPLICA, TAPE_REPACK, CONFIG_FILE])
+    subprocess.run(["sudo", "rm", "-f", DB_PATH, f"{DB_PATH}-shm", f"{DB_PATH}-wal", TAPE_PRIMARY_1, TAPE_PRIMARY_2, TAPE_REPLICA, TAPE_REPACK, CONFIG_FILE])
     subprocess.run(["sudo", "rm", "-rf", HOT_TIER])
     subprocess.run(["sudo", "rm", "-rf", CLOUD_MOCK_DIR])
     os.makedirs(HOT_TIER, exist_ok=True)
     os.makedirs(CLOUD_MOCK_DIR, exist_ok=True)
+
+def simulate_jbod_lifecycle():
+    """
+    Phase 2: Enterprise JBOD Simulation.
+    Validates Sequential Fill, fragmentation over time, and Garbage Collection (Repack).
+    """
+    logging.info("\n" + "="*60)
+    logging.info("🏢 PHASE 2: ENTERPRISE JBOD LIFECYCLE SIMULATION")
+    logging.info("="*60)
+
+    JBOD_TIER = "jbod_hot_tier"
+    JBOD_DB = "jbod_catalog.db"
+    JBOD_CONFIG = "jbod_config.toml"
+    DRIVES = [f"/tmp/jbod_drive_{i}.img" for i in range(1, 5)]
+
+    # 1. Clean and Provision
+    logging.info("💾 Provisioning 4-Bay JBOD (150MB per drive)...")
+    subprocess.run(["sudo", "rm", "-rf", JBOD_TIER, JBOD_DB, JBOD_CONFIG] + DRIVES)
+    os.makedirs(JBOD_TIER, exist_ok=True)
+    
+    for drive in DRIVES:
+        run_cmd(["fallocate", "-l", "150M", drive])
+        run_cmd(["sudo", "./target/release/huskhoard", "--config", JBOD_CONFIG, "format", "--tape-dev", drive])
+
+    # Generate JBOD specific config (No replicas, Sequential Fill focus)
+    toml = textwrap.dedent(f"""\
+        hot_tier = "{JBOD_TIER}"
+        db_path = "{JBOD_DB}"
+        log_level = "info"
+        min_free_space_gb = 0
+        primary_volumes = {DRIVES}
+        failover_volumes = []
+        replication_volumes = []
+        replicas = 0
+        janitor_schedule_time = "none"
+        janitor_interval_secs = 2
+        max_age_days = 0   
+        max_versions = 2
+        exclude_dirs = []
+        temp_extensions = []
+        immediate_archive_extensions = ["bin"]
+        immediate_archive_dirs = []
+        no_compress_extensions = ["bin"]
+    """)
+    with open(JBOD_CONFIG, "w") as f: f.write(toml)
+
+    # Start JBOD Daemon
+    logging.info("🎧 Starting Dedicated JBOD Daemon...")
+    daemon_env = os.environ.copy()
+    daemon_env["RUST_LOG"] = "info"
+    jbod_log = open("jbod_daemon.log", "w")
+    daemon_proc = subprocess.Popen(
+        ["sudo", "-E", "./target/release/huskhoard", "--config", JBOD_CONFIG, "daemon"],
+        stdin=subprocess.DEVNULL, stdout=jbod_log, stderr=subprocess.STDOUT, env=daemon_env, start_new_session=True
+    )
+    time.sleep(3)
+
+    try:
+        def make_file(name, size_mb):
+            path = os.path.join(JBOD_TIER, name)
+            logging.info(f"   Writing {size_mb}MB to {name}...")
+            with open(path, "wb") as f:
+                f.write(os.urandom(size_mb * 1024 * 1024))
+            wait_for_stubbing(path, timeout=60)
+            return path
+
+        # 2. Test Sequential Fill (Sticky Drive)
+        logging.info("🪣 Testing Sequential Fill Logic...")
+        file_a = make_file("dataset_A.bin", 60) # Goes to Drive 1
+        file_b = make_file("dataset_B.bin", 60) # Goes to Drive 1 (Drive 1 now has 120MB / 150MB)
+        file_c = make_file("dataset_C.bin", 60) # Won't fit on Drive 1! Should spill to Drive 2.
+
+        # Verify Placements
+        conn = sqlite3.connect(JBOD_DB)
+        c = conn.cursor()
+        loc_a = c.execute("SELECT t.device_path FROM catalog c JOIN tapes t ON c.tape_uuid=t.tape_uuid WHERE c.file_path=? ORDER BY version DESC LIMIT 1", (os.path.abspath(file_a),)).fetchone()[0]
+        loc_b = c.execute("SELECT t.device_path FROM catalog c JOIN tapes t ON c.tape_uuid=t.tape_uuid WHERE c.file_path=? ORDER BY version DESC LIMIT 1", (os.path.abspath(file_b),)).fetchone()[0]
+        loc_c = c.execute("SELECT t.device_path FROM catalog c JOIN tapes t ON c.tape_uuid=t.tape_uuid WHERE c.file_path=? ORDER BY version DESC LIMIT 1", (os.path.abspath(file_c),)).fetchone()[0]
+        conn.close()
+
+        if loc_a == DRIVES[0] and loc_b == DRIVES[0] and loc_c == DRIVES[1]:
+            logging.info("   ✅ SUCCESS: Sequential Fill worked perfectly! Drive 1 filled, then spilled to Drive 2.")
+        else:
+            logging.error(f"   ❌ FAILED: Drives filled out of order! (A:{loc_a}, B:{loc_b}, C:{loc_c})")
+
+        # 3. Simulate Fragmentation (Wasteland generation)
+        logging.info("🌪️ Simulating user edits to generate Wasteland on Drive 1...")
+        # Overwriting File A with a tiny file creates a new version, leaving the old 60MB version as wasteland!
+        with open(file_a, "wb") as f:
+            f.write(b"TINY_NEW_VERSION_DATA")
+        wait_for_stubbing(file_a, timeout=60)
+
+        # Print Drive 1 Health (Should show high reclaimable space)
+        logging.info(f"📊 Drive 1 Health BEFORE Repack:")
+        run_cmd(["sudo", "./target/release/huskhoard", "--config", JBOD_CONFIG, "info", "--tape-dev", DRIVES[0]])
+
+        # 4. Repack (Garbage Collection)
+        logging.info("♻️ Running Repacker: Moving surviving data from Drive 1 -> Drive 4...")
+        run_cmd([
+            "sudo", "./target/release/huskhoard", "--config", JBOD_CONFIG, "repack",
+            "--source-tape", DRIVES[0],
+            "--dest-tape", DRIVES[3]
+        ])
+
+        # 5. Verify Garbage Collection
+        conn = sqlite3.connect(JBOD_DB)
+        c = conn.cursor()
+        loc_b_new = c.execute("SELECT t.device_path FROM catalog c JOIN tapes t ON c.tape_uuid=t.tape_uuid WHERE c.file_path=? ORDER BY version DESC LIMIT 1", (os.path.abspath(file_b),)).fetchone()[0]
+        count_drive_1 = c.execute("SELECT COUNT(*) FROM catalog c JOIN tapes t ON c.tape_uuid=t.tape_uuid WHERE t.device_path=?", (DRIVES[0],)).fetchone()[0]
+        conn.close()
+
+        if loc_b_new == DRIVES[3]:
+            logging.info("   ✅ SUCCESS: Surviving active data (Dataset B) successfully evacuated to Drive 4.")
+        else:
+            logging.error(f"   ❌ FAILED: Data was not moved to Drive 4! It is on {loc_b_new}")
+
+        if count_drive_1 == 0:
+            logging.info("   ✅ SUCCESS: Drive 1 is completely purged from the catalog and can be physically formatted or swapped!")
+        else:
+            logging.error(f"   ❌ FAILED: Drive 1 still has {count_drive_1} ghost records in the DB.")
+
+        # Print Drive 4 Health (Should show 60MB used, 0 Wasteland)
+        logging.info(f"📊 Drive 4 Health AFTER Repack:")
+        run_cmd(["sudo", "./target/release/huskhoard", "--config", JBOD_CONFIG, "info", "--tape-dev", DRIVES[3]])
+
+    finally:
+        logging.info("🛑 Stopping JBOD Daemon...")
+        subprocess.run(["sudo", "pkill", "-SIGINT", "husk"])
+        daemon_proc.wait()
+        logging.info("🏢 JBOD PHASE COMPLETE.")
 
 def main():
     logging.info("🚀 STARTING HUSKHOARD ARCHIVER COMPREHENSIVE TEST")
@@ -108,9 +241,12 @@ def main():
 
     # 1. Format Multiple Tapes
     logging.info("📼 Formatting Primary and Local Replica Tapes...")
-    for tape in [TAPE_PRIMARY, TAPE_REPLICA]:
-        run_cmd(["fallocate", "-l", "500M", tape])
-        run_cmd(["sudo", "hoard", "--config", CONFIG_FILE, "format", "--tape-dev", tape])
+    run_cmd(["fallocate", "-l", "50M", TAPE_PRIMARY_1])
+    run_cmd(["fallocate", "-l", "60M", TAPE_PRIMARY_2])
+    run_cmd(["fallocate", "-l", "500M", TAPE_REPLICA])
+    
+    for tape in [TAPE_PRIMARY_1, TAPE_PRIMARY_2, TAPE_REPLICA]:
+        run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "format", "--tape-dev", tape])
 
     # 2. Start the Daemon
     logging.info("🎧 Starting HuskHoard Daemon (Grid Mode: Primary + Replica + Cloud Mock)...")
@@ -135,9 +271,23 @@ def main():
         mp4_file = os.path.join(HOT_TIER, "holiday_video.mp4")
         with open(mp4_file, "w") as f:
             f.write("FAKE VIDEO" * 1000)
+        
         # Should stub very quickly since it matches immediate_archive_extensions
         wait_for_stubbing(mp4_file, timeout=20)
 
+        # Verify it bypassed compression! (Daemon stores absolute paths)
+        abs_mp4_file = os.path.abspath(mp4_file)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT compression_type, payload_size, compressed_size FROM catalog WHERE file_path = ?", (abs_mp4_file,))
+        db_res = c.fetchone()
+        conn.close()
+        
+        if db_res and db_res[0] == 0 and db_res[1] == db_res[2]:
+            logging.info("   ✅ SUCCESS: .mp4 file correctly bypassed compression (Raw bytes written to volume).")
+        else:
+            logging.error(f"   ❌ FAILED: .mp4 file was compressed or not found! (DB Data: {db_res})")
+            
         # 4. Test Subfolder Discovery & Background Rescan
         logging.info("📁 Creating dynamic subfolders to test recursive Fanotify...")
         sub_dir = os.path.join(HOT_TIER, "deep_project_folder")
@@ -226,9 +376,20 @@ def main():
         # Generate the test file so that it has multiple 16MB frames
         logging.info("   Writing ~35MB StreamGate test file...")
         with open(sg_file, "wb") as f:
-            f.write(b"A" * target_offset)
+            # Use high-entropy (incompressible) data so the payload actually
+            # consumes ~35 MB on tape.  Repetitive patterns compress to almost
+            # nothing, which leaves Tape 2 looking nearly empty and breaks the
+            # balancer shift test that follows.
+            chunk = 256 * 1024
+            remain = target_offset
+            while remain > 0:
+                f.write(os.urandom(min(chunk, remain)))
+                remain -= chunk
             f.write(secret_payload.encode("utf-8"))
-            f.write(b"B" * (17 * 1024 * 1024))
+            remain = 17 * 1024 * 1024
+            while remain > 0:
+                f.write(os.urandom(min(chunk, remain)))
+                remain -= chunk
             
         wait_for_stubbing(sg_file)
         
@@ -283,6 +444,8 @@ def main():
             logging.error("❌ FAILED: StreamGate extraction error!")
             logging.error(f"   --- CAT STDOUT ---\n{cat_res.stdout}\n   ------------------")
             logging.error(f"   --- CAT STDERR ---\n{cat_res.stderr}\n   ------------------")
+
+        
         # ---------------------------------------------------------
         # EDGE CASE BATTERY
         # ---------------------------------------------------------
@@ -422,9 +585,10 @@ def main():
             f.write("CRITICAL DATA")
         wait_for_stubbing(failover_file)
         
-        # "Unplug" the primary tape by renaming it
-        logging.info("   'Unplugging' Primary Tape...")
-        run_cmd(["sudo", "mv", TAPE_PRIMARY, TAPE_PRIMARY + ".offline"])
+        # "Unplug" the primary tapes by renaming them
+        logging.info("   'Unplugging' Primary Tapes to force Replica failover...")
+        run_cmd(["sudo", "mv", TAPE_PRIMARY_1, TAPE_PRIMARY_1 + ".offline"])
+        run_cmd(["sudo", "mv", TAPE_PRIMARY_2, TAPE_PRIMARY_2 + ".offline"])
         
         try:
             with open(failover_file, "r") as f:
@@ -435,8 +599,9 @@ def main():
         except Exception as e:
             logging.error(f"   ❌ FAILED: Application crashed during failover attempt! {e}")
         finally:
-            # "Plug" it back in so Steps 7 and 8 (Scrubber/Repacker) can finish later
-            run_cmd(["sudo", "mv", TAPE_PRIMARY + ".offline", TAPE_PRIMARY])        
+            # "Plug" them back in so Steps 7 and 8 (Scrubber/Repacker) can finish later
+            run_cmd(["sudo", "mv", TAPE_PRIMARY_1 + ".offline", TAPE_PRIMARY_1])
+            run_cmd(["sudo", "mv", TAPE_PRIMARY_2 + ".offline", TAPE_PRIMARY_2])
     finally:
         # Stop Daemon Gracefully
         logging.info("🛑 Stopping HuskHoard Daemon safely...")
@@ -459,27 +624,27 @@ def main():
     os.remove(restore_dest)
 
     # 7. Scrubber Test
-    logging.info("🩺 Running Scrubber on Primary Tape to verify BLAKE3 integrity...")
-    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "scrub", "--tape-dev", TAPE_PRIMARY])
+    logging.info("🩺 Running Scrubber on Primary Tape 1 to verify BLAKE3 integrity...")
+    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "scrub", "--tape-dev", TAPE_PRIMARY_1])
 
     # 8. Repacker (Garbage Collection) Test
     logging.info("♻️ Testing Repacker (Garbage Collection)...")
     run_cmd(["fallocate", "-l", "500M", TAPE_REPACK])
-    # The new tape must be formatted before repacking
     run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "format", "--tape-dev", TAPE_REPACK])
     
     run_cmd([
-        "sudo", "hoard", "--config", CONFIG_FILE, "repack",
-        "--source-tape", TAPE_PRIMARY,
+        "sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "repack",
+        "--source-tape", TAPE_PRIMARY_1,
         "--dest-tape", TAPE_REPACK
     ])
     
     logging.info("📊 Final Tape Gauge (Repacked Tape):")
-    run_cmd(["sudo", "hoard", "--config", CONFIG_FILE, "info", "--tape-dev", TAPE_REPACK])
+    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "info", "--tape-dev", TAPE_REPACK])
     
     logging.info("☁️  Final Tape Gauge (Mock Cloud Target):")
-    run_cmd(["sudo", "hoard", "--config", CONFIG_FILE, "info", "--tape-dev", f"rclone:{CLOUD_MOCK_DIR}"])
-# 9. Verify Auto-Catalog Mirroring (Idle Backup)
+    run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "info", "--tape-dev", f"rclone:{CLOUD_MOCK_DIR}"])
+
+    # 9. Verify Auto-Catalog Mirroring (Idle Backup)
     logging.info("🪞 Verifying Auto-Catalog Mirroring (Idle Backup)...")
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -495,14 +660,13 @@ def main():
         logging.error(f"❌ FAILED to query DB for mirror: {e}")
 
     # 10. Disaster Recovery (Rebuild DB from Tape)
-    logging.info("🚑 Testing Disaster Recovery (Catalog Rebuild from Tape)...")
+    logging.info("🚑 Testing Disaster Recovery (Catalog Rebuild from Tape 1)...")
     recovered_db = "huskhoard_recovered_test.db"
     subprocess.run(["sudo", "rm", "-f", recovered_db])
     
-    # We use the primary tape to rebuild the catalog from scratch
     run_cmd([
-        "sudo", "hoard", "--config", CONFIG_FILE, "rebuild", 
-        "--tape-dev", TAPE_PRIMARY, 
+        "sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "rebuild", 
+        "--tape-dev", TAPE_PRIMARY_1, 
         "--output-db", recovered_db
     ])
     
@@ -518,6 +682,9 @@ def main():
         conn.close()
     except Exception as e:
         logging.error(f"❌ FAILED to read recovered DB: {e}")
+    
+    simulate_jbod_lifecycle()
+        
     logging.info("🎉 COMPREHENSIVE TEST COMPLETE.")
 
 if __name__ == "__main__":
