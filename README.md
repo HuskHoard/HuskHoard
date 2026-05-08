@@ -49,6 +49,7 @@ HuskHoard relies on the Linux **fanotify** kernel API. It is compatible with alm
 *   **Primary Support:** Ubuntu 22.04 LTS, 24.04 LTS (Recommended)
 *   **Enterprise/Server:** Debian 11/12, Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9
 *   **Desktop/Rolling:** Arch Linux, Fedora 38+, openSUSE Tumbleweed
+*   **File System:** XFS, ZFS, Ext4, Btrfs
 *   **Incompatible:** WSL2 (Windows Subsystem for Linux), CentOS 7 (Kernel too old), Synology/QNAP (unless using custom kernels).
 
 
