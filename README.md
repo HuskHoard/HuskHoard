@@ -6,7 +6,7 @@
 
 **HuskHoard** is an automated, transparent data-tiering engine for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives, **Physical LTO Tapes**, or cloud buckets—while keeping the files fully visible and accessible to your OS.
 
-It acts like an Enterprise Tape Library, but built for the modern homelab and data hoarder.
+It acts like an Enterprise Tape Library, but built for the modern hyhbrid cloud user.
 
 ## Why HuskHoard?
 
@@ -23,6 +23,8 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 *   **N-Way Replication:** Automatically mirror cold data across local drives, physical tapes, and cloud buckets (via rclone) simultaneously.
 *   **Point-in-Time Recovery (PITR):** Roll back any file to a previous version using the built-in versioning engine.
 *   **Bit-Rot Scrubber:** Cryptographically verify the integrity of offline storage using BLAKE3 hashes.
+*   **High-Water Mark Spillover:** Automatically safeguard your SSD from "Disk Full" errors. If the Hot Tier usage exceeds a configurable threshold (e.g., 80%), HuskHoard triggers an emergency archive cycle, migrating the oldest, least-accessed files to long-term storage regardless of their age until safe capacity is restored.
+
 
 #### Hardware-Aware Architecture
 Modern storage requires specialized handling. HuskHoard treats your media differently based on its physics:
@@ -114,6 +116,11 @@ hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to you
 max_age_days = 0 # TEST MODE: Archive files immediately
 janitor_interval_secs = 10
 http_port = 8080 # Port for the Streaming Gateway
+# --- Safety Settings ---
+# Trigger emergency archiving if the Hot Tier exceeds 80% capacity
+hot_tier_max_usage_percent = 80 
+# The Janitor will try to keep at least this much space (in GB) strictly free
+min_free_space_gb = 5
 ```
 
 #### 5. Launch the Daemon
@@ -144,7 +151,7 @@ Wait 10 seconds.
 
 **Stream a file directly from Tape (Zero-Disk):**
 ```bash
-./target/release/huskhoard cat --file /media/movies/scifi.mp4 | mpv -
+./target/release/huskhoard cat --file-path /media/movies/scifi.mp4 | mpv -
 ```
 
 **Check Capacity & "Wasteland" statistics:**
