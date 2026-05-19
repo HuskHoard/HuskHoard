@@ -209,7 +209,16 @@ Some files (like raw video footage or ISOs) should never take up SSD space. You 
 immediate_archive_extensions = ["mp4", "mkv", "iso", "zip"]
 immediate_archive_dirs = ["/ArchiveDrop/"]
 ```
+### Emergency Spillover & Capacity Management
+The High-Water Mark Spillover feature serves as a critical safety valve for the Hot Tier (SSD). While the standard policy engine archives files based on age (e.g., max_age_days), the Spillover logic monitors the physical reality of your disk space. During every Janitor scan, HuskHoard calculates the current disk usage of the Hot Tier. If the usage percentage exceeds the hot_tier_max_usage_percent defined in your configuration, the system enters "Emergency Spillover" mode.
+In this state, HuskHoard calculates exactly how many bytes must be freed to return to the target threshold. It then queries the catalog for un-stubbed files, sorted by the oldest access time (LRU). These files are moved to the storage pool and stubbed immediately, overriding any minimum age requirements. This ensures that your high-speed storage remains available for new ingest and system operations, even during unexpected bursts of data growth.
+```toml
+Trigger emergency archiving if the Hot Tier exceeds 80% capacity
+hot_tier_max_usage_percent = 80 
 
+The Janitor will try to keep at least this much space (in GB) strictly free
+min_free_space_gb = 5
+```
 ## 2. Restoring Data
 HuskHoard provides two ways to get your data back.
 
