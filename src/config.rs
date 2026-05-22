@@ -101,7 +101,7 @@ http_port = 8080   # HTTP Streaming Gateway Port
 hot_tier_max_usage_percent = 80 # Spillover to tape if Hot Tier exceeds 80% full
 
 # --- Volume Tiering ---
-min_free_space_gb = 5 # Prevent drives from filling beyond this limit
+min_free_space_gb = 0 # Prevent drives from filling beyond this limit
 primary_volumes = ["my_archive.img"]
 failover_volumes = ["failover_tape.img"]
 replication_volumes = ["replication_archive.img"]
