@@ -172,7 +172,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         false
     };
 
-    let min_free_bytes = config.min_free_space_gb.unwrap_or(5) * 1024 * 1024 * 1024;
+    let min_free_bytes = config.min_free_space_gb.unwrap_or(0) * 1024 * 1024 * 1024;
 
     // Balance Tier 1: Primary Volume
     let balanced_primary = get_balanced_volumes(&config.primary_volumes, &config.db_path, min_free_bytes);
@@ -183,7 +183,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
     }
     
     if !primary_secured {
-        error!("!!Primary volumes unavailable or below {} GB free! Attempting Failover Tier...", config.min_free_space_gb.unwrap_or(5));
+        error!("!!Primary volumes unavailable or below {} GB free! Attempting Failover Tier...", config.min_free_space_gb.unwrap_or(0));
         let balanced_failover = get_balanced_volumes(&config.failover_volumes, &config.db_path, min_free_bytes);
         for dev in &balanced_failover {
             if try_attach_tape(dev) { break; }
