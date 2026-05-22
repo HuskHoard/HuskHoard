@@ -115,8 +115,9 @@ janitor_schedule_time = "none"
 # Testing interval: How often the scanner wakes up (in seconds).
 janitor_interval_secs = 60
 
-max_age_days = 30
-max_versions = 3
+# set to 0 for test    
+max_age_days = 0  
+max_versions = 0
 
 # --- Exclusions & Immediate Rules ---
 exclude_dirs = ["/.git/", "/node_modules/", "/__pycache__/"]
