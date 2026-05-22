@@ -114,13 +114,13 @@ primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
 replication_volumes = ["/home/YOUR_USERNAME/huskhoard/replication_archive.img"]
 hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to your hot tier
 max_age_days = 0 # TEST MODE: Archive files immediately
-janitor_interval_secs = 10
+janitor_interval_secs = 60
 http_port = 8080 # Port for the Streaming Gateway
 # --- Safety Settings ---
 # Trigger emergency archiving if the Hot Tier exceeds 80% capacity
 hot_tier_max_usage_percent = 80 
-# The Janitor will try to keep at least this much space (in GB) strictly free
-min_free_space_gb = 5
+# The Janitor will try to keep at least this much space (in GB) strictly free, set to 0 for test
+min_free_space_gb = 0
 ```
 
 #### 5. Launch the Daemon
