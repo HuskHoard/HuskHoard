@@ -1,0 +1,74 @@
+
+
+### OS Compatibility & Requirements
+HuskHoard relies on the Linux fanotify kernel API. 
+
+*   **Enterprise/Server Support:** **Rocky Linux 8/9 (Highly Recommended)**, AlmaLinux 8/9, RHEL 8/9
+*   **Primary Support:** Ubuntu 22.04 LTS, 24.04 LTS
+*   **File System:** XFS (Default on Rocky), ZFS, Ext4, Btrfs
+*   **Note for LTO Users:** Rocky Linux is excellent for LTO due to its stable SCSI stack.
+
+### 🚀 Quick Start (Rocky Linux 9)
+⚠️ **Important:** Run all commands as your standard user. Do not log in as root.
+
+#### 1. Prerequisites
+Enable the EPEL repository and install the required system tools and Rust compiler:
+
+```bash
+# Update system and enable EPEL (needed for rclone)
+sudo dnf update -y
+sudo dnf install -y epel-release
+
+# Install Development Tools and dependencies
+sudo dnf groupinstall "Development Tools" -y
+sudo dnf install -y rclone libcap attr pkgconf-pkg-config sqlite-devel git mt-st mtx
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+#### 2. Download and Build
+```bash
+git clone https://github.com/huskhoard/huskhoard.git
+cd huskhoard
+
+# Build the project
+cargo build --release
+```
+
+#### 3. Grant Kernel Capabilities
+Because Rocky Linux has strict security (SELinux), granting capabilities is the best way to run HuskHoard without root:
+
+```bash
+sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
+```
+
+#### 4. Configure Your Environment
+Set up your testing area. Since Rocky users often use XFS, `fallocate` is extremely fast here.
+
+```bash
+mkdir -p hot_tier
+fallocate -l 100M my_archive.img
+
+# Format the volume (generates husk_config.toml)
+./target/release/huskhoard format --tape-dev my_archive.img
+
+# FOR YOUR LTO DRIVE:
+# ./target/release/huskhoard format --tape-dev /dev/nst0
+```
+
+**Update `husk_config.toml`:**
+Rocky Linux home directories are usually `/home/username/`. Ensure your paths match:
+```toml
+primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
+hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"
+max_age_days = 0 
+janitor_interval_secs = 60
+```
+
+#### 5. Launch the Daemon
+```bash
+./target/release/huskhoard daemon
+```
+
