@@ -102,7 +102,8 @@ Next, format the volume. Running this command for the first time will automatica
 ```bash
 ./target/release/huskhoard format --tape-dev my_archive.img
 ./target/release/huskhoard format --tape-dev replication_archive.img
-
+```
+```bash
 # OR: Format a physical LTO tape drive
 ./target/release/huskhoard format --tape-dev /dev/nst0
 ```
