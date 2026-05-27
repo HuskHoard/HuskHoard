@@ -1,4 +1,4 @@
-# This tests all of the main features. run it with sudo. it will launch the huskhoard main and create storage volumes and catalogs.
+# This tests all of the main features. move it to the huskhoard folder and run it with sudo, after you have installed the dependentcies. it will launch the huskhoard main and create storage volumes and catalogs.
 # It then populates the volumes and creates replica versions. 
 # the log will print all actions. this is ai generated code as you can see by the emoji intensity, but i decided to leave them in. 
 
