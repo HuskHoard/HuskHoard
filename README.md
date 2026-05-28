@@ -37,7 +37,8 @@ Modern storage requires specialized handling. HuskHoard treats your media differ
 *   **The Interceptor:** A lightweight fanotify loop that detects when an application requests a stubbed file and triggers an instant recall.
 *   **The Janitor:** A background policy engine that identifies cold data based on age, extension, or directory rules.
 *   **The Archive Worker:** The heavy-lifter. It compresses data into seekable frames, multiplexes writes across the storage pool, and manages SCSI hardware commands.
-
+*   **More about Architecture:** The blog has a few indepth articles about the architecture. You can read more here www.huskhoard.com/blog.html 
+   
 ### Sustainability & Drive Longevity
 *   **Reduced Duty Cycle:** Batching allows archive drives to stay spun down and idle 99% of the time.
 *   **Energy Efficient:** Large collections don't need dozens of drives spinning 24/7. HuskHoard lets them sleep until you hit "Play."
