@@ -43,7 +43,7 @@ pub struct HuskConfig {
 }
 
 // ---------------------------------------------------------
-// NEW: Enterprise Sidecar IPC Bridge
+// Enterprise Sidecar IPC Bridge
 // ---------------------------------------------------------
 pub struct SidecarBridge {
     socket_path: Option<String>,
