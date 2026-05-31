@@ -65,5 +65,5 @@ janitor_interval_secs = 3600
 2. **Native RADOS Object Pruning:** When Husk punches a hole in a CephFS file, the Ceph MDS tells the OSDs to literally delete the underlying 4MB RADOS objects. The space is freed cluster-wide immediately, while the file stub remains perfectly intact for your SMB/NFS users.
 3. **Cluster Energy Efficiency:** Disks in Ceph OSDs are kept spinning to maintain cluster health and scrub data. By moving 80% of your cold data to an offline tape pool or cold cloud tier, you drastically reduce the physical footprint, heat, and power consumption of your Ceph cluster.
 4. **Zero-Friction Access:** When a user clicks an old file over the Samba share, Husk pauses the read, fetches the byte-range from Tape/S3 using the StreamGate engine, and transparently streams it back into CephFS. The user experiences a slight loading delay, but has no idea the file was stored on tape.
-
+5. A few more notes about integrating with Ceph can be found here: https://www.huskhoard.com/blog-post-ceph.html
 
