@@ -1,19 +1,52 @@
+This is a fantastic addition to the documentation. It perfectly bridges the gap between TrueNAS SCALE’s appliance-like nature and Husk’s low-level hardware/kernel requirements. 
 
-### 🚀 Quick Start (TrueNAS SCALE / Debian Jail)
-⚠️ **Note:** This guide assumes you are using **Jailmaker** to run a persistent debian sandbox. this keeps huskhoard away from the core appliance os.
 
-#### 1. Jailmaker Setup
-before installing huskhoard you need to create the jail. make sure your jail config has **privileged: true** and bind mounts your zfs dataset so huskhoard can see the files. if you are using a usb drive or tape drive add a device passthrough for `/dev/sdb` or `/dev/nst0`.
+# 🚀 Quick Start (TrueNAS SCALE / Debian Jail)
 
-#### 2. Prerequisites
-inside your new debian jail run these to get the environment ready.
+⚠️ **Note:** This guide assumes you have [Jailmaker](https://github.com/Jip-Hop/jailmaker) installed on your TrueNAS SCALE box. By running Husk in a jail, you keep the software persistent across OS updates while getting full, unrestricted access to the ZFS datasets and physical tape hardware.
+
+### 1. Create the Jailmaker Config
+
+Before starting the jail, you need to edit the config file to allow kernel hooks and hardware access. In your TrueNAS shell, create a jail called `husk` and paste this into the configuration file.
+
+```ini
+# Husk Jailmaker Template
+distro=debian
+release=bookworm
+
+# Use host networking so the HTTP Gateway (8080) is reachable on your LAN
+network=host
+
+# Husk needs high-level permissions for fanotify and hardware access
+systemd_nspawn_user_args=(
+    # Allow the jail to talk to the host kernel for filesystem events
+    --capability=all
+    --system-call-filter=@system-service
+    
+    # 1. Bind mount your ZFS dataset (The Hot Tier)
+    # Change /mnt/tank/media to your actual TrueNAS dataset path
+    --bind=/mnt/tank/media:/mnt/hot_tier
+    
+    # 2. Pass through your physical tape or USB hardware
+    # For physical tape: pass through the raw SCSI device
+    --property="DeviceAllow=/dev/nst0 rwm"
+    --bind=/dev/nst0
+    
+    # 3. Keep the Husk database and binary on your ZFS pool
+    # This ensures your catalog and application survive if you rebuild the jail
+    --bind=/mnt/tank/apps/huskhoard:/opt/huskhoard
+)
+```
+
+### 2. Prerequisites
+Start your jail, open a shell inside it, and run these commands to prepare the Debian environment.
 
 ```bash
 # Update the package database
 sudo apt update
 sudo apt upgrade -y
 
-# Install build tools and libraries
+# Install build tools and dependencies
 sudo apt install -y build-essential libcap2-bin rclone libattr1-dev attr libsqlite3-dev pkg-config git mt-st mtx
 
 # Install Rust
@@ -21,8 +54,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
 
-#### 3. Download and Build
+### 3. Download and Build
+Because we mapped `/opt/huskhoard` to a persistent ZFS dataset in step 1, we will build the app there.
+
 ```bash
+cd /opt
 git clone https://github.com/huskhoard/huskhoard.git
 cd huskhoard
 
@@ -30,44 +66,45 @@ cd huskhoard
 cargo build --release
 ```
 
-#### 4. Grant Kernel Capabilities
-this lets huskhoard monitor the filesystem and talk to the hardware without needing to run every command as root.
+### 4. Grant Kernel Capabilities
+This allows Husk to monitor the filesystem (`fanotify`) and send low-level commands to your tape hardware without needing to be run as the root user.
 
 ```bash
-sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
+sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/husk
 ```
 
-#### 5. Configure Your Environment
-truenas uses zfs which handles hole punching automaticly. make sure your hot tier path is the mount point for your zfs dataset.
+### 5. Configure Your Environment
+We will use the persistent paths established in our Jailmaker config.
 
 ```bash
-mkdir -p hot_tier
-# create a dummy archive file if you are just testing with a file instead of a drive
+cd /opt/huskhoard
+
+# Create a dummy archive file (if testing without a physical tape drive)
 fallocate -l 100M my_archive.img
 
-# Format the volume (this generates your husk_config.toml)
-./target/release/huskhoard format --tape-dev my_archive.img
+# Format the volume (this also generates your husk_config.toml)
+./target/release/husk format --tape-dev my_archive.img
 ```
 
-**Update `husk_config.toml`:**
+**Update `husk_config.toml` to run in a test mode:**
 ```toml
-primary_volumes = ["/mnt/huskhoard/my_archive.img"]
-hot_tier = "/mnt/huskhoard/hot_tier"
+primary_volumes = ["/opt/huskhoard/my_archive.img"]
+hot_tier = "/mnt/hot_tier"
 max_age_days = 0 
 janitor_interval_secs = 60
 ```
 
-#### 6. Launch the Daemon
+### 6. Launch the Daemon
 ```bash
-./target/release/huskhoard daemon
+./target/release/husk daemon
 ```
 
 ---
 
-### Important notes for TrueNAS SCALE users:
+### 💡 Why TrueNAS SCALE + HuskHoard?
 
-1.  **Persistence:** by running inside a jailmaker sandbox everything you install (rust, huskhoard, etc) stays on your zfs pool and wont get deleted when you update truenas.
-2.  **ZFS Compatibility:** huskhoard uses fallocate to free up space. on zfs this works perfectly and immediately reduces the used space on your pool while keeping the file entry visible.
-3.  **Direct Hardware:** if you are using a physical lto drive make sure the `st` and `sg` kernel modules are loaded on the trunas host. jailmaker will then pass them through to the sandbox.
-4.  **Networking:** if you want to huse the http gateway for plex make sure your jailmaker config has a dedicated ip or use host networking so the port is reachable on your lan.
-5.  **Memory Safety:** running in a jail provides an extra layer of safety. huskhoard can monitor your data datasets but the binary and its temporary files stay contained.
+1. **ZFS Infinite Expansion:** Instead of buying more disks, Husk automatically moves cold data to tape or cloud remotes. TrueNAS ZFS handles the hole-punching natively, meaning the files stay perfectly visible in your SMB/NFS shares but take up zero blocks on your storage pool.
+2. **Jailmaker Safety:** By using `systemd-nspawn` via Jailmaker, you get a persistent Debian environment that survives TrueNAS OS updates while keeping the binary safely contained away from the host OS.
+3. **Hardware Passthrough:** The `DeviceAllow` property in the config is the pro way to handle SCSI tape drives. It lets Husk's Rust code send raw `ioctl` commands directly to the hardware without compromising the main OS or requiring custom TrueNAS kernel tweaks.
+4. **Zero-Copy StreamGate:** Husk's mathematical jump tables allow you to stream media directly from a tape drive or cloud remote back to your ZFS pool via the HTTP Gateway, making your archives act like a bottomless SSD distribution node for Plex or Jellyfin.
+```
