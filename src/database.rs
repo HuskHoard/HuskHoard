@@ -12,7 +12,7 @@ pub fn rescan_tape_drives(conn: &Connection) {
     for (uuid, serial, old_path) in rows {
         let mut found = false;
         
-        // 1. Scan Block Devices (HDDs / SSDs / USBs)
+        // Scan Block Devices (HDDs / SSDs / USBs)
         if let Ok(entries) = std::fs::read_dir("/sys/block") {
             for entry in entries.flatten() {
                 let dev_name = entry.file_name().to_string_lossy().to_string();
@@ -33,7 +33,7 @@ pub fn rescan_tape_drives(conn: &Connection) {
             }
         }
 
-        // 2. Scan SCSI Tape Drives if not found in block
+        // Scan SCSI Tape Drives if not found in block
         if !found {
             if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_tape") {
                 for entry in entries.flatten() {
@@ -66,9 +66,9 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
     let conn = Connection::open(db_path)?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
     
-    // EXTREMELY IMPORTANT: Enable Write-Ahead Logging.
+    // Enable Write-Ahead Logging.
     // This allows the Sweeper (Thread) and Interceptor (Main) to write simultaneously 
-    // without throwing "database is locked" errors.
+    
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     
     // Main tape catalog
