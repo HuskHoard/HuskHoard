@@ -30,7 +30,7 @@ pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u
         if let Ok((used, total, _)) = check_tape_gauge(dev, db_path) {
             let free = total.saturating_sub(used);
             if free >= min_free_bytes {
-                // CHANGED: Store 'used' space instead of 'free' space
+                // Store 'used' space instead of 'free' space
                 Some((dev.clone(), used))
             } else {
                 None // Drive falls below minimum threshold
@@ -40,7 +40,7 @@ pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u
         }
     }).collect();
 
-    // CHANGED: Sort descending by used space (Sticky drive effect)
+    // Sort descending by used space (Sticky drive effect)
     vols_with_space.sort_by(|a, b| b.1.cmp(&a.1));
 
     vols_with_space.into_iter().map(|(dev, _)| dev).collect()
@@ -216,7 +216,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
     let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
     
-    // NEW LOGIC: Check config to bypass Zstd compression
+    // Check config to bypass Zstd compression
     let file_ext = std::path::Path::new(source_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let use_compression = !config.no_compress_extensions.contains(&file_ext);
     let compression_type_flag: u8 = if use_compression { 1 } else { 0 };
@@ -332,8 +332,8 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             }
         }
 
-        // NEW Type 0x03: Pack StreamGate Jump Table (Array of u32 compressed sizes)
-        // Note: 16MB frames mean we only need 4 bytes per frame. A 10GB file only needs ~600 frames (2.4KB).
+        // Type 0x03: Pack StreamGate Jump Table (Array of u32 compressed sizes)
+        //  16MB frames mean we only need 4 bytes per frame. A 10GB file only needs ~600 frames (2.4KB).
         let frames_payload_len = jump_table.len() * 4;
         if tlv_offset + 4 + frames_payload_len <= header.tlv_data.len() {
             header.tlv_data[tlv_offset] = 0x00; header.tlv_data[tlv_offset+1] = 0x03;
@@ -424,7 +424,7 @@ impl<W: std::io::Write> std::io::Write for SkipWriter<W> {
             start = skip;
         }
 
-        // 2. Write the remaining bytes to the destination
+        //  Write the remaining bytes to the destination
         if start < buf.len() {
             let mut to_write = buf.len() - start;
             if let Some(lim) = self.limit {
@@ -519,7 +519,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
 
     let abs_start_offset = tape_offset + 4096 + target_c_offset;
 
-    // --- FIX: O_DIRECT BLOCK ALIGNMENT ---
+    // --- O_DIRECT BLOCK ALIGNMENT ---
     // We must seek and read in multiples of 4096.
     let aligned_offset = abs_start_offset - (abs_start_offset % 4096);
     let alignment_skew = (abs_start_offset % 4096) as usize;
@@ -550,8 +550,8 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
         let clean_remote = tape_dev.strip_prefix("rclone:").unwrap();
         let object_path = format!("{}/husk_{}.bin", clean_remote, tape_offset);
         
-        // FIX: Rclone objects are individual files, not one giant tape. 
-        // We must convert the absolute virtual tape offset into a file-relative offset!
+        //  Rclone objects are individual files, not one giant tape. 
+        //  convert the absolute virtual tape offset into a file-relative offset!
         let file_relative_offset = aligned_offset - tape_offset;
         
         info!("[StreamGate] Spawning Rclone -> cat {} --offset {} --count {}", object_path, file_relative_offset, padded_target_c_len);
@@ -608,7 +608,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
                 return Ok(0); 
             }
 
-            // 1. Safely discard the alignment skew, tolerating highly fragmented stream reads
+            // discard the alignment skew, tolerating highly fragmented stream reads
             while self.skew_discarded < self.alignment_skew {
                 if self.buf_start >= self.buf_end {
                     let to_read = self.io_buf.capacity;
@@ -625,7 +625,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
                 self.skew_discarded += to_discard;
             }
 
-            // 2. Read actual compressed payload (Replenish if buffer empty)
+            //  Read compressed payload (Replenish if buffer empty)
             if self.buf_start >= self.buf_end {
                 let to_read = self.io_buf.capacity;
                 let n = self.tape.read(&mut self.io_buf.as_mut_slice()[..to_read])?;
@@ -634,7 +634,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
                 self.buf_end = n;
             }
 
-            // 3. Serve the target payload, clamped by remaining target_c_len
+            //  Serve the target payload, clamped by remaining target_c_len
             let available = self.buf_end - self.buf_start;
             let remaining = self.target_c_len - self.bytes_produced;
             let chunk = std::cmp::min(std::cmp::min(buf.len(), available), remaining);
@@ -796,9 +796,9 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     let dup_fd = unsafe { libc::dup(dest_fd) };
     if dup_fd < 0 { return Err(std::io::Error::last_os_error()); }
 
-    // --- FIX: Explicitly enforce original UNIX ownership and permissions ---
+    //  Explicitly enforce original UNIX ownership and permissions ---
     // Only apply for manual restores to prevent stripping POSIX ACLs on SMB shares.
-    // The fanotify daemon doesn't need this because hole-punched stubs retain their original permissions/ACLs.
+    
     if is_manual {
         unsafe {
             if header.uid != 0 || header.gid != 0 {
@@ -1050,14 +1050,14 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     let conn = Connection::open(db_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(30)); // Wait for daemon locks instead of panicking
     
-    // 1. Check Source Volume
+    //  Check Source Volume
     let mut src_tape = open_tape_device(source_dev, true, false, false, use_direct_io)?;
     let mut vol_buf = AlignedBuffer::new(ALIGNMENT);
     src_tape.read_exact(vol_buf.as_mut_slice())?;
     let src_vol: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
     let src_uuid_hex = src_vol.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
-    // 2. Open/Format Destination Volume
+    //  Open/Format Destination Volume
     let mut dest_tape = open_tape_device(dest_dev, true, true, true, use_direct_io)?;
     let dest_meta = dest_tape.metadata()?;
     if dest_meta.len() < ALIGNMENT as u64 {
@@ -1069,7 +1069,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     let dest_vol: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
     let dest_uuid_hex = dest_vol.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
-    // 3. Find latest versions of all files on the source tape
+    // Find latest versions of all files on the source tape
     let query = "
         SELECT id, file_path, tape_offset, compressed_size 
         FROM catalog c1 
