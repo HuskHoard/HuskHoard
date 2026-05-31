@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
 // ---------------------------------------------------------
-// 1. The 4KB Object Header Definition (Padding Fixed!)
+// 1. The 4KB Object Header Definition 
 // ---------------------------------------------------------
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -9,10 +9,10 @@ pub struct ObjectHeader {
     pub magic_bytes: [u8; 8],     // offset 0
     pub format_version: u16,      // offset 8
     pub flags: u16,               // offset 10
-    pub compression_type: u8,     // offset 12 (NEW: 0=None, 1=Zstd)
-    pub reserved_pad: [u8; 3],    // offset 13 (Padding Fix)
+    pub compression_type: u8,     // offset 12 ( 0=None, 1=Zstd)
+    pub reserved_pad: [u8; 3],    // offset 13 
     pub payload_size: u64,        // offset 16 (Uncompressed size)
-    pub compressed_size: u64,     // offset 24 (NEW: Compressed length)
+    pub compressed_size: u64,     // offset 24 
     pub padded_size: u64,         // offset 32 (Aligned on tape)
     pub object_uuid: [u8; 16],    // offset 40
     pub tape_uuid: [u8; 16],      // offset 56
