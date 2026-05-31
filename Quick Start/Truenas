@@ -106,4 +106,4 @@ janitor_interval_secs = 60
 2. **Jailmaker Safety:** By using `systemd-nspawn` via Jailmaker, you get a persistent Debian environment that survives TrueNAS OS updates while keeping the binary safely contained away from the host OS.
 3. **Hardware Passthrough:** The `DeviceAllow` property in the config is the pro way to handle SCSI tape drives. It lets Husk's Rust code send raw `ioctl` commands directly to the hardware without compromising the main OS or requiring custom TrueNAS kernel tweaks.
 4. **Zero-Copy StreamGate:** Husk's mathematical jump tables allow you to stream media directly from a tape drive or cloud remote back to your ZFS pool via the HTTP Gateway, making your archives act like a bottomless SSD distribution node for Plex or Jellyfin.
-```
+5. A few more notes about integrating with TrueNAS can be found here: https://www.huskhoard.com/blog-post-true.html```
