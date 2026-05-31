@@ -22,7 +22,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     if reader.read_line(&mut request_line).is_err() || request_line.is_empty() { return; }
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     
-    // VITAL: Support HTTP HEAD requests used by Plex/VLC for probing file sizes
+    //  Support HTTP HEAD requests used by Plex/VLC for probing file sizes
     if parts.len() < 2 || (parts[0] != "GET" && parts[0] != "HEAD") { return; }
     let is_head_request = parts[0] == "HEAD";
 
