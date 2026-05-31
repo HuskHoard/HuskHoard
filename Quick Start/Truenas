@@ -1,0 +1,73 @@
+
+### 🚀 Quick Start (TrueNAS SCALE / Debian Jail)
+⚠️ **Note:** This guide assumes you are using **Jailmaker** to run a persistent debian sandbox. this keeps huskhoard away from the core appliance os.
+
+#### 1. Jailmaker Setup
+before installing huskhoard you need to create the jail. make sure your jail config has **privileged: true** and bind mounts your zfs dataset so huskhoard can see the files. if you are using a usb drive or tape drive add a device passthrough for `/dev/sdb` or `/dev/nst0`.
+
+#### 2. Prerequisites
+inside your new debian jail run these to get the environment ready.
+
+```bash
+# Update the package database
+sudo apt update
+sudo apt upgrade -y
+
+# Install build tools and libraries
+sudo apt install -y build-essential libcap2-bin rclone libattr1-dev attr libsqlite3-dev pkg-config git mt-st mtx
+
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+#### 3. Download and Build
+```bash
+git clone https://github.com/huskhoard/huskhoard.git
+cd huskhoard
+
+# Build the project
+cargo build --release
+```
+
+#### 4. Grant Kernel Capabilities
+this lets huskhoard monitor the filesystem and talk to the hardware without needing to run every command as root.
+
+```bash
+sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
+```
+
+#### 5. Configure Your Environment
+truenas uses zfs which handles hole punching automaticly. make sure your hot tier path is the mount point for your zfs dataset.
+
+```bash
+mkdir -p hot_tier
+# create a dummy archive file if you are just testing with a file instead of a drive
+fallocate -l 100M my_archive.img
+
+# Format the volume (this generates your husk_config.toml)
+./target/release/huskhoard format --tape-dev my_archive.img
+```
+
+**Update `husk_config.toml`:**
+```toml
+primary_volumes = ["/mnt/huskhoard/my_archive.img"]
+hot_tier = "/mnt/huskhoard/hot_tier"
+max_age_days = 0 
+janitor_interval_secs = 60
+```
+
+#### 6. Launch the Daemon
+```bash
+./target/release/huskhoard daemon
+```
+
+---
+
+### Important notes for TrueNAS SCALE users:
+
+1.  **Persistence:** by running inside a jailmaker sandbox everything you install (rust, huskhoard, etc) stays on your zfs pool and wont get deleted when you update truenas.
+2.  **ZFS Compatibility:** huskhoard uses fallocate to free up space. on zfs this works perfectly and immediately reduces the used space on your pool while keeping the file entry visible.
+3.  **Direct Hardware:** if you are using a physical lto drive make sure the `st` and `sg` kernel modules are loaded on the trunas host. jailmaker will then pass them through to the sandbox.
+4.  **Networking:** if you want to huse the http gateway for plex make sure your jailmaker config has a dedicated ip or use host networking so the port is reachable on your lan.
+5.  **Memory Safety:** running in a jail provides an extra layer of safety. huskhoard can monitor your data datasets but the binary and its temporary files stay contained.
