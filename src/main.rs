@@ -73,7 +73,7 @@ fn main() {
 
             let (tx, rx) = mpsc::sync_channel(100);
 
-            // 1. Spawn the Archive Worker (Handles the heavy lifting)
+            // 1. Spawn the Archive Worker 
             let worker_config = Arc::clone(&config_arc);
             thread::spawn(move || {
                 run_archive_worker(rx, worker_config, use_direct_io);
@@ -90,7 +90,7 @@ fn main() {
                             if let Ok(target_time) = chrono::NaiveTime::parse_from_str(schedule, "%H:%M") {
                                 let mut target_dt = now.date_naive().and_time(target_time);
                                 
-                                // If the scheduled time has already passed today, wait for tomorrow's slot
+                               
                                 if target_dt <= now.naive_local() {
                                     target_dt += chrono::Duration::days(1);
                                 }
