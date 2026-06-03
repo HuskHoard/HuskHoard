@@ -311,7 +311,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
     
     loop {
         // Wait for a file in the queue. If idle for 5 seconds, perform maintenance (DB Mirroring).
-        match rx.recv_timeout(Duration::from_secs(5)) {
+        match rx.recv_timeout(Duration::from_secs(3600)) {
             Ok(path_str) => {
                 let meta = match std::fs::metadata(&path_str) {
                     Ok(m) => m,
