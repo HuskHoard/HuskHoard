@@ -124,7 +124,7 @@ Drop a large file into `hot_tier`.
 dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=12
 ```
 Wait 10 seconds. 
-* Run `ls -ls hot_tier`. You will see the file's allocated size drop to near 0 bytes, while its logical size remains intact. 
+* Run `ls -ls hot_tier`. You will see the file's allocated size drop to 4K bytes, which is the sparse file data, while its logical size remains intact. 
 * Run `du -h hot_tier`. It has become a Husk. 
 * Open the file, and watch the Daemon instantly recall it from `my_archive.img`.
 
