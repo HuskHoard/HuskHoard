@@ -20,3 +20,5 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 chrono = "0.4.44"
 serde_json = "1.0.149"
+arrow = "53.0.0"
+parquet = { version = "53.0.0", features = ["arrow", "snap"] }
