@@ -43,7 +43,7 @@ pub struct HuskConfig {
 }
 
 // ---------------------------------------------------------
-// Enterprise Sidecar IPC Bridge
+//: Enterprise Sidecar IPC Bridge
 // ---------------------------------------------------------
 pub struct SidecarBridge {
     socket_path: Option<String>,
@@ -115,9 +115,8 @@ janitor_schedule_time = "none"
 # Testing interval: How often the scanner wakes up (in seconds).
 janitor_interval_secs = 60
 
-# set to 0 for test    
-max_age_days = 0  
-max_versions = 0
+max_age_days = 30
+max_versions = 3
 
 # --- Exclusions & Immediate Rules ---
 exclude_dirs = ["/.git/", "/node_modules/", "/__pycache__/"]
@@ -142,6 +141,13 @@ pub struct Cli {
 pub enum Commands {
     /// Start the USTD daemon (Interceptor + Queue Worker)
     Daemon,
+    /// Export the catalog metadata to a file format (e.g., Parquet) for Data Engineering
+    Export {
+        #[arg(long, default_value = "parquet")]
+        format: String,
+        #[arg(long)]
+        output: String,
+    },
     /// Stream a file from tape directly to Standard Output (Zero-Disk extraction)
     Cat {
         #[arg(long)]
