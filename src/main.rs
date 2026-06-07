@@ -73,7 +73,7 @@ fn main() {
 
             let (tx, rx) = mpsc::sync_channel(100);
 
-            // 1. Spawn the Archive Worker 
+            // 1. Spawn the Archive Worker (Handles the heavy lifting)
             let worker_config = Arc::clone(&config_arc);
             thread::spawn(move || {
                 run_archive_worker(rx, worker_config, use_direct_io);
@@ -90,7 +90,7 @@ fn main() {
                             if let Ok(target_time) = chrono::NaiveTime::parse_from_str(schedule, "%H:%M") {
                                 let mut target_dt = now.date_naive().and_time(target_time);
                                 
-                               
+                                // If the scheduled time has already passed today, wait for tomorrow's slot
                                 if target_dt <= now.naive_local() {
                                     target_dt += chrono::Duration::days(1);
                                 }
@@ -156,6 +156,19 @@ fn main() {
         Commands::Repack { source_tape, dest_tape } => {
             if let Err(e) = repack_tape(&config_arc.db_path, source_tape, dest_tape, use_direct_io) {
                 error!("Repacker failed: {}", e);
+            }
+        }
+        Commands::Export { format, output } => {
+            if format.to_lowercase() == "parquet" {
+                info!("Exporting catalog to Parquet: {}", output);
+                if let Err(e) = export_catalog_parquet(&config_arc.db_path, output) {
+                    error!("Export failed: {}", e);
+                } else {
+                    info!("Successfully exported catalog to {}", output);
+                    info!("Data Engineers can now query this using: duckdb -c \"SELECT * FROM '{}' LIMIT 10;\"", output);
+                }
+            } else {
+                error!("Unsupported format: {}. Currently only 'parquet' is supported.", format);
             }
         }
     }
