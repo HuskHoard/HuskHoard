@@ -30,6 +30,7 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 *   **The Interceptor:** A lightweight fanotify loop that detects when an application requests a stubbed file and triggers an instant recall.
 *   **The Janitor:** A background policy engine that identifies cold data based on age, extension, or directory rules.
 *   **The Archive Worker:** The heavy-lifter. It compresses data into seekable frames, multiplexes writes across the storage pool, and manages SCSI hardware commands.
+*   **More about Architecture:** The blog has a few indepth articles about the architecture. You can read more here www.huskhoard.com/blog.html 
 
 ### OS Compatibility & Requirements
 HuskHoard relies on the Linux **fanotify** kernel API. It is compatible with modern Linux distributions using **Kernel 5.1 or higher**.
