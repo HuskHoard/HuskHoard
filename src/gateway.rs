@@ -14,7 +14,7 @@ use serde_json::json;
 // HTTP Streaming Gateway (VLC / Plex Bridge)
 // ---------------------------------------------------------
 pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_direct_io: bool) {
-    // VITAL: Prevent zombie threads if a client network drops
+    // Prevent zombie threads if a client network drops
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -26,14 +26,14 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     if parts.len() < 2 { return; }
     let method = parts[0];
 
-    // --- NEW: Handle browser CORS Preflight (OPTIONS) ---
+    // ---  Handle browser CORS Preflight (OPTIONS) ---
     if method == "OPTIONS" {
         let headers = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
         let _ = stream.write_all(headers.as_bytes());
         return;
     }
 
-    // VITAL: Support HTTP HEAD requests used by Plex/VLC for probing file sizes
+    //  Support HTTP HEAD requests used by Plex/VLC for probing file sizes
     if method != "GET" && method != "HEAD" { return; }
     let is_head_request = method == "HEAD";
 
@@ -41,7 +41,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     let url_path = parts[1].replace("%20", " "); 
     if url_path.contains("..") { return; } // Requirement 4: Prevent Path Traversal
 
-    // --- NEW: Live Dashboard API Endpoint ---
+    // ---  Live Dashboard API Endpoint ---
     if url_path == "/api/dashboard" {
         let conn = rusqlite::Connection::open(&config.db_path).unwrap();
         
