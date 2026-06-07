@@ -10,9 +10,9 @@ pub struct ObjectHeader {
     pub format_version: u16,      // offset 8
     pub flags: u16,               // offset 10
     pub compression_type: u8,     // offset 12 ( 0=None, 1=Zstd)
-    pub reserved_pad: [u8; 3],    // offset 13 
+    pub reserved_pad: [u8; 3],    // offset 13 (Padding )
     pub payload_size: u64,        // offset 16 (Uncompressed size)
-    pub compressed_size: u64,     // offset 24 
+    pub compressed_size: u64,     // offset 24 ( Compressed length)
     pub padded_size: u64,         // offset 32 (Aligned on tape)
     pub object_uuid: [u8; 16],    // offset 40
     pub tape_uuid: [u8; 16],      // offset 56
@@ -40,7 +40,7 @@ pub struct VolumeHeader {
     pub magic_bytes: [u8; 8],     // offset 0: "USTDVOL\0"
     pub format_version: u16,      // offset 8
     pub flags: u16,               // offset 10
-    pub reserved_pad1: u32,       // offset 12: EXPLICIT PADDING FIX
+    pub reserved_pad1: u32,       // offset 12: EXPLICIT PADDING
     pub volume_uuid: [u8; 16],    // offset 16: Unique Tape ID
     pub created_at: i64,          // offset 32
     pub label: [u8; 32],          // offset 40: Human readable label
