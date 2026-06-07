@@ -53,26 +53,80 @@ source $HOME/.cargo/env
 ```
 
 #### 2. Download and Build
+Clone the repository and move into the project directory. **You must remain in this directory for the rest of the tutorial.**
+
 ```bash
 git clone https://github.com/huskhoard/huskhoard.git
 cd huskhoard
+
+# Build the project
 cargo build --release
+```
+
+#### 3. Grant Kernel Capabilities
+HuskHoard needs specific capabilities to intercept file reads via `fanotify` without needing to run as a dangerous root process. Apply these to the newly built binary:
+
+```bash
 sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
 ```
 
-#### 3. Setup Test Environment
+#### 4. Configure Your "Test Environment"
+Set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Tape Volume".
+
 ```bash
+# Ensure you are still in the 'huskhoard' project directory
 mkdir -p hot_tier
 fallocate -l 100M my_archive.img
-./target/release/huskhoard format --tape-dev my_archive.img
+fallocate -l 100M replication_archive.img
 ```
 
-Update your `husk_config.toml` to point to these paths and set `max_age_days = 0` for instant archiving during testing.
+Next, format the volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
 
-#### 4. Launch the Daemon
+```bash
+./target/release/huskhoard format --tape-dev my_archive.img
+./target/release/huskhoard format --tape-dev replication_archive.img
+```
+```bash
+# OR: Format a physical LTO tape drive
+./target/release/huskhoard format --tape-dev /dev/nst0
+```
+
+Open the newly generated `husk_config.toml` in your text editor. Update these lines to enable **Instant Archiving** so you can see it work immediately. *(Note: Using absolute paths is highly recommended so the daemon always knows where your data is).*
+
+```toml
+primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
+replication_volumes = ["/home/YOUR_USERNAME/huskhoard/replication_archive.img"]
+hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to your hot tier
+max_age_days = 0 # TEST MODE: Archive files immediately
+janitor_interval_secs = 60
+http_port = 8080 # Port for the Streaming Gateway
+# --- Safety Settings ---
+# Trigger emergency archiving if the Hot Tier exceeds 80% capacity
+hot_tier_max_usage_percent = 80 
+# The Janitor will try to keep at least this much space (in GB) strictly free, set to 0 for test
+min_free_space_gb = 0
+```
+
+#### 5. Launch the Daemon
+Start the HuskHoard background engine:
+
 ```bash
 ./target/release/huskhoard daemon
 ```
+
+#### 6. Test it
+Leave the daemon running and open a **second terminal window**. 
+
+Drop a large file into `hot_tier`.
+
+#### Generate a 12MB dummy file filled with random data
+```bash
+dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=12
+```
+Wait 10 seconds. 
+* Run `ls -ls hot_tier`. You will see the file's allocated size drop to near 0 bytes, while its logical size remains intact. 
+* Run `du -h hot_tier`. It has become a Husk. 
+* Open the file, and watch the Daemon instantly recall it from `my_archive.img`.
 
 ---
 
