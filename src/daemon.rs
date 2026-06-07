@@ -1,7 +1,7 @@
 //daemon.rs
 use std::ffi::CString;
 use std::fs::OpenOptions;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::io::Write;
 use std::path::Path;
@@ -15,7 +15,7 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 
 use crate::config::{HuskConfig, SidecarBridge, is_path_excluded};
-use crate::engine::{restore_file, archive_file};
+use crate::engine::archive_file;
 use crate::hardware::get_drive_serial;
 
 // ---------------------------------------------------------
@@ -65,10 +65,10 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
         return Err(err); 
     }
 
-    //  Use FAN_ACCESS_PERM instead of FAN_OPEN_PERM to avoid VFS inode lock deadlocks
+    // Use FAN_ACCESS_PERM instead of FAN_OPEN_PERM to avoid VFS inode lock deadlocks
         let mark_mask = libc::FAN_ACCESS_PERM | libc::FAN_CLOSE_WRITE | libc::FAN_EVENT_ON_CHILD;
         
-        //  Recursively mark the root watch directory and all current subdirectories
+        // 1. Recursively mark the root watch directory and all current subdirectories
         info!("[Daemon]  Scanning and attaching listeners to all subdirectories...");
         mark_directory_recursive(fan_fd, &abs_dir, mark_mask, &config);
 
@@ -76,7 +76,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
         info!("[Daemon] Listening for File Reads & Modifies...");
         info!("=======================================================\n");
 
-        // Background thread to periodically re-mark dynamically created subdirectories
+        // 2. Background thread to periodically re-mark dynamically created subdirectories
         let bg_fan_fd = fan_fd;
         let bg_watch_dir = abs_dir.clone();
         let config_clone = Arc::clone(&config);
@@ -122,17 +122,21 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                 let mask = metadata.mask as u64;
                 
                 if let Ok(real_path) = std::fs::read_link(&proc_path) {
-                    let path_str = real_path.to_string_lossy().to_string();
+                    //  Ensure path is absolute and consistent with DB records
+                    let path_str = std::fs::canonicalize(&real_path)
+                        .unwrap_or(real_path)
+                        .to_string_lossy()
+                        .to_string();
 
                     // EVENT 1: Process is trying to READ a file
                     if (mask & libc::FAN_ACCESS_PERM) != 0 {
-                        // Only query xattr (disk access) on READ events. 
+                        //  Only query xattr (disk access) on READ events. 
                         let is_stubbed = xattr::get(&path_str, "trusted.husk.status")
                             .map(|v| v == Some(b"stubbed".to_vec()))
                             .unwrap_or(false);
 
                         if is_stubbed {
-                            //  If the file is being opened strictly to OVERWRITE it (O_WRONLY / O_TRUNC),
+                            // FAST PATH: If the file is being opened strictly to OVERWRITE it (O_WRONLY / O_TRUNC),
                             // do NOT pull it from tape. Just drop the stub status and allow the overwrite instantly.
                             let flags = unsafe { libc::fcntl(fd_raw, libc::F_GETFL) };
                             let is_trunc = (flags & libc::O_TRUNC) != 0;
@@ -154,6 +158,19 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 
                             // Find out WHICH process is reading the file
                             let pid = metadata.pid;
+                            //  Cloud NAS Byte-Range Detection
+                            let mut requested_offset = 0;
+                            let fdinfo_path = format!("/proc/{}/fdinfo/{}", pid, fd_raw);
+                            if let Ok(fdinfo) = std::fs::read_to_string(&fdinfo_path) {
+                                for line in fdinfo.lines() {
+                                    if line.starts_with("pos:") {
+                                        let parts: Vec<&str> = line.split_whitespace().collect();
+                                        if parts.len() > 1 {
+                                            requested_offset = parts[1].parse::<u64>().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
                             let mut proc_name = String::new();
                             if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
                                 proc_name = comm.trim().to_string();
@@ -165,7 +182,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                 info!("[Daemon]  Ignoring background read from '{}' to keep file stubbed.", proc_name);
                             } else {
                                 info!("\n[Daemon] INTERCEPTED READ ON STUB: {} (Triggered by PID {}: {})", path_str, pid, proc_name);
-                                // Gather Replicas synchronously
+                                // 1. Gather Replicas synchronously
                                 let mut stmt = conn.prepare(
                                     "SELECT t.device_path, c.tape_offset 
                                      FROM catalog c 
@@ -178,7 +195,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                     replicas.push((row.get::<_, String>(0).unwrap(), row.get::<_, u64>(1).unwrap()));
                                 }
 
-                                // Dispatch restoration to thread pool to prevent blocking UI loops
+                                // 2. Dispatch restoration to thread pool to prevent blocking UI loops
                                 let path_clone = path_str.clone();
                                 let db_path_clone = db_path.to_string();
                                 let active_restores_clone = Arc::clone(&active_restores);
@@ -195,46 +212,59 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                     }
 
                                     if is_primary {
-                                        // Capture original timestamps BEFORE restoring
-                                        let (atime_sec, atime_nsec, mtime_sec, mtime_nsec) = if let Ok(meta) = std::fs::metadata(&path_clone) {
-                                            (meta.atime(), meta.atime_nsec(), meta.mtime(), meta.mtime_nsec())
-                                        } else {
-                                            (0, 0, 0, 0)
-                                        };
+                                        // (Timestamp capture removed: Sparse hole-filling preserves the inode)
 
                                         let mut restored = false;
-                                        for (db_tape, db_offset) in replicas {
-                                            info!("[Daemon] Trying to wake Volume replica at '{}'...", db_tape);
-                                            if let Err(e) = restore_file(&interceptor_config, &db_path_clone, &db_tape, &path_clone, fd_raw, db_offset, use_direct_io, false) {
-                                                error!("[Daemon] !!Replica at '{}' unavailable: {}. Trying next...", db_tape, e);
-                                            } else {
-                                                restored = true;
-                                                break;
+                                        
+                                        // 1. Duplicate the FD to write into the Stub safely
+                                        let dup_fd = unsafe { libc::dup(fd_raw) };
+                                        let mut dest_file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+
+                                        for (db_tape, _db_offset) in &replicas {
+                                            info!("[Cloud NAS] Fetching block at offset {} from replica '{}'...", requested_offset, db_tape);
+                                            
+                                            // Seek exactly to where the application wants to read
+                                            if let Err(_) = std::io::Seek::seek(&mut dest_file, std::io::SeekFrom::Start(requested_offset)) {
+                                                continue;
+                                            }
+
+                                            // Determine read-ahead window (16MB Frame)
+                                            let chunk_size = 16 * 1024 * 1024; 
+
+                                            // Re-use your StreamGate logic to fetch ONLY the requested byte range!
+                                            // This fills the sparse hole without destroying the rest of the file.
+                                            match crate::engine::stream_file(
+                                                &interceptor_config, 
+                                                &db_path_clone, 
+                                                &path_clone, 
+                                                requested_offset, 
+                                                Some(chunk_size), 
+                                                use_direct_io, 
+                                                None, // tape_uuid
+                                                &mut dest_file
+                                            ) {
+                                                Ok(_) => {
+                                                    restored = true;
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    error!("[Daemon] Partial restore failed on '{}': {}", db_tape, e);
+                                                }
                                             }
                                         }
 
                                         if restored {
                                             let _ = xattr::remove(&path_clone, "trusted.husk.status");
-                                            if let Ok(t_conn) = Connection::open(&db_path_clone) {
-                                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                                                let _ = t_conn.execute("INSERT OR REPLACE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)", params![path_clone, now]);
-                                            }
-                                            
-                                            // Hide the restore modification from file watchers and editors
-                                            if mtime_sec != 0 {
-                                                let c_path = CString::new(path_clone.as_str()).unwrap();
-                                                let times = [
-                                                    libc::timespec { tv_sec: atime_sec as libc::time_t, tv_nsec: atime_nsec as libc::c_long },
-                                                    libc::timespec { tv_sec: mtime_sec as libc::time_t, tv_nsec: mtime_nsec as libc::c_long },
-                                                ];
-                                                unsafe {
-                                                    libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
-                                                }
-                                            }
-                                            
+                                            // ...
                                             info!("[Daemon] Restore complete for: {}", path_clone);
                                         } else {
-                                            error!("[Daemon] CRITICAL: All replicas for '{}' offline!", path_clone);
+                                            //  More descriptive error to distinguish between "Not Found" and "Offline"
+                                            if replicas.is_empty() {
+                                                error!("[Daemon] CRITICAL: Path '{}' not found in database. Check if paths are absolute!", path_clone);
+                                            } else {
+                                                error!("[Daemon] CRITICAL: All replicas for '{}' are physically offline!", path_clone);
+                                            }
+
                                             if let Ok(meta) = std::fs::metadata(&path_clone) {
                                                 let _ = stub_file(&path_clone, meta.len());
                                             }
@@ -275,7 +305,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 
                     // EVENT 2: Process finished WRITING to a file
                     if (mask & libc::FAN_CLOSE_WRITE) != 0 {
-                        // Identify directories via RAM mask. NO xattr or metadata checks 
+                        // ZERO-LOCK DEBOUNCING: Identify directories via RAM mask. NO xattr or metadata checks here!
                         // This prevents Samba/SMB/gedit Sharing Violations during atomic temporary saves.
                         // Ghost files (.goutputstream) are blindly queued in O(1) time and self-clean in the Janitor.
                         let is_dir = (mask & libc::FAN_ONDIR as u64) != 0;
@@ -304,7 +334,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 // 6. The "Janitor" (Database-Driven Policy Engine)
 // ---------------------------------------------------------
 
-// Worker thread Sits in the background, receives files via a queue, and uploads them.
+// Worker thread: Sits in the background, receives files via a queue, and uploads them.
 pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_direct_io: bool) {
     let conn = Connection::open(&config.db_path).expect("Worker failed to open catalog");
     let mut archived_since_last_mirror = 0;
@@ -312,7 +342,12 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
     loop {
         // Wait for a file in the queue. If idle for 5 seconds, perform maintenance (DB Mirroring).
         match rx.recv_timeout(Duration::from_secs(3600)) {
-            Ok(path_str) => {
+            Ok(mut path_str) => {
+                //  Canonicalize path before processing so DB records are always absolute
+                if let Ok(abs_path) = std::fs::canonicalize(&path_str) {
+                    path_str = abs_path.to_string_lossy().to_string();
+                }
+
                 let meta = match std::fs::metadata(&path_str) {
                     Ok(m) => m,
                     Err(_) => {
@@ -361,7 +396,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                             ).unwrap_or(1);
 
                             let mut payload_size_saved = 0;
-                           
+                            // Add the '&' here to borrow the list so the Sidecar hook can use it later
                             for (offset, size, comp_size, comp_type, hash, tape_uuid, dev_path) in &replica_list {
                                 payload_size_saved = *size; // Add '*' to copy the numeric value
                                 let drive_serial = get_drive_serial(dev_path);
@@ -398,7 +433,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                 )", params![path_str, config.max_versions]
                             );
                             
-                // ---------------------------------------------------------
+                                // ---------------------------------------------------------
 				// POST-COMMIT CATALOG TRIGGER (Multi-Node Global Sync)
 				// ---------------------------------------------------------
 				let sidecar = SidecarBridge::new(&config);
@@ -444,7 +479,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Idle Time! If we just finished archiving files, mirror the database.
                 if archived_since_last_mirror > 0 {
-                    info!("[Worker] Queue idle. Mirroring Catalog to primary storage (Database Anchor)...");
+                    info!("[Worker] Queue idle for 1 hour. Mirroring Catalog to primary storage...");
                     let backup_path = format!("{}_backup.db", config.db_path);
                     let _ = std::fs::remove_file(&backup_path);
                     
@@ -498,7 +533,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let max_age_secs = config.max_age_days * 24 * 3600; 
 
-    // Check Hot Tier Usage (High-Water Mark)
+    //  Check Hot Tier Usage (High-Water Mark)
     let mut emergency_bytes_to_free = 0u64;
     let max_pct = config.hot_tier_max_usage_percent.unwrap_or(80) as f64 / 100.0;
     
@@ -512,7 +547,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
     }
 
-    // Order by oldest first to ensure emergency spillover drops the stalest files
+    //  Order by oldest first to ensure emergency spillover drops the stalest files
     let mut stmt = conn.prepare("SELECT file_path, last_touch FROM active_tracking ORDER BY last_touch ASC").unwrap();
     let rows: Vec<(String, u64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap().filter_map(Result::ok).collect();
@@ -561,7 +596,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
 fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     info!("\nStubbing '{}' (Punching hole to free {} bytes of SSD space)...", file_path, file_size);
     
-    //  Save the original timestamps to prevent IDEs/Git from noticing the change
+    // 0. Save the original timestamps to prevent IDEs/Git from noticing the change
     let meta = std::fs::metadata(file_path)?;
     let atime_sec = meta.atime();
     let atime_nsec = meta.atime_nsec();
@@ -571,7 +606,7 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     let file = OpenOptions::new().write(true).open(file_path)?;
     let fd = file.as_raw_fd();
 
-    //  Punch a hole through the entire file using Linux fallocate
+    // 1. Punch a hole through the entire file using Linux fallocate
     // Kernel rejects fallocate length of 0 with EINVAL, so skip it for empty files
     if file_size > 0 {
         let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
@@ -587,10 +622,10 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     // Explicitly drop/close the file descriptor before restoring timestamps
     drop(file);
 
-    //  Mark it as an archived stub via xattr
+    // 2. Mark it as an archived stub via xattr
     xattr::set(file_path, "trusted.husk.status", b"stubbed")?;
 
-    // Silently restore the old timestamps to fool file watchers
+    // 3. Silently restore the old timestamps to fool file watchers
     let c_path = CString::new(file_path).unwrap();
     let times = [
         libc::timespec { tv_sec: atime_sec as libc::time_t, tv_nsec: atime_nsec as libc::c_long },
