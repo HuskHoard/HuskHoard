@@ -11,7 +11,7 @@ use crate::config::ALIGNMENT;
 // 3. The "RawWrite" Archiver Logic (With Multiplexed Replication)
 // ---------------------------------------------------------
 pub struct MultiTapeWriter<'a> {
-    tapes: Vec<&'a mut dyn std::io::Write>, 
+    tapes: Vec<&'a mut dyn std::io::Write>, // Changed to accept ANY generic Writer
     buffer: AlignedBuffer,
     pub cursor: usize,
     pub bytes_written: u64,
@@ -103,7 +103,7 @@ impl StorageBackend {
             StorageBackend::Local(f) => { f.seek(SeekFrom::Start(offset))?; Ok(()) },
             StorageBackend::Tape(_) => Ok(()), 
             StorageBackend::Rclone { .. } => Ok(()), 
-            StorageBackend::Grid(_) => Ok(()), 
+            StorageBackend::Grid(_) => Ok(()), // Grid tunnels handle tracking internally
         }
     }
     pub fn close(self) -> std::io::Result<()> {
@@ -151,7 +151,7 @@ pub fn spawn_rclone_writer(remote_path: &str) -> std::io::Result<StorageBackend>
 pub enum StorageReader {
     Local(File),
     Rclone(std::process::ChildStdout, std::process::Child),
-    Grid(UnixStream), // NEW: Multi-Node Read Hand-off
+    Grid(UnixStream), //: Multi-Node Read Hand-off
 }
 
 impl std::io::Read for StorageReader {
