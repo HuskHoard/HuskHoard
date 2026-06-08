@@ -535,7 +535,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let max_age_secs = config.max_age_days * 24 * 3600; 
 
-    // NEW: Check Hot Tier Usage (High-Water Mark)
+    // Check Hot Tier Usage (High-Water Mark)
     let mut emergency_bytes_to_free = 0u64;
     let max_pct = config.hot_tier_max_usage_percent.unwrap_or(80) as f64 / 100.0;
     
@@ -549,7 +549,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
     }
 
-    // NEW: Order by oldest first to ensure emergency spillover drops the stalest files
+    // Order by oldest first to ensure emergency spillover drops the stalest files
     let mut stmt = conn.prepare("SELECT file_path, last_touch FROM active_tracking ORDER BY last_touch ASC").unwrap();
     let rows: Vec<(String, u64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap().filter_map(Result::ok).collect();
