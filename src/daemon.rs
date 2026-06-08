@@ -65,7 +65,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
         return Err(err); 
     }
 
-    // Use FAN_ACCESS_PERM instead of FAN_OPEN_PERM to avoid VFS inode lock deadlocks
+    //  Use FAN_ACCESS_PERM instead of FAN_OPEN_PERM to avoid VFS inode lock deadlocks
         let mark_mask = libc::FAN_ACCESS_PERM | libc::FAN_CLOSE_WRITE | libc::FAN_EVENT_ON_CHILD;
         
         // 1. Recursively mark the root watch directory and all current subdirectories
@@ -122,7 +122,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                 let mask = metadata.mask as u64;
                 
                 if let Ok(real_path) = std::fs::read_link(&proc_path) {
-                    //  Ensure path is absolute and consistent with DB records
+                    // Ensure path is absolute and consistent with DB records
                     let path_str = std::fs::canonicalize(&real_path)
                         .unwrap_or(real_path)
                         .to_string_lossy()
@@ -130,7 +130,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 
                     // EVENT 1: Process is trying to READ a file
                     if (mask & libc::FAN_ACCESS_PERM) != 0 {
-                        //  Only query xattr (disk access) on READ events. 
+                        // Only query xattr (disk access) on READ events. 
                         let is_stubbed = xattr::get(&path_str, "trusted.husk.status")
                             .map(|v| v == Some(b"stubbed".to_vec()))
                             .unwrap_or(false);
@@ -141,7 +141,8 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                             let flags = unsafe { libc::fcntl(fd_raw, libc::F_GETFL) };
                             let is_trunc = (flags & libc::O_TRUNC) != 0;
 
-                            
+                            //  O_WRONLY on its own (like Python's "a" for append) is NOT safe to bypass,
+                            // because we still need the original data to append to! Only bypass if explicitly truncating.
                             if is_trunc {
                                 info!("[Daemon] Fast-Path Bypass: '{}' opened for truncation. Skipping Volume restore.", path_str);
                                 let _ = xattr::remove(&path_str, "trusted.husk.status");
@@ -158,19 +159,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 
                             // Find out WHICH process is reading the file
                             let pid = metadata.pid;
-                            //  Cloud NAS Byte-Range Detection
-                            let mut requested_offset = 0;
-                            let fdinfo_path = format!("/proc/{}/fdinfo/{}", pid, fd_raw);
-                            if let Ok(fdinfo) = std::fs::read_to_string(&fdinfo_path) {
-                                for line in fdinfo.lines() {
-                                    if line.starts_with("pos:") {
-                                        let parts: Vec<&str> = line.split_whitespace().collect();
-                                        if parts.len() > 1 {
-                                            requested_offset = parts[1].parse::<u64>().unwrap_or(0);
-                                        }
-                                    }
-                                }
-                            }
+                            
                             let mut proc_name = String::new();
                             if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid)) {
                                 proc_name = comm.trim().to_string();
@@ -221,24 +210,22 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                         let mut dest_file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
 
                                         for (db_tape, _db_offset) in &replicas {
-                                            info!("[Cloud NAS] Fetching block at offset {} from replica '{}'...", requested_offset, db_tape);
+                                            info!("[Cloud NAS] Fetching full file from replica '{}'...", db_tape);
                                             
-                                            // Seek exactly to where the application wants to read
-                                            if let Err(_) = std::io::Seek::seek(&mut dest_file, std::io::SeekFrom::Start(requested_offset)) {
+                                            // Seek to the beginning of the file for a full restore
+                                            if let Err(_) = std::io::Seek::seek(&mut dest_file, std::io::SeekFrom::Start(0)) {
                                                 continue;
                                             }
 
-                                            // Determine read-ahead window (16MB Frame)
-                                            let chunk_size = 16 * 1024 * 1024; 
-
-                                            // Re-use your StreamGate logic to fetch ONLY the requested byte range!
-                                            // This fills the sparse hole without destroying the rest of the file.
+                                            //  We must restore the FULL object before clearing the stub flag.
+                                            // Partial fills combined with removing the stub flag cause subsequent reads 
+                                            // to silently read zeroes from the hole-punched areas.
                                             match crate::engine::stream_file(
                                                 &interceptor_config, 
                                                 &db_path_clone, 
                                                 &path_clone, 
-                                                requested_offset, 
-                                                Some(chunk_size), 
+                                                0, // start from beginning
+                                                None, // read until EOF
                                                 use_direct_io, 
                                                 None, // tape_uuid
                                                 &mut dest_file
@@ -248,7 +235,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                                     break;
                                                 }
                                                 Err(e) => {
-                                                    error!("[Daemon] Partial restore failed on '{}': {}", db_tape, e);
+                                                    error!("[Daemon] Full restore failed on '{}': {}", db_tape, e);
                                                 }
                                             }
                                         }
@@ -258,7 +245,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                             // ...
                                             info!("[Daemon] Restore complete for: {}", path_clone);
                                         } else {
-                                            //  More descriptive error to distinguish between "Not Found" and "Offline"
+                                            // More descriptive error to distinguish between "Not Found" and "Offline"
                                             if replicas.is_empty() {
                                                 error!("[Daemon] CRITICAL: Path '{}' not found in database. Check if paths are absolute!", path_clone);
                                             } else {
@@ -336,14 +323,15 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 
 // Worker thread: Sits in the background, receives files via a queue, and uploads them.
 pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, use_direct_io: bool) {
-    let conn = Connection::open(&config.db_path).expect("Worker failed to open catalog");
+    let mut conn = Connection::open(&config.db_path).expect("Worker failed to open catalog");
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(30)); // Set busy timeout
     let mut archived_since_last_mirror = 0;
     
     loop {
         // Wait for a file in the queue. If idle for 5 seconds, perform maintenance (DB Mirroring).
         match rx.recv_timeout(Duration::from_secs(3600)) {
             Ok(mut path_str) => {
-                //  Canonicalize path before processing so DB records are always absolute
+                // Canonicalize path before processing so DB records are always absolute
                 if let Ok(abs_path) = std::fs::canonicalize(&path_str) {
                     path_str = abs_path.to_string_lossy().to_string();
                 }
@@ -396,71 +384,85 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                             ).unwrap_or(1);
 
                             let mut payload_size_saved = 0;
-                            // Add the '&' here to borrow the list so the Sidecar hook can use it later
-                            for (offset, size, comp_size, comp_type, hash, tape_uuid, dev_path) in &replica_list {
-                                payload_size_saved = *size; // Add '*' to copy the numeric value
-                                let drive_serial = get_drive_serial(dev_path);
+                            
+                            // Wrap all catalog writes in a transaction to ensure durability.
+                            // Do not stub the file if the database commit fails.
+                            let mut db_commit_success = false;
+                            
+                            if let Ok(tx) = conn.transaction() {
+                                let mut all_inserts_ok = true;
                                 
-                                let _ = conn.execute(
-                                    "INSERT OR REPLACE INTO tapes (tape_uuid, device_path, drive_serial) VALUES (?1, ?2, ?3)",
-                                    params![tape_uuid, dev_path, drive_serial],
+                                for (offset, size, comp_size, comp_type, hash, tape_uuid, dev_path) in &replica_list {
+                                    payload_size_saved = *size; 
+                                    let drive_serial = get_drive_serial(dev_path);
+                                    
+                                    if tx.execute(
+                                        "INSERT OR REPLACE INTO tapes (tape_uuid, device_path, drive_serial) VALUES (?1, ?2, ?3)",
+                                        params![tape_uuid, dev_path, drive_serial],
+                                    ).is_err() { all_inserts_ok = false; }
+                                    
+                                    if tx.execute(
+                                        "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata) 
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                        params![path_str, next_version, tape_uuid, offset, size, comp_size, comp_type, meta.uid(), meta.gid(), meta.mode(), meta.mtime(), hash, custom_meta],
+                                    ).is_err() { all_inserts_ok = false; }
+                                }
+
+                                for (u_off, c_off, c_size) in jump_table {
+                                    if tx.execute(
+                                        "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                        params![path_str, next_version, u_off, c_off, c_size]
+                                    ).is_err() { all_inserts_ok = false; }
+                                }
+
+                                let _ = tx.execute(
+                                    "DELETE FROM catalog WHERE file_path = ?1 AND version NOT IN (
+                                        SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
+                                    )", params![path_str, config.max_versions]
                                 );
-                                let _ = conn.execute(
-                                    "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata) 
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                                    params![path_str, next_version, tape_uuid, offset, size, comp_size, comp_type, meta.uid(), meta.gid(), meta.mode(), meta.mtime(), hash, custom_meta],
+                                
+                                let _ = tx.execute(
+                                    "DELETE FROM object_frames WHERE file_path = ?1 AND version NOT IN (
+                                        SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
+                                    )", params![path_str, config.max_versions]
                                 );
+                                
+                                if all_inserts_ok && tx.commit().is_ok() {
+                                    db_commit_success = true;
+                                }
                             }
 
-                            //  Store Jump Table for StreamGate
-                            for (u_off, c_off, c_size) in jump_table {
-                                let _ = conn.execute(
-                                    "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                    params![path_str, next_version, u_off, c_off, c_size]
-                                );
+                            if !db_commit_success {
+                                error!("[Worker] Catalog write failed for {}. Aborting stub process to prevent data loss.", path_str);
+                                continue;
                             }
-
-                            let _ = conn.execute(
-                                "DELETE FROM catalog WHERE file_path = ?1 AND version NOT IN (
-                                    SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
-                                )", params![path_str, config.max_versions]
-                            );
                             
-                            // Cleanup old StreamGate frames
-                            let _ = conn.execute(
-                                "DELETE FROM object_frames WHERE file_path = ?1 AND version NOT IN (
-                                    SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
-                                )", params![path_str, config.max_versions]
-                            );
-                            
-                                // ---------------------------------------------------------
-				// POST-COMMIT CATALOG TRIGGER (Multi-Node Global Sync)
-				// ---------------------------------------------------------
-				let sidecar = SidecarBridge::new(&config);
+                            // ---------------------------------------------------------
+                            // POST-COMMIT CATALOG TRIGGER (Multi-Node Global Sync)
+                            // ---------------------------------------------------------
+                            let sidecar = SidecarBridge::new(&config);
 
-				// Group all replica locations into a JSON array
-				let replicas_json: Vec<serde_json::Value> = replica_list.iter().map(|(offset, _, _, _, _, tape_uuid, dev_path)| {
-				    json!({
-				        "tape_uuid": tape_uuid,
-				        "tape_offset": offset,
-				        "device_path": dev_path
-				    })
-				}).collect();
+                            let replicas_json: Vec<serde_json::Value> = replica_list.iter().map(|(offset, _, _, _, _, tape_uuid, dev_path)| {
+                                json!({
+                                    "tape_uuid": tape_uuid,
+                                    "tape_offset": offset,
+                                    "device_path": dev_path
+                                })
+                            }).collect();
 
-				// Grab the payload size and hash from the first replica
-				let payload_size = replica_list[0].1;
-				let blake3_hash = &replica_list[0].4;
+                            let payload_size = replica_list[0].1;
+                            let blake3_hash = &replica_list[0].4;
 
-				sidecar.send_event(json!({
-				    "event": "CATALOG_UPDATE", 
-				    "action": "UPSERT",
-				    "file_path": path_str,
-				    "version": next_version,
-				    "payload_size": payload_size,
-				    "blake3_hash": blake3_hash,
-				    "replicas": replicas_json,
-				    "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-				}));
+                            sidecar.send_event(json!({
+                                "event": "CATALOG_UPDATE", 
+                                "action": "UPSERT",
+                                "file_path": path_str,
+                                "version": next_version,
+                                "payload_size": payload_size,
+                                "blake3_hash": blake3_hash,
+                                "replicas": replicas_json,
+                                "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                            }));
 
                             if let Err(e) = stub_file(&path_str, payload_size_saved) {
                                 error!("[Worker]  Failed to stub {}: {}", path_str, e);
@@ -533,7 +535,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let max_age_secs = config.max_age_days * 24 * 3600; 
 
-    //  Check Hot Tier Usage (High-Water Mark)
+    // NEW: Check Hot Tier Usage (High-Water Mark)
     let mut emergency_bytes_to_free = 0u64;
     let max_pct = config.hot_tier_max_usage_percent.unwrap_or(80) as f64 / 100.0;
     
@@ -547,7 +549,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
     }
 
-    //  Order by oldest first to ensure emergency spillover drops the stalest files
+    // NEW: Order by oldest first to ensure emergency spillover drops the stalest files
     let mut stmt = conn.prepare("SELECT file_path, last_touch FROM active_tracking ORDER BY last_touch ASC").unwrap();
     let rows: Vec<(String, u64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap().filter_map(Result::ok).collect();
