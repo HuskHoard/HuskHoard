@@ -14,6 +14,7 @@ HuskHoard automates this process using **Transparent Stubbing** and **StreamGate
 1.  **The Husk:** Moves cold data to a storage pool and "punches a hole" in the SSD file.
 2.  **The Recall:** Intercepts reads and rehydrates files in real-time.
 3.  **StreamGate:** Allows you to stream massive files (videos, logs) directly from tape/cloud to an application **without** ever writing them back to your SSD.
+4.  **Data Portability:** Exports massive catalog metadata to Apache Parquet for analysis in external big-data tools like DuckDB, Spark, or Python.
 
 ## Our Philosophy
 *   **Sequential-First:** We treat all archive media like Tape. By writing sequentially, we eliminate the "write-wall" of SMR drives and natively support LTO-5 through LTO-9 hardware.
@@ -59,6 +60,8 @@ Designed for Media & Entertainment (M&E) and multi-node environments, the option
 ### 5. The Catalog (SQLite)
 The Catalog is the "Brain." It tracks every version of every file and its exact byte-offset on your "tapes." 
 > **Resilience Note:** The Catalog is periodically backed up to the archive volumes themselves. This creates a "Database Anchor," allowing for total disaster recovery even if the host SSD is wiped.
+>
+> **Data Engineering Note:** The SQLite Catalog can be natively exported to **Apache Parquet**, bridging the gap between cold file storage and modern AI/Analytics pipelines.
 
 #### 6. Disaster Recovery: The "Database Anchor"
 HuskHoard follows the **Easy Exit** philosophy. You are never locked into the database.
@@ -255,7 +258,7 @@ Simply open the file in any application (VLC, Image Viewer, Text Editor). HuskHo
 ### B. Manual CLI Restore (PITR)
 HuskHoard maintains a history of your files. If you accidentally overwrite a file and want the version from three days ago, use the `restore` command:
 ```bash
-./huskhoard restore --file-path /home/jm/report.pdf --dest-path ./recovered.pdf --version 1
+./huskhoard restore --file-path /home/jo/report.pdf --dest-path ./recovered.pdf --version 1
 ```
 
 ## 3. Monitoring Volume Health
@@ -298,12 +301,27 @@ Because HuskHoard uses indexed 16MB Zstd frames, you can jump to specific parts 
 ./huskhoard cat --file-path movie.mkv --offset 2000000000 | mpv -
 ```
 
+**REPLACE WITH (Paste this):**
+```markdown
 **Verify data on a specific Replica:**
 If you have multiple tapes and suspect one is failing, you can force StreamGate to read from a specific Volume UUID:
 ```bash
 ./huskhoard cat --file-path sensitive_data.bin --tape-uuid "550e8400-e29b-41d4-a716-446655440000"
 ```
+## 7. Deleting Data (Deep Archive vs. True Delete)
+HuskHoard offers two completely different workflows for deleting files depending on your retention needs:
 
+### A. Deep Archiving (Standard OS Delete)
+If you delete a file using standard OS tools (e.g., `rm`, deleting via a Windows SMB share, or moving to the Trash), the file is removed from your SSD. **However, it remains safely in the HuskHoard Catalog and on your physical tapes.**
+* **Use Case:** You are done working on a project and want it off your active NVMe drive, but you still want it archived forever on tape.
+
+### B. True Delete (Permanent Destruction)
+If you have a file that is garbage (e.g., a bad video take, corrupted render) and you want it completely purged from both the SSD and the underlying Tape database, you must use the Husk CLI:
+```bash
+./huskhoard rm --file-path /home/jm/bad_render.mp4
+```
+* **Use Case:** Reclaiming tape space and permanently destroying sensitive or useless files. *Note: The physical space on the tape is fully reclaimed the next time you run a `repack`.*
+```
 
 
 
@@ -342,6 +360,16 @@ The Repacker performs "Garbage Collection":
 * It copies those files to the destination.
 * It updates the Catalog to point to the new offsets.
 * The old drive can then be wiped and reused.
+
+## 2.5 Catalog Reconciliation (The Pruner)
+If your users frequently delete files via Windows SMB/standard `rm` and expect them to be permanently destroyed (rather than "Deep Archived"), your tape library will eventually fill up with "orphaned" files. 
+
+You can force the Catalog to sync perfectly with your SSD by running the Pruner:
+```bash
+./huskhoard prune
+```
+The Pruner scans the entire database. If a file exists in the database but is completely missing from the SSD (no stub, no file), it permanently deletes the record from the Catalog. 
+*Note: Run a `repack` after a massive `prune` to physically free the space on your tapes.*
 
 ## 3. Disaster Recovery (The Rebuild)
 If your SSD dies and you lose your `husk_catalog.db`, do not panic. Your data is not lost.
@@ -411,8 +439,13 @@ The `tlv_data` block stores variable-length information:
 | `info` | `--tape-dev` | Displays capacity and "Wasteland" statistics. |
 | `scrub` | `--tape-dev` | Verifies BLAKE3 hashes for all data on volume. |
 | `restore` | `--file-path` | Manually extracts a file (supports `--version`). |
+| `rm` | `--file-path` | Permanently deletes a file from SSD and Catalog. |
+| `repack` | `--source`, `--dest` | Reclaims space by migrating active data. |
+| `prune` | None | Deletes orphaned catalog records missing from the SSD. |
+| `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. || `restore` | `--file-path` | Manually extracts a file (supports `--version`). |
 | `repack` | `--source`, `--dest` | Reclaims space by migrating active data. |
 | `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. |
+| `export` | `--format`, `--output`| Exports the SQLite catalog to a Data Engineering format (Parquet). |
 
 ## Storage Interface Specs
 *   **Block Size:** 4096 bytes (Logical), 262,144 bytes (Physical SCSI Tape Frame).
@@ -428,13 +461,11 @@ The `tlv_data` block stores variable-length information:
 ---
 
 
-***
-
 ### Section 8: Production Deployment Guide (`production.md`)
 
 # Production Deployment
 
-While testing with `.img` files is useful for development, a production HuskHoard setup involves physical block devices, massive multi-drive arrays, and real-time cloud replication. This guide will walk you through a professional-grade deployment.
+While testing with `.img` files is useful for development, a production HuskHoard setup involves physical block devices and real-time cloud replication. This guide walk you through a professional-grade deployment.
 
 ## 1. Preparing Production Hardware
 
@@ -455,7 +486,7 @@ Unlike the test environment where we used `fallocate`, in production we format t
 
 ```bash
 # Format a physical 14TB Hard Drive
-sudo ./husk format --tape_dev /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
+sudo ./huskhoard format --tape-dev /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
 ```
 
 ## 2. Setting up the Cloud Replication Tier
@@ -463,92 +494,35 @@ HuskHoard can replicate every byte to a cloud provider in real-time.
 
 1.  **Configure rclone:** Run `rclone config` and create a remote (e.g., named `backblaze_b2`).
 2.  **Verify access:** Ensure you can see the bucket: `rclone ls backblaze_b2:my-husk-bucket`.
-3.  **Add to Husk:** Use the `rclone:` prefix in your config (see examples below).
+3.  **Add to Husk:** Use the `rclone:` prefix in your config (see step 3).
 
-## 3. Production Configuration Architectures
-HuskHoard supports as many drives as your server can physically connect. Because of its Tiered Volume Engine, you can structure these drives for either **High Availability** or **Infinite Spillover**.
+## 3. Production Configuration Example
+An example setup may involve a "Hot" NVMe SSD, many local "Primary" HDDs, and a "Cloud" replica. HuskHoard can support as many drives as you can address with your server. 
 
-### Architecture A: High Availability Mirror (RAID 1 Equivalent)
-Use this if you want absolute 1:1 local redundancy. HuskHoard multiplexes writes simultaneously.
-
+Edit `husk_config.toml`:
 ```toml
 # --- SSD Tier ---
 hot_tier = "/mnt/nvme_data/media"
 db_path = "/var/lib/husk/husk_catalog.db"
-min_free_space_gb = 50 
 
-# --- Tier 1: Local Primary Array ---
+# --- Hard Drive Tier (Local Archive) ---
 primary_volumes = [
-    "/dev/disk/by-id/ata-WDC-SERIAL1",
-    "/dev/disk/by-id/ata-WDC-SERIAL2"
+    "/dev/disk/by-id/ata-WDC_WD140EDGZ-SERIAL1",
+    "/dev/disk/by-id/ata-WDC_WD140EDGZ-SERIAL2",
+    "/dev/disk/by-id/ata-WDC_WD140EDGZ-SERIAL3"
 ]
 
-# --- Tier 2: Real-Time Local Mirrors ---
-replication_volumes = [
-    "/dev/disk/by-id/ata-WDC-SERIAL3",
-    "/dev/disk/by-id/ata-WDC-SERIAL4"
-]
-replicas = 1
+# --- Cloud Tier (Replication) ---
+replication_volumes = ["rclone:backblaze_b2:my-husk-bucket/vault1"]
+replicas = 1 # Keep 1 local copy + 1 cloud copy
+
+# --- Production Policy ---
+janitor_schedule_time = "02:00" # Run the scan every night at 2 AM
+max_age_days = 60              # Keep files on SSD for 2 months
+max_versions = 5               # Keep 5 historical versions for rollback
 ```
 
-### Architecture B: The Infinite Spillover (JBOD + Cloud)
-Use this if you want maximum local capacity and use the cloud as your emergency safety net. 
-
-```toml
-hot_tier = "/mnt/nvme_data/media"
-db_path = "/var/lib/husk/husk_catalog.db"
-min_free_space_gb = 50 
-
-# --- Pool all local drives for maximum capacity ---
-primary_volumes = [
-    "/dev/disk/by-id/ata-WDC-SERIAL1",
-    "/dev/disk/by-id/ata-WDC-SERIAL2",
-    "/dev/disk/by-id/ata-WDC-SERIAL3",
-    "/dev/disk/by-id/ata-WDC-SERIAL4"
-]
-
-# --- Emergency Cloud Failover ---
-# If all 4 local drives fill up, data seamlessly routes here
-failover_volumes = ["rclone:backblaze_b2:my-husk-bucket/vault1"]
-
-replication_volumes = []
-replicas = 0
-```
-
-## 4. Understanding "Sticky Drive" Allocation
-If you have 20 drives in your `primary_volumes`, HuskHoard **does not** stripe data across them like RAID 0. 
-
-Instead, it uses a **"Sticky Drive"** algorithm. It sorts your drives by *Most Used Space First*. It will write exclusively to Drive 1 until it hits your `min_free_space_gb` safety limit. Only then will it move to Drive 2. 
-
-**Why this matters for production:**
-* **Power Savings:** Drives 2 through 20 stay spun down and sleeping in low-power mode for months.
-* **Safety:** If Drive 1 dies, you only lose Drive 1. There is no catastrophic chain failure or 50-hour array rebuild required.
-* **Edge-Case Safety (The Physical Fit Check):** If Drive 1 has 55GB free, and an incoming file is 100GB, HuskHoard calculates this *before* writing. It will skip Drive 1 and put the 100GB file on Drive 2, ensuring a file is never split or corrupted mid-write.
-
-## 5. Tuning the Janitor for Batch Processing
-In a test environment, it is common to use `janitor_interval_secs = 60`. In production, constant polling generates unnecessary overhead. You should transition to a nightly batch processor.
-
-Edit `husk_config.toml`:
-```toml
-# Disable the testing interval
-janitor_schedule_time = "02:00" # Run once a day at 2:00 AM
-
-max_age_days = 60               # Keep files on SSD for 2 months
-max_versions = 5                # Keep 5 historical versions for rollback
-```
-
-### Advanced: Tuning the Database Mirror Timeout
-By default, the Archiver Worker writes a full backup of the SQLite database to the sequential archive drive whenever the queue is idle for 5 seconds. If you are doing batch processing, this creates unnecessary "wasteland" space by writing the database hundreds of times.
-
-Before compiling for production, you can change this idle timeout to **1 Hour**:
-1. Open `src/daemon.rs`.
-2. Locate `match rx.recv_timeout(Duration::from_secs(5)) {`
-3. Change it to `match rx.recv_timeout(Duration::from_secs(3600)) {`
-4. Recompile with `cargo build --release`.
-
-HuskHoard will now process incoming files instantly, but will wait until the system has been entirely idle for an hour before sealing the batch with a database backup.
-
-## 6. Running as a System Service (systemd)
+## 4. Running as a System Service (systemd)
 In production, you want HuskHoard to start automatically when the server boots. Create a systemd unit file:
 
 `sudo nano /etc/systemd/system/huskhoard.service`
@@ -560,9 +534,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/huskhoard
-ExecStart=/opt/huskhoard/husk daemon
+User=huskuser
+Group=huskuser
+WorkingDirectory=/home/huskuser/husk
+ExecStart=/home/huskuser/husk/target/release/huskhoard daemon
 Restart=always
 RestartSec=5
 
@@ -579,8 +554,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable huskhoard
 sudo systemctl start huskhoard
 ```
+# Production Deployment
 
-## 7. LTO Tape Setup
+## 5. LTO Tape Setup
 To use a physical tape drive, ensure your user has permissions for the generic SCSI character devices.
 ```bash
 # Add user to the tape group
@@ -591,29 +567,20 @@ In your `husk_config.toml`, point to the **non-rewinding** device:
 primary_volumes = ["/dev/nst0"] # Use 'n' prefix to prevent auto-rewind on close
 ```
 
-## 8. Managing the "Offline Library"
+## 6. Managing the "Offline Library"
 HuskHoard excels at managing a "Shelf" of disconnected drives and tapes. 
-*   **Hardware Portability:** Husk writes a UUID to LBA 0 of every volume. You can unplug a USB drive, move it to a different SATA port, and the database will automatically find it.
-*   **The Recall Prompt:** If an app tries to access a file on a drive that is currently in a box on your shelf, the daemon will hold the app open and log a request via the Sidecar IPC (which you can route to Slack/Email):
-    > `👉 PLEASE INSERT: Volume UUID [a1b2c3d4] (Location Hint: Box 4)`
-*   **Resume:** Once the drive is plugged in, HuskHoard automatically mounts it and continues the stream.
+*   **Identify by Model:** For LTO drives, HuskHoard records the drive model (e.g., `IBM-LTO8`) in the database.
+*   **The Recall Prompt:** If an app tries to access a file on a tape that is currently in a box on your shelf, the daemon will block the app and log:
+    > `👉 PLEASE INSERT: Volume UUID [a1b2c3d4] (SCSI Model: HP LTO-7 ULTRIUM)`
+*   **Resume:** Once the tape is inserted and the drive is ready, HuskHoard automatically continues the stream.
 
-## 9. Garbage Collection (Repacking)
-Over time, as files are deleted or overwritten, old data in the archive becomes "Wasteland" (dead space). 
-
-You can reclaim this space using the `Repack` command, which copies only the active files to a new drive:
-```bash
-sudo ./husk repack --source_tape /dev/sdb --dest_tape /dev/sdc
-```
-**How it impacts the Sticky Drive:**
-If Drive 1 was full, but you Repack it so it now has 50% free space, HuskHoard **will not** immediately jump back to Drive 1. It will continue filling whatever drive is currently the *most* full (e.g., Drive 2). Drive 1 simply becomes the "backup" drive that takes over as soon as Drive 2 hits its capacity limit, preserving drive longevity.
-
-## 10. Performance Tuning for High Capacity
+## 7. Performance Tuning for High Capacity
 When dealing with multi-terabyte drives, performance tuning is key:
 
 *   **O_DIRECT:** Production mode defaults to `O_DIRECT`. This ensures that archiving 10TB of data won't "pollute" your Linux RAM cache, leaving your system snappy for other tasks.
-*   **Disk Spindown:** If you are using standard HDDs, you can set an idle spindown timer using `hdparm -S 240 /dev/sdX` (spins down after 20 minutes of inactivity). HuskHoard will automatically wake the drive when a "Husk" is accessed.
-*   **Database Location:** Always keep your `husk_catalog.db` on your fastest NVMe SSD. This ensures that `ls` commands and file metadata lookups remain instantaneous, even if the data is on a sleeping hard drive.
+*   **Disk Spindown:** If you are using standard HDDs, you can set an idle spindown timer using `hdparm -S`. HuskHoard will automatically wake the drive when a "Husk" is accessed.
+*   **Database Location:** Always keep your `husk_catalog.db` on your fastest SSD. This ensures that `ls` commands and file metadata lookups remain instantaneous, even if the data is on a sleeping hard drive.
+
 ---
 
 
@@ -699,11 +666,40 @@ Because the database is the "Brain" of the system, HuskHoard performs **Database
 *   That backup is then **archived onto the tape itself**.
 *   This ensures that even if your computer and its SSD are destroyed in a fire, as long as you have your archive drives, you can recover the Catalog and every file within it.
 
+## 7. Data Engineering & Parquet Export
+As your library scales to millions of files, querying SQLite directly might become a bottleneck for heavy analytical workloads. HuskHoard includes a native **Apache Parquet** exporter so you can plug your storage metadata directly into big-data tools (DuckDB, ClickHouse, Apache Spark, or Python Pandas).
+
+To export your catalog:
+`bash
+./huskhoard export --format parquet --output my_catalog.parquet
+`
+
+**Why Parquet?**
+Parquet uses columnar compression (Snappy), meaning a 10GB SQLite database might compress down to a 200MB Parquet file that can be queried in milliseconds.
+
+**Example: Instant Analytics with DuckDB**
+You can use the free `duckdb` CLI to run massive analytical queries directly against the exported file:
+
+`bash
+# Find the top 5 largest files archived
+duckdb -c "
+  SELECT file_path, payload_size / 1e9 AS GB 
+  FROM 'my_catalog.parquet' 
+  ORDER BY payload_size DESC LIMIT 5;
+"
+
+# Calculate total storage used per Compression Type
+duckdb -c "
+  SELECT compression_type, SUM(compressed_size) / 1e12 AS TB_Used 
+  FROM 'my_catalog.parquet' 
+  GROUP BY compression_type;
+"
+`
+
 ---
 
 
 ### Section 10: High-Performance Search (`search.md`)
-
 # High-Performance Search
 
 As your "Hoard" grows to millions of files and multiple petabytes, traditional Linux search tools like `find` or `locate` become painfully slow. HuskHoard solves this by providing **Instant Metadata Search** via the Catalog.
