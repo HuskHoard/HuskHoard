@@ -158,6 +158,16 @@ fn main() {
                 error!("Repacker failed: {}", e);
             }
         }
+        Commands::Prune => {
+            if let Err(e) = prune_catalog(&config_arc.db_path) {
+                error!("Prune failed: {}", e);
+            }
+        }
+        Commands::Rm { file_path } => {
+            if let Err(e) = hard_remove(&config_arc.db_path, file_path) {
+                error!("Remove failed: {}", e);
+            }
+        }
         Commands::Export { format, output } => {
             if format.to_lowercase() == "parquet" {
                 info!("Exporting catalog to Parquet: {}", output);
