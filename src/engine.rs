@@ -1289,3 +1289,65 @@ pub fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io
     
     Ok(())
 }
+
+// ---------------------------------------------------------
+// 8.6 Maintenance: Prune & Hard Remove
+// ---------------------------------------------------------
+pub fn prune_catalog(db_path: &str) -> std::io::Result<()> {
+    info!("Starting Catalog Reconciliation...");
+    let conn = Connection::open(db_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    
+    // Get all unique files currently in the catalog
+    let mut stmt = conn.prepare("SELECT DISTINCT file_path FROM catalog").unwrap();
+    let paths: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(Result::ok).collect();
+    
+    let mut purged_count = 0;
+
+    for path in paths {
+        // If the file does not exist on the SSD AT ALL (not even a stub)
+        if !std::path::Path::new(&path).exists() {
+            info!("  [Prune] File missing from filesystem. Removing from catalog: {}", path);
+            
+            // Delete from Catalog
+            let _ = conn.execute("DELETE FROM catalog WHERE file_path = ?1", params![path]);
+            
+            // Delete from StreamGate index
+            let _ = conn.execute("DELETE FROM object_frames WHERE file_path = ?1", params![path]);
+            
+            purged_count += 1;
+        }
+    }
+    
+    info!("Reconciliation complete. Purged {} orphaned records from the catalog.", purged_count);
+    info!("These files will be physically erased from tape during the next 'repack'.");
+    
+    Ok(())
+}
+
+pub fn hard_remove(db_path: &str, file_path: &str) -> std::io::Result<()> {
+    let conn = Connection::open(db_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    
+    // 1. Resolve absolute path to match DB
+    let abs_path = std::fs::canonicalize(file_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(file_path))
+        .to_string_lossy()
+        .to_string();
+
+    // 2. Erase from Filesystem if it exists
+    if std::path::Path::new(&abs_path).exists() {
+        std::fs::remove_file(&abs_path)?;
+        info!("Deleted from Hot Tier: {}", abs_path);
+    }
+
+    // 3. Erase from Database
+    let deleted_cat = conn.execute("DELETE FROM catalog WHERE file_path = ?1", params![abs_path]).unwrap_or(0);
+    let _ = conn.execute("DELETE FROM object_frames WHERE file_path = ?1", params![abs_path]);
+
+    if deleted_cat > 0 {
+        info!("Deleted from Catalog: {}. It will be erased from tape on next repack.", abs_path);
+    } else {
+        error!("File not found in catalog: {}", abs_path);
+    }
+
+    Ok(())
+}
