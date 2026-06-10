@@ -519,7 +519,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
 
     let abs_start_offset = tape_offset + 4096 + target_c_offset;
 
-    // --- FIX: O_DIRECT BLOCK ALIGNMENT ---
+    // ---  O_DIRECT BLOCK ALIGNMENT ---
     // We must seek and read in multiples of 4096.
     let aligned_offset = abs_start_offset - (abs_start_offset % 4096);
     let alignment_skew = (abs_start_offset % 4096) as usize;
@@ -796,7 +796,7 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     let dup_fd = unsafe { libc::dup(dest_fd) };
     if dup_fd < 0 { return Err(std::io::Error::last_os_error()); }
 
-    // --- FIX: Explicitly enforce original UNIX ownership and permissions ---
+    // --- Explicitly enforce original UNIX ownership and permissions ---
     // Only apply for manual restores to prevent stripping POSIX ACLs on SMB shares.
     // The fanotify daemon doesn't need this because hole-punched stubs retain their original permissions/ACLs.
     if is_manual {
