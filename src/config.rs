@@ -196,6 +196,13 @@ pub enum Commands {
         source_tape: String,
         #[arg(long)]
         dest_tape: String,
+    },
+    /// Reconcile the catalog by deleting DB entries for files that no longer exist on the filesystem
+    Prune,
+    /// Permanently delete a file from both the filesystem and the tape catalog
+    Rm {
+        #[arg(long)]
+        file_path: String,
     }
 }
 pub fn is_path_excluded(path: &str, config: &Arc<HuskConfig>) -> bool {
