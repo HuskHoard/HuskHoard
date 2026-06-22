@@ -189,6 +189,8 @@ pub enum Commands {
         dest_path: String,
         #[arg(long)]
         version: Option<u32>,
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Reclaim tape space by copying only the latest active files to a new tape (Garbage Collection)
     Repack {
