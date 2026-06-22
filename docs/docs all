@@ -259,6 +259,9 @@ Simply open the file in any application (VLC, Image Viewer, Text Editor). HuskHo
 HuskHoard maintains a history of your files. If you accidentally overwrite a file and want the version from three days ago, use the `restore` command:
 ```bash
 ./huskhoard restore --file-path /home/jo/report.pdf --dest-path ./recovered.pdf --version 1
+You can also specify exactly which replica volume to restore from using the --source parameter (useful if your primary volume is temporarily offline but a cloud or secondary replica is available):
+```bash
+./huskhoard restore --file-path /home/jo/report.pdf --dest-path ./recovered.pdf --source "rclone:backblaze_b2"
 ```
 
 ## 3. Monitoring Volume Health
@@ -438,12 +441,10 @@ The `tlv_data` block stores variable-length information:
 | `format` | `--tape-dev` | Writes a Volume Header to LBA 0 of a drive. |
 | `info` | `--tape-dev` | Displays capacity and "Wasteland" statistics. |
 | `scrub` | `--tape-dev` | Verifies BLAKE3 hashes for all data on volume. |
-| `restore` | `--file-path` | Manually extracts a file (supports `--version`). |
+| `restore` | `--file-path` | Manually extracts a file (supports `--version` and `--source`). |
 | `rm` | `--file-path` | Permanently deletes a file from SSD and Catalog. |
 | `repack` | `--source`, `--dest` | Reclaims space by migrating active data. |
 | `prune` | None | Deletes orphaned catalog records missing from the SSD. |
-| `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. || `restore` | `--file-path` | Manually extracts a file (supports `--version`). |
-| `repack` | `--source`, `--dest` | Reclaims space by migrating active data. |
 | `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. |
 | `export` | `--format`, `--output`| Exports the SQLite catalog to a Data Engineering format (Parquet). |
 
