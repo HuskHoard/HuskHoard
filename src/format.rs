@@ -23,7 +23,7 @@ pub struct ObjectHeader {
     pub gid: u32,                 // offset 96
     pub data_checksum: [u8; 32],  // offset 100
     pub header_crc32: u32,        // offset 132
-    // Fixed header total exactly 136 bytes.
+    
     
     pub tlv_data: [u8; 3960],     // offset 136 -> 4096 bytes total
 }
