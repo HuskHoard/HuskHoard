@@ -216,7 +216,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
     let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
     
-    // LOGIC: Check config to bypass Zstd compression
+    // NEW LOGIC: Check config to bypass Zstd compression
     let file_ext = std::path::Path::new(source_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let use_compression = !config.no_compress_extensions.contains(&file_ext);
     let compression_type_flag: u8 = if use_compression { 1 } else { 0 };
@@ -332,7 +332,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             }
         }
 
-        // Type 0x03: Pack StreamGate Jump Table (Array of u32 compressed sizes)
+        // NEW Type 0x03: Pack StreamGate Jump Table (Array of u32 compressed sizes)
         // Note: 16MB frames mean we only need 4 bytes per frame. A 10GB file only needs ~600 frames (2.4KB).
         let frames_payload_len = jump_table.len() * 4;
         if tlv_offset + 4 + frames_payload_len <= header.tlv_data.len() {
@@ -902,7 +902,7 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     Ok(())
 }
 
-pub fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, dest_path: &str, version: Option<u32>, use_direct_io: bool) -> std::io::Result<()> {
+pub fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, dest_path: &str, version: Option<u32>, source: Option<String>, use_direct_io: bool) -> std::io::Result<()> {
     let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB open failed"))?;
     
     let mut query = String::from(
@@ -912,12 +912,23 @@ pub fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, 
          WHERE c.file_path = ?1"
     );
     
-    let row_res = if let Some(v) = version {
-        query.push_str(" AND c.version = ?2 LIMIT 1");
-        conn.query_row(&query, params![file_path, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
-    } else {
-        query.push_str(" ORDER BY c.version DESC LIMIT 1");
-        conn.query_row(&query, params![file_path], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+    let row_res = match (&version, &source) {
+        (Some(v), Some(s)) => {
+            query.push_str(" AND (t.device_path LIKE '%' || ?2 || '%' OR t.tape_uuid LIKE '%' || ?2 || '%') AND c.version = ?3 ORDER BY c.tape_offset ASC LIMIT 1");
+            conn.query_row(&query, params![file_path, s, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+        }
+        (Some(v), None) => {
+            query.push_str(" AND c.version = ?2 ORDER BY c.tape_offset ASC LIMIT 1");
+            conn.query_row(&query, params![file_path, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+        }
+        (None, Some(s)) => {
+            query.push_str(" AND (t.device_path LIKE '%' || ?2 || '%' OR t.tape_uuid LIKE '%' || ?2 || '%') ORDER BY c.version DESC, c.tape_offset ASC LIMIT 1");
+            conn.query_row(&query, params![file_path, s], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+        }
+        (None, None) => {
+            query.push_str(" ORDER BY c.version DESC, c.tape_offset ASC LIMIT 1");
+            conn.query_row(&query, params![file_path], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+        }
     };
 
     match row_res {
@@ -942,8 +953,8 @@ pub fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, 
             }
         }
         Err(_) => {
-            error!(" File '{}' (Version: {:?}) not found in catalog.", file_path, version);
-            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Version not found in catalog."))
+            error!(" File '{}' (Version: {:?}, Source: {:?}) not found in catalog.", file_path, version, source);
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Version/Source not found in catalog."))
         }
     }
 }
