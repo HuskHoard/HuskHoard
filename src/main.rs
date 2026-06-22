@@ -141,8 +141,9 @@ fn main() {
                 error!("Scrubber failed: {}", e);
             }
         }
-        Commands::Restore { file_path, dest_path, version } => {
-            if let Err(e) = manual_restore(&config_arc, &config_arc.db_path, file_path, dest_path, *version, use_direct_io) {
+        
+        Commands::Restore { file_path, dest_path, version, source } => {
+            if let Err(e) = manual_restore(&config_arc, &config_arc.db_path, file_path, dest_path, *version, source.clone(), use_direct_io) {
                 error!("Manual restore failed: {}", e);
             }
         }
