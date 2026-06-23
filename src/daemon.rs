@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::io::Write;
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -165,9 +166,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                 proc_name = comm.trim().to_string();
                             }
 
-                            // Prevent aggressive background indexers from unintentionally restoring files
-                            let ignore_list = ["rg", "code", "node", "git", "grep", "tracker-miner-f"];
-                            if ignore_list.contains(&proc_name.as_str()) {
+                            if config.ignore_processes.iter().any(|p| p == &proc_name) {
                                 info!("[Daemon]  Ignoring background read from '{}' to keep file stubbed.", proc_name);
                             } else {
                                 info!("\n[Daemon] INTERCEPTED READ ON STUB: {} (Triggered by PID {}: {})", path_str, pid, proc_name);
@@ -262,6 +261,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                             restores.remove(&path_clone);
                                         }
                                     } else {
+                                        info!("[Daemon] Process '{}' waiting for primary restore of '{}'...", proc_name, path_clone);
                                         // Secondary read request. Wait for primary to finish restoring the file.
                                         loop {
                                             {
@@ -367,10 +367,11 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                             let _ = stream.write_all(msg.to_string().as_bytes());
                             let _ = stream.write_all(b"\n");
                             
-                            let mut buf = [0u8; 8192]; // Buffer for returning MAM JSON data
-                            if let Ok(n) = std::io::Read::read(&mut stream, &mut buf) {
-                                let resp = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-                                if resp.starts_with('{') { custom_meta = resp; } // Save JSON to DB
+                            let mut reader = std::io::BufReader::new(stream);
+                            let mut resp = String::new();
+                            if let Ok(_) = reader.read_line(&mut resp) {
+                                let resp = resp.trim();
+                                if resp.starts_with('{') { custom_meta = resp.to_string(); }
                             }
                         }
                     }
@@ -532,10 +533,11 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
 // Scanner thread: Instantly queries the DB and populates the queue without blocking.
 pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>) {
     let conn = Connection::open(&config.db_path).unwrap();
+    let _ = conn.busy_timeout(Duration::from_secs(30));
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let max_age_secs = config.max_age_days * 24 * 3600; 
 
-    // Check Hot Tier Usage (High-Water Mark)
+    // NEW: Check Hot Tier Usage (High-Water Mark)
     let mut emergency_bytes_to_free = 0u64;
     let max_pct = config.hot_tier_max_usage_percent.unwrap_or(80) as f64 / 100.0;
     
@@ -549,7 +551,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
     }
 
-    // Order by oldest first to ensure emergency spillover drops the stalest files
+    // NEW: Order by oldest first to ensure emergency spillover drops the stalest files
     let mut stmt = conn.prepare("SELECT file_path, last_touch FROM active_tracking ORDER BY last_touch ASC").unwrap();
     let rows: Vec<(String, u64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap().filter_map(Result::ok).collect();
