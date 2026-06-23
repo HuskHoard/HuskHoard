@@ -9,12 +9,20 @@ use log::{info, error};
 use crate::config::HuskConfig;
 use crate::engine::stream_file;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+
+struct StreamGuard;
+impl Drop for StreamGuard {
+    fn drop(&mut self) { ACTIVE_STREAMS.fetch_sub(1, Ordering::SeqCst); }
+}
 
 // ---------------------------------------------------------
 // HTTP Streaming Gateway (VLC / Plex Bridge)
 // ---------------------------------------------------------
 pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_direct_io: bool) {
-    // Prevent zombie threads if a client network drops
+    // VITAL: Prevent zombie threads if a client network drops
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -26,22 +34,38 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     if parts.len() < 2 { return; }
     let method = parts[0];
 
-    // ---  Handle browser CORS Preflight (OPTIONS) ---
+    // --- NEW: Handle browser CORS Preflight (OPTIONS) ---
     if method == "OPTIONS" {
         let headers = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n\r\n";
         let _ = stream.write_all(headers.as_bytes());
         return;
     }
 
-    //  Support HTTP HEAD requests used by Plex/VLC for probing file sizes
+    // VITAL: Support HTTP HEAD requests used by Plex/VLC for probing file sizes
     if method != "GET" && method != "HEAD" { return; }
     let is_head_request = method == "HEAD";
 
     // 1. Map URL to Local Path securely
-    let url_path = parts[1].replace("%20", " "); 
+    let mut decoded = Vec::new();
+    let mut bytes = parts[1].bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            if let (Some(h1), Some(h2)) = (bytes.next(), bytes.next()) {
+                if let (Ok(n1), Ok(n2)) = (
+                    u8::from_str_radix(std::str::from_utf8(&[h1]).unwrap_or(""), 16),
+                    u8::from_str_radix(std::str::from_utf8(&[h2]).unwrap_or(""), 16)
+                ) {
+                    decoded.push((n1 << 4) | n2);
+                    continue;
+                }
+            }
+        }
+        decoded.push(b);
+    }
+    let url_path = String::from_utf8_lossy(&decoded).into_owned(); 
     if url_path.contains("..") { return; } // Requirement 4: Prevent Path Traversal
 
-    // ---  Live Dashboard API Endpoint ---
+    // --- NEW: Live Dashboard API Endpoint ---
     if url_path == "/api/dashboard" {
         let conn = rusqlite::Connection::open(&config.db_path).unwrap();
         
@@ -115,11 +139,18 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
         let mut catalog = Vec::new();
         if let Ok(mut stmt) = conn.prepare("SELECT id, file_path, payload_size, version, original_mtime, tape_uuid FROM catalog ORDER BY id DESC LIMIT 50") {
             let _ = stmt.query_map([], |row| {
+                let path_str: String = row.get(1)?;
+                let status = if xattr::get(&path_str, "trusted.husk.status").map(|v| v == Some(b"stubbed".to_vec())).unwrap_or(false) {
+                    "STUBBED"
+                } else {
+                    "RESIDENT"
+                };
+
                 catalog.push(json!({
                     "id": row.get::<_, i64>(0)?,
-                    "path": row.get::<_, String>(1)?,
+                    "path": path_str,
                     "size": row.get::<_, i64>(2)?,
-                    "status": "STUBBED", 
+                    "status": status, 
                     "versions": row.get::<_, i64>(3)?,
                     "mtime": row.get::<_, i64>(4)?,
                     "tape": row.get::<_, String>(5)?
@@ -128,15 +159,18 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
             }).map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>());
         }
 
+        let files_today: i64 = conn.query_row("SELECT COUNT(*) FROM catalog WHERE archived_at >= date('now')", [], |row| row.get(0)).unwrap_or(0);
+        let total_replicas: i64 = conn.query_row("SELECT COUNT(*) FROM catalog", [], |row| row.get(0)).unwrap_or(0);
+
         let payload = json!({
             "volumes": vols,
             "catalog": catalog,
             "stats": {
-                "filesArchivedToday": catalog.len(), 
-                "totalReplicas": catalog.len(),
+                "filesArchivedToday": files_today, 
+                "totalReplicas": total_replicas,
                 "queueDepth": 0,
                 "janitorNextRun": config.janitor_schedule_time.clone().unwrap_or_else(|| format!("Every {}s", config.janitor_interval_secs)),
-                "activeStreams": 1
+                "activeStreams": ACTIVE_STREAMS.load(Ordering::SeqCst)
             },
             "events": [], 
             "logs": [],
@@ -166,7 +200,14 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     let file_path_obj = Path::new(&config.hot_tier).join(clean_path);
     
     let abs_path = match file_path_obj.canonicalize() {
-        Ok(p) => p,
+        Ok(p) => {
+            let hot_tier_abs = Path::new(&config.hot_tier).canonicalize().unwrap_or_default();
+            if !p.starts_with(&hot_tier_abs) {
+                let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+                return;
+            }
+            p
+        },
         Err(_) => {
             let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
             return;
@@ -188,7 +229,9 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
             if !split.is_empty() {
                 range_start = split[0].parse().unwrap_or(0);
                 if split.len() > 1 && !split[1].is_empty() {
-                    range_end = Some(split[1].parse().unwrap());
+                    if let Ok(end_val) = split[1].parse() {
+                        range_end = Some(end_val);
+                    }
                 }
             }
         }
@@ -272,10 +315,16 @@ pub fn run_http_gateway(config: Arc<HuskConfig>, use_direct_io: bool) {
     info!("[Gateway] Local HTTP Streaming Gateway active: http://{}/stream/", addr);
 
     for stream in listener.incoming() {
-        if let Ok(stream) = stream {
+        if let Ok(mut stream) = stream {
+            if ACTIVE_STREAMS.load(Ordering::SeqCst) >= 50 {
+                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+                continue;
+            }
+            ACTIVE_STREAMS.fetch_add(1, Ordering::SeqCst);
+            
             let cfg = Arc::clone(&config);
-            // Requirement 3: Threaded Concurrency per HTTP request
             thread::spawn(move || {
+                let _guard = StreamGuard;
                 handle_http_client(stream, cfg, use_direct_io);
             });
         }
