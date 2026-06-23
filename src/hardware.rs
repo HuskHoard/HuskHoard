@@ -68,8 +68,16 @@ pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, 
         
         if Path::new(db_path).exists() {
             if let Ok(conn) = Connection::open(db_path) {
-                let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog";
-                if let Ok(max_used) = conn.query_row(query, [], |row| row.get::<_, i64>(0)) { used_capacity = max_used as u64; }
+                let tape_uuid_hex: Result<String, _> = conn.query_row(
+                    "SELECT tape_uuid FROM tapes WHERE device_path = ?1", 
+                    params![tape_dev], |row| row.get(0)
+                );
+                if let Ok(uuid) = tape_uuid_hex {
+                    let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+                    if let Ok(max_used) = conn.query_row(query, params![uuid], |row| row.get::<_, i64>(0)) { 
+                        used_capacity = max_used as u64; 
+                    }
+                }
             }
         }
         return Ok((used_capacity, lto_capacity, active_data));
