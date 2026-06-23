@@ -313,6 +313,10 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 if let Ok(Some(val)) = xattr::get(source_path, &attr) {
                     let attr_bytes = attr.to_string_lossy().as_bytes().to_vec();
                     // Custom Packing Format: [NameLen: 1 byte] [Name] [ValLen: 2 bytes] [Val]
+                    if attr_bytes.len() > 255 {
+                        log::warn!("Skipping xattr: name exceeds 255 bytes");
+                        continue;
+                    }
                     let total_len = 1 + attr_bytes.len() + 2 + val.len();
                     if tlv_offset + 4 + total_len <= header.tlv_data.len() {
                         header.tlv_data[tlv_offset] = 0x00; header.tlv_data[tlv_offset+1] = 0x02;
@@ -345,7 +349,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 header.tlv_data[p..p+4].copy_from_slice(&(*c_size as u32).to_be_bytes());
                 p += 4;
             }
-            // tlv_offset += 4 + frames_payload_len; 
+            //tlv_offset += 4 + frames_payload_len; 
         }
 
         let mut crc = Crc32Hasher::new();
@@ -568,7 +572,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
     } else if is_char_dev {
         let mut f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
         let fd = f.as_raw_fd();
-        let file_index: i32 = conn.query_row("SELECT COUNT(*) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2", params![tape_uuid, tape_offset], |row| row.get(0)).unwrap_or(0);
+        let file_index: i32 = conn.query_row("SELECT COUNT(DISTINCT tape_offset) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2", params![tape_uuid, tape_offset], |row| row.get(0)).unwrap_or(0);
         let _ = send_mtio_cmd(fd, MTREW, 1);
         if file_index > 0 { let _ = send_mtio_cmd(fd, MTFSF, file_index); }
         
@@ -754,7 +758,7 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
         ).unwrap_or_default();
 
         let file_index: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2",
+            "SELECT COUNT(DISTINCT tape_offset) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2",
             params![tape_uuid, tape_offset], |row| row.get(0)
         ).unwrap_or(0);
 
