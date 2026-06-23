@@ -39,7 +39,8 @@ pub struct HuskConfig {
     pub log_level: String,
     pub http_port: Option<u16>,
     pub sidecar_socket_path: Option<String>, 
-    pub hot_tier_max_usage_percent: Option<u8>, 
+    pub hot_tier_max_usage_percent: Option<u8>,
+    pub ignore_processes: Vec<String>, 
 }
 
 // ---------------------------------------------------------
