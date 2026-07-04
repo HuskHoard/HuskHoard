@@ -113,6 +113,8 @@ Edit `husk_config.toml` to define your tiers and policies:
 *   `failover_volumes`: (Optional) Drives to use automatically if the primary is full or disconnected.
 *   `replication_volumes`: (Optional) Your `rclone` cloud remotes (e.g., `["rclone:s3:my-bucket"]`).
 *   `janitor_schedule_time`: Set a specific time for archival (e.g., `"02:00"` for 2 AM), or `"none"` to use an interval.
+*   `ignore_processes`: A list of process names (e.g., `["rsync", "clamscan", "mlocate"]`) allowed to touch a stubbed file without triggering rehydration. Required — use `[]` if you don't need it.
+*   `sidecar_socket_path`: (Optional) Path to a Unix socket for the Enterprise Sidecar IPC Bridge — needed for M&E pre-archive hooks, multi-node sync, or `husk-grid://` targets. See Architecture, Section 4.
 
 ## 4. Formatting your First Volume
 Before HuskHoard can write to a disk or image, it must be formatted with the **USTD Volume Header**:
@@ -328,9 +330,106 @@ If you have a file that is garbage (e.g., a bad video take, corrupted render) an
 
 
 
----
+### Section 5.1 : # Configuration Recipes
 
+HuskHoard’s policy engine is highly flexible. By tweaking your `husk_config.toml`, you can adapt the system for radically different workloads—from a simple automated tape archiver to a multi-tiered cloud media server. 
 
+Below are several example configurations you can use as templates for your specific environment. **Note:** these snippets show only the settings that differ from the default — they aren't complete, standalone config files. Start from your auto-generated default config and merge these values in.
+
+## 1. The Simple Tape Archiver (No Versioning, No Replication)
+**Best for:** Traditional IT operators or home lab users who simply want to write files to physical LTO tape, maintain a highly-searchable SQLite catalog, and free up SSD space. No cloud, no historical versioning, and no redundant replicas.
+
+**Key Settings:** 
+* `max_versions = 1` tells the database to only keep the absolute newest version of a file and prune older records.
+* `replicas = 0` entirely disables the replication logic.
+* `primary_volumes` points directly to the non-rewinding tape device (`/dev/nst0`).
+
+```toml
+# --- Core Paths ---
+hot_tier = "/mnt/nvme/staging_area"
+db_path = "/var/lib/husk/husk_catalog.db"
+
+# --- Hardware (Tape Only) ---
+primary_volumes = ["/dev/nst0"] 
+failover_volumes = []
+replication_volumes = []
+replicas = 0 
+
+# --- Policy Engine ---
+janitor_schedule_time = "23:00" # Run automatically once a night at 11 PM
+max_age_days = 7                # Move files to tape if untouched for a week
+max_versions = 1                # Disable versioning (keep only the latest version)
+
+# Maximize tape write speed by bypassing Zstd compression on already-compressed files
+no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "tar", "gz", "rar", "7z", "jpg", "png", "iso"]
+```
+
+## 2. Mission-Critical Backup (The "3-2-1" Strategy)
+**Best for:** Enterprise data, financial records, or critical infrastructure where data loss is unacceptable. This configuration keeps local versions, creates a local failover, and pushes a replica to an offsite S3 bucket.
+
+**Key Settings:**
+* `max_versions = 10` allows you to roll back a file to 10 previous historical states.
+* `replicas = 1` ensures every file written to the primary HDD is simultaneously multiplexed to the cloud.
+
+```toml
+# --- Core Paths ---
+hot_tier = "/mnt/data/active_shares"
+db_path = "/var/lib/husk/husk_catalog.db"
+
+# --- Multi-Tier Volume Allocation ---
+primary_volumes = ["/dev/disk/by-id/ata-WDC_WD140_Primary"]
+failover_volumes = ["/dev/disk/by-id/ata-WDC_WD140_Backup"]
+replication_volumes = ["rclone:aws_s3:my-company-vault/husk_backups"]
+replicas = 1
+
+# --- Policy Engine ---
+janitor_schedule_time = "none"
+janitor_interval_secs = 3600   # Sweep for modified files every hour
+max_age_days = 1               # Archive almost immediately 
+max_versions = 10              # Retain a deep historical rollback queue
+
+# Never let the active share drive exceed 75% capacity (Emergency Spillover)
+hot_tier_max_usage_percent = 75 
+```
+
+## 3. Media & Entertainment (Instant Video Offload)
+**Best for:** Video editors and VFX artists who deal with massive raw footage files that rapidly consume expensive NVMe storage. 
+
+**Key Settings:**
+* `immediate_archive_dirs` and `immediate_archive_extensions` tell the Janitor to bypass the `max_age_days` rule entirely. The moment a `.braw` or `.r3d` file lands in the hot tier, it is asynchronously vaulted to cold storage and stubbed.
+
+```toml
+# --- Core Paths ---
+hot_tier = "/mnt/nvme/video_projects"
+db_path = "/var/lib/husk/husk_catalog.db"
+
+# --- Volume Allocation ---
+primary_volumes = ["/dev/disk/by-id/nvme-Cold_Storage_Pool"]
+failover_volumes = []
+replication_volumes = []
+replicas = 0
+
+# --- Policy Engine ---
+janitor_schedule_time = "none"
+janitor_interval_secs = 60      # Aggressive 60-second sweeps
+max_age_days = 30               # Standard documents/assets stay for 30 days
+max_versions = 3
+
+# --- Aggressive Immediate Rules ---
+# The moment a camera card is dumped into /Raw_Footage/, archive it instantly
+immediate_archive_dirs = ["/Raw_Footage/", "/Render_Exports/"]
+immediate_archive_extensions = ["braw", "r3d", "mxf", "mov", "mp4", "prores"]
+no_compress_extensions = ["braw", "r3d", "mxf", "mov", "mp4"]
+```
+```
+
+### Step 3: Link it in your main Index/Readme (Optional)
+If you have a main `README.md` or `index.md` file that lists the table of contents for your documentation, you can add a link to it so users can find it easily:
+
+Copy and paste this wherever your documentation index is located:
+```markdown
+* [Configuration Recipes](recipes.md) - Pre-built templates for Tape-Only, M&E, and Enterprise 3-2-1 workloads.
+```
 
 ### Section 6: Maintenance & Disaster Recovery (`maintenance.md`)
 
@@ -441,9 +540,10 @@ The `tlv_data` block stores variable-length information:
 | `format` | `--tape-dev` | Writes a Volume Header to LBA 0 of a drive. |
 | `info` | `--tape-dev` | Displays capacity and "Wasteland" statistics. |
 | `scrub` | `--tape-dev` | Verifies BLAKE3 hashes for all data on volume. |
+| `cat` | `--file-path` | Streams a file directly to stdout with zero SSD writes (supports `--offset`, `--length`, `--tape-uuid`). |
 | `restore` | `--file-path` | Manually extracts a file (supports `--version` and `--source`). |
 | `rm` | `--file-path` | Permanently deletes a file from SSD and Catalog. |
-| `repack` | `--source`, `--dest` | Reclaims space by migrating active data. |
+| `repack` | `--source-tape`, `--dest-tape` | Reclaims space by migrating active data. |
 | `prune` | None | Deletes orphaned catalog records missing from the SSD. |
 | `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. |
 | `export` | `--format`, `--output`| Exports the SQLite catalog to a Data Engineering format (Parquet). |
@@ -451,7 +551,7 @@ The `tlv_data` block stores variable-length information:
 ## Storage Interface Specs
 *   **Block Size:** 4096 bytes (Logical), 262,144 bytes (Physical SCSI Tape Frame).
 *   **Tape Markers:** Uses standard SCSI `EOF` filemarks between every archived object.
-*   **Seek Method:** `lseek()` for disks, `MTFSF` (Forward Space File) for physical tape.
+*   **Reported Capacity:** `info`/`scrub` currently report a fixed 12TB for any physical LTO drive and a fixed 1PB placeholder for any `rclone:` remote, regardless of actual hardware/quota. Treat the fill percentage as directional rather than exact until hardware-specific capacity lookup ships.
 
 ## 3. Performance Tuning
 *   **Alignment:** HuskHoard enforces 4096-byte alignment. This ensures compatibility with **4Kn Advanced Format** drives and prevents "Partial Sector Writes."
@@ -663,7 +763,7 @@ If you ever want to leave HuskHoard or recover a file manually, the database giv
 
 ## 6. Database Backups
 Because the database is the "Brain" of the system, HuskHoard performs **Database Anchoring**:
-*   Every time the Archive Worker finishes a batch, it performs a `VACUUM INTO` to create a clean backup.
+*   After the Archive Worker has been idle for a while following at least one archived file (currently a 1-hour idle timeout), it performs a `VACUUM INTO` to create a clean backup. This is debounced, not triggered per-batch — and only the 3 most recent backup versions are retained on the archive volume.
 *   That backup is then **archived onto the tape itself**.
 *   This ensures that even if your computer and its SSD are destroyed in a fire, as long as you have your archive drives, you can recover the Catalog and every file within it.
 
@@ -806,6 +906,22 @@ Plex will now treat the LTO Tape or S3 bucket as a standard high-speed stream.
 *   **Path Traversal Protection:** The gateway strictly validates URLs. You cannot use `../` to escape the `hot_tier` and read system files like `/etc/shadow`.
 *   **Localhost Enforcement:** The gateway is designed for local-to-local communication. This keeps your metadata and file content off the open web.
 *   **Graceful 503s:** If you try to stream a file from a tape that is currently sitting on your shelf (offline), the gateway will return an `HTTP 503 Service Unavailable` with a log entry telling you exactly which drive to plug in.
+*   **Connection Limit:** The gateway caps concurrent streams at 50. Beyond that, new requests get an immediate `HTTP 503 Service Unavailable` rather than queuing or crashing the daemon.
+
+## 6. Live Dashboard API
+In addition to `/stream/`, the gateway exposes a read-only JSON endpoint for building your own monitoring UI:
+
+​```bash
+curl http://127.0.0.1:8080/api/dashboard
+​```
+
+The response includes:
+*   `volumes`: Every Primary/Failover/Replication/Legacy volume, with online/offline status, used/total/active bytes, and reclaimable ("wasteland") space.
+*   `catalog`: The 50 most recently archived files, with stub/resident status and version count.
+*   `stats`: Files archived today, total replica count, and the next Janitor run time.
+*   `config`: A snapshot of key policy settings (`max_age_days`, `max_versions`, `hot_tier_max_usage_percent`, etc).
+
+The gateway also answers `OPTIONS` requests with CORS headers and supports `HEAD` requests (used by Plex/VLC to probe file size before streaming), so a browser-based dashboard can query it directly.
 ```
 
 ---
