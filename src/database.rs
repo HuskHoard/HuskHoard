@@ -88,7 +88,8 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
             archived_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             original_mtime INTEGER NOT NULL,
             blake3_hash TEXT NOT NULL,
-            custom_metadata TEXT
+            custom_metadata TEXT,
+            ext_blocks INTEGER DEFAULT 0
         )",
         [],
     )?;
@@ -111,6 +112,7 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
     )?;
     
     // Alpha Patch: Add columns to existing DBs without wiping them
+    let _ = conn.execute("ALTER TABLE catalog ADD COLUMN ext_blocks INTEGER DEFAULT 0", []);
     let _ = conn.execute("ALTER TABLE tapes ADD COLUMN drive_serial TEXT DEFAULT 'VIRTUAL_IMAGE'", []);
     let _ = conn.execute("ALTER TABLE tapes ADD COLUMN backend_type TEXT DEFAULT 'local'", []);
     let _ = conn.execute("ALTER TABLE tapes ADD COLUMN location_hint TEXT DEFAULT NULL", []);
