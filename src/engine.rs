@@ -46,7 +46,7 @@ pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u
     vols_with_space.into_iter().map(|(dev, _)| dev).collect()
 }
 // Returns a tuple: (Vector of replicas, Vector of StreamGate Frames (UncompressedOffset, CompressedOffset, CompressedSize))
-pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, use_direct_io: bool) -> std::io::Result<(Vec<(u64, u64, u64, u8, String, String, String)>, Vec<(u64, u64, u64)>)> {
+pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, use_direct_io: bool) -> std::io::Result<(Vec<(u64, u64, u64, u8, String, String, String, usize)>, Vec<(u64, u64, u64)>)> {
     info!("Archiving '{}'...", source_path);
     
     let sidecar = SidecarBridge::new(config);
@@ -73,7 +73,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             let uuid_bytes: [u8; 16] = hasher.finalize().as_bytes()[0..16].try_into().unwrap();
             let uuid_hex = uuid_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
             
-            let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+            let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
             let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
             let start_offset = if logical_eof % ALIGNMENT as u64 == 0 { logical_eof } else { logical_eof + ALIGNMENT as u64 - (logical_eof % ALIGNMENT as u64) };
 
@@ -101,7 +101,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             let uuid_bytes: [u8; 16] = hasher.finalize().as_bytes()[0..16].try_into().unwrap();
             let uuid_hex = uuid_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-            let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+            let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
             let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
             let start_offset = if logical_eof % ALIGNMENT as u64 == 0 { logical_eof } else { logical_eof + ALIGNMENT as u64 - (logical_eof % ALIGNMENT as u64) };
 
@@ -140,7 +140,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 if &vol_header.magic_bytes != b"USTDVOL\0" { return false; }
                 
                 let uuid_hex = vol_header.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+                let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
                 let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
                 let start_offset = if logical_eof % ALIGNMENT as u64 == 0 { logical_eof } else { logical_eof + ALIGNMENT as u64 - (logical_eof % ALIGNMENT as u64) };
 
@@ -295,16 +295,13 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             data_checksum: *data_hash.as_bytes(), header_crc32: 0, tlv_data: [0; 3960],
         };
 
+        let mut all_tlvs = Vec::new();
         let filename = Path::new(source_path).file_name().unwrap().to_str().unwrap().as_bytes();
-        let mut tlv_offset = 0;
         
         // Type 0x01: Pack Filename
-        if tlv_offset + 4 + filename.len() <= header.tlv_data.len() {
-            header.tlv_data[tlv_offset] = 0x00; header.tlv_data[tlv_offset+1] = 0x01;
-            header.tlv_data[tlv_offset+2..tlv_offset+4].copy_from_slice(&(filename.len() as u16).to_be_bytes());
-            header.tlv_data[tlv_offset+4..tlv_offset+4 + filename.len()].copy_from_slice(filename);
-            tlv_offset += 4 + filename.len();
-        }
+        all_tlvs.push(0x00); all_tlvs.push(0x01);
+        all_tlvs.extend_from_slice(&(filename.len() as u16).to_be_bytes());
+        all_tlvs.extend_from_slice(filename);
 
         // Type 0x02: Pack Extracted Xattrs
         if let Ok(xattrs) = xattr::list(source_path) {
@@ -312,56 +309,61 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 if attr.to_string_lossy().starts_with("trusted.ustd") { continue; } // Skip internal status
                 if let Ok(Some(val)) = xattr::get(source_path, &attr) {
                     let attr_bytes = attr.to_string_lossy().as_bytes().to_vec();
-                    // Custom Packing Format: [NameLen: 1 byte] [Name] [ValLen: 2 bytes] [Val]
                     if attr_bytes.len() > 255 {
                         log::warn!("Skipping xattr: name exceeds 255 bytes");
                         continue;
                     }
                     let total_len = 1 + attr_bytes.len() + 2 + val.len();
-                    if tlv_offset + 4 + total_len <= header.tlv_data.len() {
-                        header.tlv_data[tlv_offset] = 0x00; header.tlv_data[tlv_offset+1] = 0x02;
-                        header.tlv_data[tlv_offset+2..tlv_offset+4].copy_from_slice(&(total_len as u16).to_be_bytes());
-                        
-                        let payload_start = tlv_offset + 4;
-                        header.tlv_data[payload_start] = attr_bytes.len() as u8;
-                        header.tlv_data[payload_start+1 .. payload_start+1+attr_bytes.len()].copy_from_slice(&attr_bytes);
-                        
-                        let val_len_start = payload_start+1+attr_bytes.len();
-                        header.tlv_data[val_len_start .. val_len_start+2].copy_from_slice(&(val.len() as u16).to_be_bytes());
-                        header.tlv_data[val_len_start+2 .. val_len_start+2+val.len()].copy_from_slice(&val);
-                        
-                        tlv_offset += 4 + total_len;
-                    }
+                    all_tlvs.push(0x00); all_tlvs.push(0x02);
+                    all_tlvs.extend_from_slice(&(total_len as u16).to_be_bytes());
+                    all_tlvs.push(attr_bytes.len() as u8);
+                    all_tlvs.extend_from_slice(&attr_bytes);
+                    all_tlvs.extend_from_slice(&(val.len() as u16).to_be_bytes());
+                    all_tlvs.extend_from_slice(&val);
                 }
             }
         }
 
-        // NEW Type 0x03: Pack StreamGate Jump Table (Array of u32 compressed sizes)
-        // Note: 16MB frames mean we only need 4 bytes per frame. A 10GB file only needs ~600 frames (2.4KB).
+        // Type 0x03: Pack StreamGate Jump Table
         let frames_payload_len = jump_table.len() * 4;
-        if tlv_offset + 4 + frames_payload_len <= header.tlv_data.len() {
-            header.tlv_data[tlv_offset] = 0x00; header.tlv_data[tlv_offset+1] = 0x03;
-            header.tlv_data[tlv_offset+2..tlv_offset+4].copy_from_slice(&(frames_payload_len as u16).to_be_bytes());
-            
-            let mut p = tlv_offset + 4;
-            for (_, _, c_size) in &jump_table {
-                // Compress size fits easily in u32 since max frame is ~16MB
-                header.tlv_data[p..p+4].copy_from_slice(&(*c_size as u32).to_be_bytes());
-                p += 4;
-            }
-            //tlv_offset += 4 + frames_payload_len; 
+        all_tlvs.push(0x00); all_tlvs.push(0x03);
+        all_tlvs.extend_from_slice(&(frames_payload_len as u16).to_be_bytes());
+        for (_, _, c_size) in &jump_table {
+            all_tlvs.extend_from_slice(&(*c_size as u32).to_be_bytes());
         }
+
+        let mut ext_blocks = 0;
+        let mut ext_buffer = Vec::new();
+        if all_tlvs.len() <= 3960 {
+            header.tlv_data[..all_tlvs.len()].copy_from_slice(&all_tlvs);
+        } else {
+            header.tlv_data.copy_from_slice(&all_tlvs[..3960]);
+            let overflow = &all_tlvs[3960..];
+            ext_blocks = (overflow.len() + 4095) / 4096;
+            ext_buffer = vec![0u8; ext_blocks * 4096];
+            ext_buffer[..overflow.len()].copy_from_slice(overflow);
+        }
+        
+        // Use the first byte of reserved_pad to store the number of extension blocks
+        header.reserved_pad[0] = ext_blocks as u8;
 
         let mut crc = Crc32Hasher::new();
         crc.update(bytemuck::bytes_of(&header));
         header.header_crc32 = crc.finalize();
 
-        // Write Header. (For rclone, this will be appended at the END of the file as a footer. 
-        // For local disks, we seek back and overwrite the zeroed header block at the start.)
+        // Write Header.
         tape.backend.seek_to(tape.start_offset)?;
         header_buf.as_mut_slice().copy_from_slice(bytemuck::bytes_of(&header));
         tape.backend.write_all(header_buf.as_slice())?;
-        results.push((tape.start_offset, payload_size, final_compressed_size, compression_type_flag, hash_hex.clone(), tape.uuid_hex.clone(), tape.dev_path.clone()));
+        
+        // Write Extension Blocks dynamically attached to the end of padding
+        if ext_blocks > 0 {
+            let ext_offset = tape.start_offset + 4096 + final_padded_size;
+            tape.backend.seek_to(ext_offset)?;
+            tape.backend.write_all(&ext_buffer)?;
+        }
+        
+        results.push((tape.start_offset, payload_size, final_compressed_size, compression_type_flag, hash_hex.clone(), tape.uuid_hex.clone(), tape.dev_path.clone(), ext_blocks));
     }
 
     // CRITICAL: Wait for all uploads to finish before returning
@@ -873,23 +875,40 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "BLAKE3 checksum mismatch!"));
     }
 
-    // Unpack Xattrs from TLV
+    // Unpack Xattrs from TLV, merging Extension Blocks if present
+    let ext_blocks = header.reserved_pad[0] as usize;
+    let mut all_tlvs = header.tlv_data.to_vec();
+
+    if ext_blocks > 0 {
+        let mut ext_buf = vec![0u8; ext_blocks * 4096];
+        if tape_dev.starts_with("rclone:") || is_char_dev {
+            let _ = tape.read_exact(&mut ext_buf);
+        } else {
+            if let StorageReader::Local(f) = &mut tape {
+                if f.seek(SeekFrom::Start(tape_offset + 4096 + header.padded_size)).is_ok() {
+                    let _ = f.read_exact(&mut ext_buf);
+                }
+            }
+        }
+        all_tlvs.extend_from_slice(&ext_buf);
+    }
+
     let mut tlv_offset = 0;
-    while tlv_offset + 4 <= header.tlv_data.len() {
-        let t_type = u16::from_be_bytes([header.tlv_data[tlv_offset], header.tlv_data[tlv_offset+1]]);
-        let t_len = u16::from_be_bytes([header.tlv_data[tlv_offset+2], header.tlv_data[tlv_offset+3]]) as usize;
-        if t_type == 0 || tlv_offset + 4 + t_len > header.tlv_data.len() { break; }
+    while tlv_offset + 4 <= all_tlvs.len() {
+        let t_type = u16::from_be_bytes([all_tlvs[tlv_offset], all_tlvs[tlv_offset+1]]);
+        let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
+        if t_type == 0 || tlv_offset + 4 + t_len > all_tlvs.len() { break; }
         
         if t_type == 0x02 { 
             let payload_start = tlv_offset + 4;
-            let name_len = header.tlv_data[payload_start] as usize;
+            let name_len = all_tlvs[payload_start] as usize;
             if name_len > 0 && payload_start + 1 + name_len + 2 <= payload_start + t_len {
-                let name = String::from_utf8_lossy(&header.tlv_data[payload_start+1 .. payload_start+1+name_len]).into_owned();
+                let name = String::from_utf8_lossy(&all_tlvs[payload_start+1 .. payload_start+1+name_len]).into_owned();
                 let val_len_start = payload_start+1+name_len;
-                let val_len = u16::from_be_bytes([header.tlv_data[val_len_start], header.tlv_data[val_len_start+1]]) as usize;
+                let val_len = u16::from_be_bytes([all_tlvs[val_len_start], all_tlvs[val_len_start+1]]) as usize;
                 let val_start = val_len_start + 2;
                 if val_start + val_len <= payload_start + t_len {
-                    let val = &header.tlv_data[val_start .. val_start+val_len];
+                    let val = &all_tlvs[val_start .. val_start+val_len];
                     
                     // Look up actual dest path via /proc mapping since we only have the raw_fd
                     let proc_path = format!("/proc/self/fd/{}", dest_fd);
@@ -1006,12 +1025,27 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                 params![&filename, 1, tape_dev, offset, header.payload_size, header.compressed_size, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
             );
             
-            //  Recover StreamGate Jump Table from TLV
+            // Recover StreamGate Jump Table from TLV, handling Extension Blocks
+            let ext_blocks = header.reserved_pad[0] as usize;
+            let mut all_tlvs = header.tlv_data.to_vec();
+
+            if ext_blocks > 0 {
+                let mut ext_buf = vec![0u8; ext_blocks * 4096];
+                let ext_offset = offset + 4096 + header.padded_size;
+                
+                let current_pos = tape.stream_position().unwrap_or(0);
+                if tape.seek(SeekFrom::Start(ext_offset)).is_ok() {
+                    let _ = tape.read_exact(&mut ext_buf);
+                    all_tlvs.extend_from_slice(&ext_buf);
+                }
+                let _ = tape.seek(SeekFrom::Start(current_pos));
+            }
+
             let mut tlv_offset = 0;
-            while tlv_offset + 4 <= header.tlv_data.len() {
-                let t_type = u16::from_be_bytes([header.tlv_data[tlv_offset], header.tlv_data[tlv_offset+1]]);
-                let t_len = u16::from_be_bytes([header.tlv_data[tlv_offset+2], header.tlv_data[tlv_offset+3]]) as usize;
-                if t_type == 0 || tlv_offset + 4 + t_len > header.tlv_data.len() { break; }
+            while tlv_offset + 4 <= all_tlvs.len() {
+                let t_type = u16::from_be_bytes([all_tlvs[tlv_offset], all_tlvs[tlv_offset+1]]);
+                let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
+                if t_type == 0 || tlv_offset + 4 + t_len > all_tlvs.len() { break; }
                 
                 if t_type == 0x03 {
                     let frame_count = t_len / 4;
@@ -1020,8 +1054,8 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                     let mut c_off: u64 = 0;
                     
                     for _ in 0..frame_count {
-                        if p + 4 > header.tlv_data.len() { break; }
-                        let c_size = u32::from_be_bytes([header.tlv_data[p], header.tlv_data[p+1], header.tlv_data[p+2], header.tlv_data[p+3]]) as u64;
+                        if p + 4 > all_tlvs.len() { break; }
+                        let c_size = u32::from_be_bytes([all_tlvs[p], all_tlvs[p+1], all_tlvs[p+2], all_tlvs[p+3]]) as u64;
                         
                         let _ = conn.execute(
                             "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1038,8 +1072,8 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
 
             recovered_count += 1;
             
-            // Jump forward by the padded size + the header size
-            offset += (ALIGNMENT as u64) + header.padded_size;
+            // Jump forward by the padded size + header size + ext blocks size
+            offset += (ALIGNMENT as u64) + header.padded_size + (ext_blocks as u64 * ALIGNMENT as u64);
         } else {
             // Not a header. Move forward 4KB and try again (Scan mode).
             offset += ALIGNMENT as u64;
@@ -1086,7 +1120,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     
     // 3. Find latest versions of all files on the source tape
     let query = "
-        SELECT id, file_path, tape_offset, compressed_size 
+        SELECT id, file_path, tape_offset, compressed_size, ext_blocks 
         FROM catalog c1 
         WHERE tape_uuid = ?1 
           AND version = (SELECT MAX(version) FROM catalog c2 WHERE c1.file_path = c2.file_path)
@@ -1098,7 +1132,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     
     let mut moved_count = 0;
     let mut dest_offset: u64 = conn.query_row(
-        "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1",
+        "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1",
         params![dest_uuid_hex], |row| row.get::<_, i64>(0)
     ).unwrap_or(4096) as u64;
     dest_offset = if dest_offset % ALIGNMENT as u64 == 0 { dest_offset } else { dest_offset + ALIGNMENT as u64 - (dest_offset % ALIGNMENT as u64) };
@@ -1110,6 +1144,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
         let path: String = row.get(1).unwrap();
         let src_offset: u64 = row.get(2).unwrap();
         let compressed_size: u64 = row.get(3).unwrap();
+        let ext_blocks: u64 = row.get::<_, Option<u64>>(4).unwrap().unwrap_or(0);
         let padded_size: u64 = ((compressed_size + 4095) / 4096) * 4096;
         
         // Read Source Header
@@ -1131,8 +1166,8 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
         header_buf.as_mut_slice().copy_from_slice(bytemuck::bytes_of(&header));
         dest_tape.write_all(header_buf.as_slice())?;
         
-        // Fast-copy Compressed Zstd Payload (Zero-Decompression)
-        let mut bytes_left = padded_size;
+        // Fast-copy Compressed Zstd Payload (Zero-Decompression) + Ext Blocks
+        let mut bytes_left = padded_size + (ext_blocks * 4096);
         while bytes_left > 0 {
             let chunk = std::cmp::min(bytes_left, io_buf.capacity as u64) as usize;
             src_tape.read_exact(&mut io_buf.as_mut_slice()[..chunk])?;
@@ -1150,7 +1185,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
         ).unwrap();
         
         moved_count += 1;
-        dest_offset += ALIGNMENT as u64 + padded_size;
+        dest_offset += ALIGNMENT as u64 + padded_size + (ext_blocks * 4096);
         info!("   Repacked: {}", path);
     }
     
