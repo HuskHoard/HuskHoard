@@ -393,7 +393,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                             if let Ok(tx) = conn.transaction() {
                                 let mut all_inserts_ok = true;
                                 
-                                for (offset, size, comp_size, comp_type, hash, tape_uuid, dev_path) in &replica_list {
+                                for (offset, size, comp_size, comp_type, hash, tape_uuid, dev_path, ext_blocks) in &replica_list {
                                     payload_size_saved = *size; 
                                     let drive_serial = get_drive_serial(dev_path);
                                     
@@ -403,9 +403,9 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                     ).is_err() { all_inserts_ok = false; }
                                     
                                     if tx.execute(
-                                        "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata) 
-                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                                        params![path_str, next_version, tape_uuid, offset, size, comp_size, comp_type, meta.uid(), meta.gid(), meta.mode(), meta.mtime(), hash, custom_meta],
+                                        "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata, ext_blocks) 
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                        params![path_str, next_version, tape_uuid, offset, size, comp_size, comp_type, meta.uid(), meta.gid(), meta.mode(), meta.mtime(), hash, custom_meta, *ext_blocks as u32],
                                     ).is_err() { all_inserts_ok = false; }
                                 }
 
@@ -443,7 +443,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                             // ---------------------------------------------------------
                             let sidecar = SidecarBridge::new(&config);
 
-                            let replicas_json: Vec<serde_json::Value> = replica_list.iter().map(|(offset, _, _, _, _, tape_uuid, dev_path)| {
+                            let replicas_json: Vec<serde_json::Value> = replica_list.iter().map(|(offset, _, _, _, _, tape_uuid, dev_path, _)| {
                                 json!({
                                     "tape_uuid": tape_uuid,
                                     "tape_offset": offset,
@@ -494,11 +494,11 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                 params![special_path], |row| row.get(0),
                             ).unwrap_or(1);
                             
-                            for (offset, size, comp_size, comp_type, hash, tape_uuid, _) in results {
+                            for (offset, size, comp_size, comp_type, hash, tape_uuid, _, ext_blocks) in results {
                             let _ = conn.execute(
-                                "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata) 
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                                params![special_path, next_ver, tape_uuid, offset, size, comp_size, comp_type, 0, 0, 0644, 0, hash, "{}"],
+                                "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata, ext_blocks) 
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                params![special_path, next_ver, tape_uuid, offset, size, comp_size, comp_type, 0, 0, 0644, 0, hash, "{}", ext_blocks as u32],
                             );
                         }
 
