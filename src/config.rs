@@ -40,6 +40,7 @@ pub struct HuskConfig {
     pub http_port: Option<u16>,
     pub sidecar_socket_path: Option<String>, 
     pub hot_tier_max_usage_percent: Option<u8>,
+    #[serde(default)]
     pub ignore_processes: Vec<String>, 
 }
 
@@ -125,6 +126,7 @@ temp_extensions = [".swp", ".tmp", ".crdownload", "~", ".part"]
 immediate_archive_extensions = ["mp4", "mov", "iso", "zip", "tar", "gz"]
 immediate_archive_dirs = ["/ArchiveDrop/"]
 no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "tar", "gz", "rar", "7z", "jpg", "png", "iso"]
+ignore_processes = []
 "#;
 
 
