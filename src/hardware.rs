@@ -29,7 +29,32 @@ pub fn format_bytes(bytes: u64) -> String {
     else if b >= KB { format!("{:.2} KB", b / KB) }
     else { format!("{} B", bytes) }
 }
+// ---------------------------------------------------------
+// Helper: Real Drive/Media Capacity via sg_logs (Tape Capacity Log Page 0x31)
+// ---------------------------------------------------------
+pub fn get_tape_capacity_bytes(tape_dev: &str) -> Option<u64> {
+    let output = std::process::Command::new("sg_logs")
+        .arg("-p")
+        .arg("0x31")
+        .arg(tape_dev)
+        .output()
+        .ok()?;
 
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.to_lowercase().contains("main partition maximum capacity") {
+            let mib: u64 = line.split(':').nth(1)?.trim().parse().ok()?;
+            if mib > 0 {
+                return Some(mib * 1024 * 1024);
+            }
+        }
+    }
+    None
+}
 pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, u64, u64)> {
     // 1. Rclone Cloud Targets
     if tape_dev.starts_with("rclone:") {
@@ -42,7 +67,7 @@ pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, 
                 let uuid_bytes: [u8; 16] = hasher.finalize().as_bytes()[0..16].try_into().unwrap();
                 let tape_uuid_hex = uuid_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
                 
-                let query_eof = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+                let query_eof = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
                 if let Ok(max_used) = conn.query_row(query_eof, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) { used_capacity = max_used as u64; }
 
                 let query_active = "SELECT COALESCE(SUM(((compressed_size + 4095) / 4096) * 4096 + 4096), 0) FROM catalog c1 INNER JOIN (SELECT file_path, MAX(version) as max_ver FROM catalog GROUP BY file_path) c2 ON c1.file_path = c2.file_path AND c1.version = c2.max_ver WHERE tape_uuid = ?1";
@@ -61,8 +86,10 @@ pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, 
 
     // 2. Physical SCSI Tape Targets (Character Device)
     if is_char_dev {
-        // Mock LTO-8 capacity (12TB) for now. Future updates will read hardware specs via sg_inq.
-        let lto_capacity = 12_000_000_000_000; 
+        // Query the real drive/media capacity via the Tape Capacity log page (0x31).
+        // Falls back to the LTO-8 (12TB) mock if sg_logs isn't installed or the
+        // drive/media doesn't support this log page.
+        let lto_capacity = get_tape_capacity_bytes(tape_dev).unwrap_or(12_000_000_000_000);
         let mut used_capacity = ALIGNMENT as u64;
         let active_data = 0; // Unused for now to prevent compiler warnings
         
@@ -73,7 +100,7 @@ pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, 
                     params![tape_dev], |row| row.get(0)
                 );
                 if let Ok(uuid) = tape_uuid_hex {
-                    let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+                    let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
                     if let Ok(max_used) = conn.query_row(query, params![uuid], |row| row.get::<_, i64>(0)) { 
                         used_capacity = max_used as u64; 
                     }
@@ -104,7 +131,7 @@ pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, 
                     if &vol_header.magic_bytes == b"USTDVOL\0" {
                         let tape_uuid_hex = vol_header.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
                         
-                        let query_eof = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096), 4096) FROM catalog WHERE tape_uuid = ?1";
+                        let query_eof = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
                         if let Ok(max_used) = conn.query_row(query_eof, params![tape_uuid_hex], |row| row.get::<_, i64>(0)) { 
                             used_capacity = max_used as u64; 
                         }
@@ -166,10 +193,12 @@ pub struct mtop {
 }
 
 pub const MTIOCTOP: libc::c_ulong = 0x40086d01;
-pub const MTREW: libc::c_short = 1;   // Rewind tape
-pub const MTWEOF: libc::c_short = 4;  // Write filemark
-pub const MTFSF: libc::c_short = 11;  // Forward space file
-pub const MTEOM: libc::c_short = 12;  // Space to end of recorded data
+pub const MTREW: libc::c_short = 6;    // Rewind tape
+pub const MTWEOF: libc::c_short = 5;   // Write filemark
+pub const MTFSF: libc::c_short = 1;    // Forward space over filemark
+pub const MTEOM: libc::c_short = 12;   // Space to end of recorded data
+
+pub const MTSETBLK: libc::c_short = 20; // Set block length (0 = variable block mode)
 
 pub fn send_mtio_cmd(fd: i32, op: libc::c_short, count: libc::c_int) -> std::io::Result<()> {
     let mut mt_cmd = mtop { mt_op: op, mt_count: count };
@@ -197,21 +226,31 @@ pub fn open_tape_device(tape_dev: &str, read: bool, write: bool, create: bool, u
     // We disable it here to let the kernel handle SCSI frame buffering safely.
     let effective_direct = if is_char_dev { false } else { use_direct_io };
 
-    if effective_direct {
+    let file = if effective_direct {
         opts.custom_flags(libc::O_DIRECT);
         match opts.open(tape_dev) {
-            Ok(file) => return Ok(file),
+            Ok(file) => file,
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
                 error!("!!O_DIRECT is unsupported on '{}'. Falling back to buffered I/O. (Set DISABLE_O_DIRECT=1 to silence this)", tape_dev);
                 let mut fallback_opts = OpenOptions::new();
                 fallback_opts.read(read).write(write).create(create);
-                return fallback_opts.open(tape_dev);
+                fallback_opts.open(tape_dev)?
             }
             Err(e) => return Err(e), // Bubble up other errors (e.g., Permission Denied)
         }
+    } else {
+        opts.open(tape_dev)?
+    };
+
+    // Force variable block mode so our 4KB-aligned, variable-length writes
+    // never collide with a drive that powered on in fixed-block mode.
+    if is_char_dev {
+        if let Err(e) = send_mtio_cmd(file.as_raw_fd(), MTSETBLK, 0) {
+            error!("!!Could not set variable block mode on '{}': {}. Continuing with drive's current block size.", tape_dev, e);
+        }
     }
 
-    opts.open(tape_dev)
+    Ok(file)
 }
 
 pub fn format_tape(tape_dev: &str, use_direct_io: bool) -> std::io::Result<()> {
