@@ -42,6 +42,7 @@ HuskHoard relies on the Linux **fanotify** kernel API. It is compatible with mod
 
 ### 🚀 Quick Start (Ubuntu 24.04)
 if you prefer to install the binary use this [Quick Start](https://github.com/HuskHoard/HuskHoard/blob/main/Quick%20Start/Release.md)
+
 **⚠️ Important:** Run all commands as your standard user. HuskHoard is designed to run in user-space.
 
 #### 1. Prerequisites
