@@ -23,7 +23,7 @@ Because HuskHoard uses the Linux `fanotify` API to transparently intercept file 
 ```bash
 sudo setcap cap_sys_admin,cap_sys_ptrace,cap_dac_read_search+ep ./huskhoard
 ```
-*(Note: If your system uses different capabilities, refer to the advanced documentation).*
+*(Note: this is for a ubuntu environment. If your system uses different capabilities, refer to the other quick start guides).*
 
 
 #### 4. Configure Your "Test Environment"
@@ -39,12 +39,12 @@ fallocate -l 100M replication_archive.img
 Next, format the volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
 
 ```bash
-./target/release/huskhoard format --tape-dev my_archive.img
-./target/release/huskhoard format --tape-dev replication_archive.img
+./huskhoard format --tape-dev my_archive.img
+./huskhoard format --tape-dev replication_archive.img
 ```
 ```bash
 # OR: Format a physical LTO tape drive
-./target/release/huskhoard format --tape-dev /dev/nst0
+./huskhoard format --tape-dev /dev/nst0
 ```
 
 Open the newly generated `husk_config.toml` in your text editor. Update these lines to enable **Instant Archiving** so you can see it work immediately. *(Note: Using absolute paths is highly recommended so the daemon always knows where your data is).*
@@ -67,7 +67,7 @@ min_free_space_gb = 0
 Start the HuskHoard background engine:
 
 ```bash
-./target/release/huskhoard daemon
+./huskhoard daemon
 ```
 
 #### 6. Test it
@@ -90,29 +90,29 @@ Wait 10 seconds.
 
 **Stream a file directly from Tape (Zero-Disk):**
 ```bash
-./target/release/huskhoard cat --file-path /media/movies/scifi.mp4 | mpv -
+./huskhoard cat --file-path /media/movies/scifi.mp4 | mpv -
 ```
 
 **Export Catalog for Data Engineering (Parquet):**
 ```bash
-./target/release/huskhoard export --format parquet --output my_catalog.parquet
+./huskhoard export --format parquet --output my_catalog.parquet
 # Query it instantly with DuckDB:
 # duckdb -c "SELECT file_path, payload_size FROM 'my_catalog.parquet' WHERE payload_size > 1e9"
 ```
 
 **Check Capacity & "Wasteland" statistics:**
 ```bash
-./target/release/huskhoard info --tape-dev /dev/nst0
+./huskhoard info --tape-dev /dev/nst0
 ```
 
 **Scrub a Volume for Bit-Rot:**
 ```bash
-./target/release/huskhoard scrub --tape-dev my_archive.img
+./huskhoard scrub --tape-dev my_archive.img
 ```
 
 **Repack (Garbage Collect) an old Volume:**
 ```bash
-./target/release/huskhoard repack --source-tape old_drive.img --dest-tape new_drive.img
+./huskhoard repack --source-tape old_drive.img --dest-tape new_drive.img
 ```
 
 ---
