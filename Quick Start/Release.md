@@ -4,15 +4,12 @@
 If you prefer not to build HuskHoard from source, you can use our pre-compiled release binaries. 
 
 **1. Download the Latest Release**
-Fetch the latest binary from the GitHub Releases page. (Assuming a standard Linux `x86_64` environment):
+Fetch the latest binary from the GitHub Releases page. :
 
 ```bash
 # Download the latest release archive (Check the Releases page for the exact filename)
-wget https://github.com/huskhoard/huskhoard/releases/latest/download/huskhoard-linux-amd64.tar.gz
+wget https://github.com/HuskHoard/HuskHoard/releases/download/v0.1.0/huskhoard
 
-# Extract the archive
-tar -xzf huskhoard-linux-amd64.tar.gz
-cd huskhoard-linux-amd64
 ```
 
 **2. Make the Binary Executable**
@@ -28,20 +25,107 @@ sudo setcap cap_sys_admin,cap_sys_ptrace,cap_dac_read_search+ep ./huskhoard
 ```
 *(Note: If your system uses different capabilities, refer to the advanced documentation).*
 
-**4. Move to your PATH (Optional but Recommended)**
-If you want HuskHoard accessible system-wide, move it to `/usr/local/bin`. 
-**Important:** Moving the binary strips its capabilities, so you must re-apply them after moving!
+
+#### 4. Configure Your "Test Environment"
+Set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Volume".
 
 ```bash
-sudo mv ./huskhoard /usr/local/bin/huskhoard
-sudo setcap cap_sys_admin,cap_sys_ptrace,cap_dac_read_search+ep /usr/local/bin/huskhoard
+# Ensure you are still in the 'huskhoard' project directory
+mkdir -p hot_tier
+fallocate -l 100M my_archive.img
+fallocate -l 100M replication_archive.img
 ```
 
-**5. Verify Installation**
-Check that HuskHoard is installed and running properly:
+Next, format the volume. Running this command for the first time will automatically generate a `husk_config.toml` file in your current directory.
+
 ```bash
-huskhoard --help
+./target/release/huskhoard format --tape-dev my_archive.img
+./target/release/huskhoard format --tape-dev replication_archive.img
 ```
+```bash
+# OR: Format a physical LTO tape drive
+./target/release/huskhoard format --tape-dev /dev/nst0
+```
+
+Open the newly generated `husk_config.toml` in your text editor. Update these lines to enable **Instant Archiving** so you can see it work immediately. *(Note: Using absolute paths is highly recommended so the daemon always knows where your data is).*
+
+```toml
+primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
+replication_volumes = ["/home/YOUR_USERNAME/huskhoard/replication_archive.img"]
+hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"  # Ensure this points to your hot tier
+max_age_days = 0 # TEST MODE: Archive files immediately
+janitor_interval_secs = 60
+http_port = 8080 # Port for the Streaming Gateway
+# --- Safety Settings ---
+# Trigger emergency archiving if the Hot Tier exceeds 80% capacity
+hot_tier_max_usage_percent = 80 
+# The Janitor will try to keep at least this much space (in GB) strictly free, set to 0 for test
+min_free_space_gb = 0
+```
+
+#### 5. Launch the Daemon
+Start the HuskHoard background engine:
+
+```bash
+./target/release/huskhoard daemon
+```
+
+#### 6. Test it
+Leave the daemon running and open a **second terminal window**. 
+
+Drop a large file into `hot_tier`.
+
+#### Generate a 12MB dummy file filled with random data
+```bash
+dd if=/dev/urandom of=hot_tier/dummy_data.bin bs=1M count=12
+```
+Wait 10 seconds. 
+* Run `ls -ls hot_tier`. You will see the file's allocated size drop to 4K bytes, which is the sparse file data, while its logical size remains intact. 
+* Run `du -h hot_tier`. It has become a Husk. 
+* Open the file, and watch the Daemon instantly recall it from `my_archive.img`.
+
+---
+
+### 🕹️ Command Center
+
+**Stream a file directly from Tape (Zero-Disk):**
+```bash
+./target/release/huskhoard cat --file-path /media/movies/scifi.mp4 | mpv -
+```
+
+**Export Catalog for Data Engineering (Parquet):**
+```bash
+./target/release/huskhoard export --format parquet --output my_catalog.parquet
+# Query it instantly with DuckDB:
+# duckdb -c "SELECT file_path, payload_size FROM 'my_catalog.parquet' WHERE payload_size > 1e9"
+```
+
+**Check Capacity & "Wasteland" statistics:**
+```bash
+./target/release/huskhoard info --tape-dev /dev/nst0
+```
+
+**Scrub a Volume for Bit-Rot:**
+```bash
+./target/release/huskhoard scrub --tape-dev my_archive.img
+```
+
+**Repack (Garbage Collect) an old Volume:**
+```bash
+./target/release/huskhoard repack --source-tape old_drive.img --dest-tape new_drive.img
+```
+
+---
+
+### 🚀 Roadmap
+*   [Complete] **StreamGate HTTP:** A local web-gateway allowing video players to seek through tapes via HTTP Range requests.
+*   [Complete] **Parquet Export:** Native support for exporting metadata to big-data formats.
+*   [Planned] **Web Dashboard:** Real-time visual "Tank Gauge" monitoring.
+
+### License
+Husk is licensed under the AGPL v3. Infrastructure software should remain free, open, and permanently protected from proprietary exploitation.
+
+For commercial inquiries, contact `info@huskhoard.com`.
 
 You are now ready to configure your storage tiers and start the archiving engine. 
 ```
