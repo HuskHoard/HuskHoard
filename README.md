@@ -5,7 +5,7 @@
 ![Built with Rust](https://img.shields.io/badge/Built_with-Rust-orange.svg)
 ![platform-Linux](https://img.shields.io/badge/platform-Linux%20-red.svg)
 
-**HuskHoard** is an automated, transparent data-tiering engine for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.com/blog-post-lto.html, or cloud buckets, while keeping the files fully visible and accessible to your OS. More info at [www.huskhoard.com](http://www.huskhoard.com)
+**HuskHoard** is an automated, transparent data-tiering engine for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.com/blog-post-lto.html), or cloud buckets, while keeping the files fully visible and accessible to your OS. More info at [www.huskhoard.com](http://www.huskhoard.com)
 
 It acts like an Enterprise Tape Library, but built for the modern hybrid cloud user.
 
