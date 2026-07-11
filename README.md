@@ -71,8 +71,8 @@ HuskHoard needs specific capabilities to intercept file reads via `fanotify` wit
 sudo setcap cap_sys_admin,cap_dac_read_search+ep target/release/huskhoard
 ```
 
-#### 4. Configure Your "Test Environment"
-Set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Tape Volume".
+#### 4. Configure Your "Test Environment"  
+the test environment is a rapid archive version of a production environment. Only to demonstrate the opperation. Look at the production section of the docs or this [post](https://huskhoard.comom/blog-post-config.html) for additional configurations. Set up a safe testing area right inside the project folder. We will create a `hot_tier` directory (on your SSD) and a 100MB file to act as your physical "Tape Volume". 
 
 ```bash
 # Ensure you are still in the 'huskhoard' project directory
