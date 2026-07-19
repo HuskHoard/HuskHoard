@@ -1,6 +1,7 @@
 //database.rs
 use rusqlite::{params, Connection, Result as SqlResult};
 use log::{info, error};
+use crate::hardware::get_vpd_serial;
 
 pub fn rescan_tape_drives(conn: &Connection) {
     info!(" Scanning for physically moved Volumes...");
@@ -38,9 +39,9 @@ pub fn rescan_tape_drives(conn: &Connection) {
             if let Ok(entries) = std::fs::read_dir("/sys/class/scsi_tape") {
                 for entry in entries.flatten() {
                     let dev_name = entry.file_name().to_string_lossy().to_string();
-                    let sys_path = format!("/sys/class/scsi_tape/{}/device/model", dev_name);
-                    if let Ok(current_serial) = std::fs::read_to_string(&sys_path) {
-                        if current_serial.trim() == serial {
+                    let sys_device_path = format!("/sys/class/scsi_tape/{}/device", dev_name);
+                    if let Some(current_serial) = get_vpd_serial(&sys_device_path) {
+                        if current_serial == serial {
                             let new_path = format!("/dev/{}", dev_name);
                             if new_path != old_path {
                                 info!("Tape Drive Moved! UUID {} is now safely tracked at {}", uuid, new_path);
