@@ -334,6 +334,27 @@ impl Drop for AlignedBuffer {
     }
 }
 // ---------------------------------------------------------
+// Helper: Read the real SCSI Unit Serial Number (VPD Page 0x80)
+// ---------------------------------------------------------
+pub fn get_vpd_serial(sys_device_path: &str) -> Option<String> {
+    let vpd_path = format!("{}/vpd_pg80", sys_device_path);
+    let data = std::fs::read(&vpd_path).ok()?;
+
+    // VPD Page 0x80 layout: [0]=periph qualifier/type, [1]=page code (0x80),
+    // [2..4]=page length (big-endian u16), [4..]=ASCII serial number.
+    if data.len() < 4 || data[1] != 0x80 {
+        return None;
+    }
+    let page_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let end = (4 + page_len).min(data.len());
+    if end <= 4 {
+        return None;
+    }
+    let serial = String::from_utf8_lossy(&data[4..end]).trim().to_string();
+    if serial.is_empty() { None } else { Some(serial) }
+}
+
+// ---------------------------------------------------------
 // Helper: Extract Hardware Drive Serial Number
 // ---------------------------------------------------------
 pub fn get_drive_serial(tape_dev: &str) -> String {
@@ -344,8 +365,16 @@ pub fn get_drive_serial(tape_dev: &str) -> String {
     
     // 1. Check for physical SCSI Tape Drives (e.g., /dev/nst0)
     if dev_name.starts_with("nst") || dev_name.starts_with("st") {
-        let sys_path = format!("/sys/class/scsi_tape/{}/device/model", dev_name);
-        return std::fs::read_to_string(&sys_path)
+        let sys_device_path = format!("/sys/class/scsi_tape/{}/device", dev_name);
+
+        // Prefer the real Unit Serial Number (VPD page 0x80) so two drives
+        // sharing the same model/persona are never confused with each other.
+        if let Some(serial) = get_vpd_serial(&sys_device_path) {
+            return serial;
+        }
+
+        error!("!!No VPD Serial Number (page 0x80) exposed for '{}'. Falling back to model string - identical drive models cannot be told apart.", tape_dev);
+        return std::fs::read_to_string(format!("{}/model", sys_device_path))
             .unwrap_or_else(|_| "SCSI_TAPE_DRIVE".to_string())
             .trim().to_string();
     }
