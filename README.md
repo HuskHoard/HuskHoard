@@ -5,13 +5,13 @@
 ![Built with Rust](https://img.shields.io/badge/Built_with-Rust-orange.svg)
 ![platform-Linux](https://img.shields.io/badge/platform-Linux%20-red.svg)
 
-**HuskHoard** is an automated, transparent data-tiering engine for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.comom/blog-post-lto.html), or [cloud buckets](https://huskhoard.com/blog-post-cloud.html), while keeping the files fully visible and accessible to your OS. More info at [www.huskhoard.com](http://www.huskhoard.com)
+**HuskHoard** is an open source data tiering archive for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.comom/blog-post-lto.html), or [cloud buckets](https://huskhoard.com/blog-post-cloud.html), while keeping the files fully visible and accessible to your OS. More info at [www.huskhoard.com](http://www.huskhoard.com)
 
 It acts like an Enterprise Tape Library, but built for the modern hybrid cloud user.
 
 ## Why HuskHoard?
 
-Enterprise storage vendors charge thousands of dollars for automated storage tiering and lock your data inside proprietary black boxes. HuskHoard does it for free, right in user-space, using standard open-source formats.
+Enterprise storage vendors charge thousands of dollars for automated storage tiering and lock your data inside proprietary black boxes. HuskHoard does it for free, right in user-space, using standard open-source formats. Managing your data in an open source data tiering archive.
 
 *   **Bring Your Own Hardware:** HuskHoard doesn't care if your "Tape Library" is a $10,000 SAN, a **Physical LTO Tape Drive**, a dusty USB drive, or an Amazon S3 bucket.
 *   **Zero-Overhead Transparent Stubbing:** HuskHoard does **not** use FUSE. It uses the Linux `fanotify` kernel API to block and resume processes in real-time.
