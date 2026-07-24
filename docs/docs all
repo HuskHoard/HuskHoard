@@ -306,8 +306,8 @@ Because HuskHoard uses indexed 16MB Zstd frames, you can jump to specific parts 
 ./huskhoard cat --file-path movie.mkv --offset 2000000000 | mpv -
 ```
 
-**REPLACE WITH (Paste this):**
-```markdown
+
+
 **Verify data on a specific Replica:**
 If you have multiple tapes and suspect one is failing, you can force StreamGate to read from a specific Volume UUID:
 ```bash
@@ -423,14 +423,6 @@ no_compress_extensions = ["braw", "r3d", "mxf", "mov", "mp4"]
 ```
 ```
 
-### Step 3: Link it in your main Index/Readme (Optional)
-If you have a main `README.md` or `index.md` file that lists the table of contents for your documentation, you can add a link to it so users can find it easily:
-
-Copy and paste this wherever your documentation index is located:
-```markdown
-* [Configuration Recipes](recipes.md) - Pre-built templates for Tape-Only, M&E, and Enterprise 3-2-1 workloads.
-```
-
 ### Section 6: Maintenance & Disaster Recovery (`maintenance.md`)
 
 # Maintenance & Disaster Recovery
@@ -489,10 +481,6 @@ We believe you should never be locked into a storage tool. If you need to get yo
 1. Use `dd` or a hex editor to find the offset of a file (skipping the 4096-byte header).
 2. Pipe the raw data into the standard `zstd` utility:
    `dd if=/dev/sdb bs=4096 skip=[offset+1] | zstd -d > recovered_file`
-# Maintenance
-
-## 1. Physical Tape Maintenance
-When using physical LTO tapes, the **Scrubber** and **Repacker** currently require the volume to be on a standard Disk/Image. Support for native sequential scrubbing of LTO hardware is currently in the roadmap.
 
 
 ---
