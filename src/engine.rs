@@ -1118,6 +1118,31 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     let dest_vol: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
     let dest_uuid_hex = dest_vol.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
+    // --- Capacity Check before repacking ---
+    let query_req = "
+        SELECT COALESCE(SUM(((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 0)
+        FROM catalog c1 
+        WHERE tape_uuid = ?1 
+          AND version = (SELECT MAX(version) FROM catalog c2 WHERE c1.file_path = c2.file_path)
+    ";
+    let required_space = conn.query_row(query_req, params![src_uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
+    
+    // Add a 100MB safety buffer room for headers and alignment skew
+    let required_space_with_room = required_space + (100 * 1024 * 1024);
+    
+    let (dest_used, dest_total, _) = check_tape_gauge(dest_dev, db_path).unwrap_or((0, 0, 0));
+    let dest_free = dest_total.saturating_sub(dest_used);
+    
+    if dest_free < required_space_with_room {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Repack aborted: Destination volume has insufficient space. Requires {} but only {} is free.", 
+                format_bytes(required_space_with_room), 
+                format_bytes(dest_free))
+        ));
+    }
+    // ---------------------------------------------
+    
     // 3. Find latest versions of all files on the source tape
     let query = "
         SELECT id, file_path, tape_offset, compressed_size, ext_blocks 
