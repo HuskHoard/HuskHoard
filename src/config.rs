@@ -35,7 +35,9 @@ pub struct HuskConfig {
     pub immediate_archive_extensions: Vec<String>,
     pub immediate_archive_dirs: Vec<String>,
     #[serde(default = "default_no_compress")]
-    pub no_compress_extensions: Vec<String>, 
+    pub no_compress_extensions: Vec<String>,
+    #[serde(default)]
+    pub no_replicate_dirs: Vec<String>, 
     pub log_level: String,
     pub http_port: Option<u16>,
     pub sidecar_socket_path: Option<String>, 
@@ -126,6 +128,7 @@ temp_extensions = [".swp", ".tmp", ".crdownload", "~", ".part"]
 immediate_archive_extensions = ["mp4", "mov", "iso", "zip", "tar", "gz"]
 immediate_archive_dirs = ["/ArchiveDrop/"]
 no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "tar", "gz", "rar", "7z", "jpg", "png", "iso"]
+no_replicate_dirs = ["/NoReplicate/", "/Temp/"]
 ignore_processes = []
 "#;
 
