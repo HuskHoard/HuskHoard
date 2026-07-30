@@ -297,6 +297,9 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                         // Ghost files (.goutputstream) are blindly queued in O(1) time and self-clean in the Janitor.
                         let is_dir = (mask & libc::FAN_ONDIR as u64) != 0;
                         if !is_dir && !is_path_excluded(&path_str, &config) {
+                            //  Strip the stub status if the file was modified directly
+                            let _ = xattr::remove(&path_str, "trusted.husk.status");
+                            
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             if let Err(e) = conn.execute(
                                 "INSERT OR REPLACE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)",
@@ -418,13 +421,13 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
 
                                 let _ = tx.execute(
                                     "DELETE FROM catalog WHERE file_path = ?1 AND version NOT IN (
-                                        SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
+                                        SELECT DISTINCT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
                                     )", params![path_str, config.max_versions]
                                 );
                                 
                                 let _ = tx.execute(
                                     "DELETE FROM object_frames WHERE file_path = ?1 AND version NOT IN (
-                                        SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
+                                        SELECT DISTINCT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT ?2
                                     )", params![path_str, config.max_versions]
                                 );
                                 
@@ -505,14 +508,14 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                         // FIFO: Keep only the 3 most recent versions of the catalog backup
                         let _ = conn.execute(
                             "DELETE FROM catalog WHERE file_path = ?1 AND version NOT IN (
-                                SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 3
+                                SELECT DISTINCT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 3
                             )", params![special_path]
                         );
                         
                         // Clean up any StreamGate frame metadata associated with the purged versions
                         let _ = conn.execute(
                             "DELETE FROM object_frames WHERE file_path = ?1 AND version NOT IN (
-                                SELECT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 3
+                                SELECT DISTINCT version FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 3
                             )", params![special_path]
                         );
 
@@ -537,7 +540,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let max_age_secs = config.max_age_days * 24 * 3600; 
 
-    // NEW: Check Hot Tier Usage (High-Water Mark)
+    // Check Hot Tier Usage (High-Water Mark)
     let mut emergency_bytes_to_free = 0u64;
     let max_pct = config.hot_tier_max_usage_percent.unwrap_or(80) as f64 / 100.0;
     
@@ -551,7 +554,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
     }
 
-    // NEW: Order by oldest first to ensure emergency spillover drops the stalest files
+    //  Order by oldest first to ensure emergency spillover drops the stalest files
     let mut stmt = conn.prepare("SELECT file_path, last_touch FROM active_tracking ORDER BY last_touch ASC").unwrap();
     let rows: Vec<(String, u64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap().filter_map(Result::ok).collect();
