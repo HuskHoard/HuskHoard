@@ -24,6 +24,48 @@ use crate::database::*;
 // Volume Allocation: Sequential Fill ( Core Default)
 // Fills volumes one by one by sorting by MOST used space first.
 // ---------------------------------------------------------
+
+// --- STREAMGATE: Metadata Hoisting Extractor ---
+fn extract_moov_atom(path: &str) -> Option<Vec<u8>> {
+    let mut f = File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let mut buf = [0u8; 8];
+
+    while f.stream_position().ok().unwrap_or(file_len) < file_len {
+        if f.read_exact(&mut buf).is_err() { break; }
+        
+        let mut size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let atom_type = &buf[4..8];
+
+        if size == 1 { // 64-bit extended size
+            let mut ext_size = [0u8; 8];
+            if f.read_exact(&mut ext_size).is_err() { break; }
+            size = u64::from_be_bytes(ext_size);
+        } else if size == 0 { // Extends to EOF
+            size = file_len - f.stream_position().unwrap_or(0) + 8;
+        }
+
+        if atom_type == b"moov" {
+            // Found the index! Extract it (Cap at 200MB to prevent RAM exhaustion on massive files)
+            let data_size = std::cmp::min(size as usize, 200 * 1024 * 1024);
+            let mut moov_data = vec![0u8; data_size];
+            
+            // Seek back to capture the atom header as well
+            let back_step = if size > (u32::MAX as u64) { -16 } else { -8 };
+            if f.seek(SeekFrom::Current(back_step)).is_ok() {
+                if f.read_exact(&mut moov_data).is_ok() {
+                    return Some(moov_data);
+                }
+            }
+        }
+
+        // Skip to the next top-level atom
+        let skip_bytes = if size > 8 { size - 8 } else { 0 };
+        if f.seek(SeekFrom::Current(skip_bytes as i64)).is_err() { break; }
+    }
+    None
+}
+// -----------------------------------------------
 pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) -> Vec<String> {
     let mut vols_with_space: Vec<(String, u64)> = volumes.iter().filter_map(|dev| {
         // Use existing gauge to safely check Tapes, Block Devs, and Rclone!
@@ -190,12 +232,24 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         }
     }
 
+    // Check if the source path is blacklisted from replication
+    let mut skip_replication = false;
+    for dir in &config.no_replicate_dirs {
+        if source_path.contains(dir) {
+            skip_replication = true;
+            info!("[Archiver] Replication bypassed: '{}' matches no_replicate_dirs rule ('{}')", source_path, dir);
+            break;
+        }
+    }
+
     // Balance Tier 2: Replication Volumes
-    let balanced_replicas = get_balanced_volumes(&config.replication_volumes, &config.db_path, min_free_bytes);
-    let mut replicas_secured = 0;
-    for dev in &balanced_replicas {
-        if replicas_secured >= config.replicas { break; }
-        if try_attach_tape(dev) { replicas_secured += 1; }
+    if !skip_replication {
+        let balanced_replicas = get_balanced_volumes(&config.replication_volumes, &config.db_path, min_free_bytes);
+        let mut replicas_secured = 0;
+        for dev in &balanced_replicas {
+            if replicas_secured >= config.replicas { break; }
+            if try_attach_tape(dev) { replicas_secured += 1; }
+        }
     }
 
     if active_tapes.is_empty() {
@@ -216,7 +270,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
     let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
     
-    // NEW LOGIC: Check config to bypass Zstd compression
+    //  Check config to bypass Zstd compression
     let file_ext = std::path::Path::new(source_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     let use_compression = !config.no_compress_extensions.contains(&file_ext);
     let compression_type_flag: u8 = if use_compression { 1 } else { 0 };
@@ -297,7 +351,21 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
         let mut all_tlvs = Vec::new();
         let filename = Path::new(source_path).file_name().unwrap().to_str().unwrap().as_bytes();
-        
+        // --- STREAMGATE METADATA HOISTING (Type 0x04) ---
+        if file_ext == "mp4" || file_ext == "mov" {
+            info!("[StreamGate] Native Video detected. Scanning for 'moov' index...");
+            if let Some(moov_data) = extract_moov_atom(source_path) {
+                info!("[StreamGate] Hoisting {} bytes of moov metadata to Volume Header!", moov_data.len());
+                // Chunk the moov atom into 60KB TLV blocks to fit within the u16 length limits
+                for chunk in moov_data.chunks(60000) {
+                    all_tlvs.push(0x00); all_tlvs.push(0x04);
+                    all_tlvs.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+                    all_tlvs.extend_from_slice(chunk);
+                }
+            } else {
+                info!("[StreamGate] No 'moov' atom found or file is malformed.");
+            }
+        }
         // Type 0x01: Pack Filename
         all_tlvs.push(0x00); all_tlvs.push(0x01);
         all_tlvs.extend_from_slice(&(filename.len() as u16).to_be_bytes());
@@ -899,7 +967,11 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
         let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
         if t_type == 0 || tlv_offset + 4 + t_len > all_tlvs.len() { break; }
         
-        if t_type == 0x02 { 
+        if t_type == 0x04 {
+            // Type 0x04 is TLV_HOISTED_META. 
+            // In a full restore, we safely ignore the hoisted atom because the physical 
+            // tape stream will naturally restore the original moov atom at the end of the file.
+        } else if t_type == 0x02 { 
             let payload_start = tlv_offset + 4;
             let name_len = all_tlvs[payload_start] as usize;
             if name_len > 0 && payload_start + 1 + name_len + 2 <= payload_start + t_len {
@@ -1047,7 +1119,9 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                 let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
                 if t_type == 0 || tlv_offset + 4 + t_len > all_tlvs.len() { break; }
                 
-                if t_type == 0x03 {
+                if t_type == 0x04 {
+                    // Ignore hoisted metadata during database rebuilds
+                } else if t_type == 0x03 {
                     let frame_count = t_len / 4;
                     let mut p = tlv_offset + 4;
                     let mut u_off: u64 = 0;
@@ -1118,7 +1192,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     let dest_vol: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
     let dest_uuid_hex = dest_vol.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
-    // --- Capacity Check before repacking ---
+    // --- NEW: Capacity Check before repacking ---
     let query_req = "
         SELECT COALESCE(SUM(((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 0)
         FROM catalog c1 
@@ -1127,8 +1201,8 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     ";
     let required_space = conn.query_row(query_req, params![src_uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
     
-    // Add a 100MB safety buffer room for headers and alignment skew
-    let required_space_with_room = required_space + (100 * 1024 * 1024);
+    // Add a 10MB safety buffer room for headers and alignment skew
+    let required_space_with_room = required_space + (10 * 1024 * 1024);
     
     let (dest_used, dest_total, _) = check_tape_gauge(dest_dev, db_path).unwrap_or((0, 0, 0));
     let dest_free = dest_total.saturating_sub(dest_used);
