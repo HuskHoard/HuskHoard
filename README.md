@@ -9,7 +9,7 @@
 > We are big in Japan! You can read the Japanese README here: **[日本語のREADMEはこちら](README-ja.md)**.  
 > *Note: We are actively looking for Japanese maintainers/translators to help improve our docs! If you're interested, please open a PR or say hello in the issues.*
 
-**HuskHoard** is an open source data tiering archive for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.comom/blog-post-lto.html), or [cloud buckets](https://huskhoard.com/blog-post-cloud.html), while keeping the files fully visible and accessible to your OS. More info at [www.huskhoard.com](http://www.huskhoard.com)
+**HuskHoard** is an open source data tiering archive for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.com/blog-post-lto.html), or [cloud buckets](https://huskhoard.com/blog-post-cloud.html), while keeping the files fully visible and accessible to your OS. More info at [www.huskhoard.com](http://www.huskhoard.com)
 
 It acts like an Enterprise Tape Library, but built for the modern hybrid cloud user.
 Check our [LTO Compatibility list](https://huskhoard.com/compatibility.html) and create your LTO Archive today!
