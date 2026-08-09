@@ -6,10 +6,10 @@
 ![Built with Rust](https://img.shields.io/badge/Built_with-Rust-orange.svg)
 ![platform-Linux](https://img.shields.io/badge/platform-Linux%20-red.svg)
 
-**HuskHoard** はLinux向けのオープンソース・データ階層化アーカイブ（Data Tiering Archive）です。コールドデータを安価なハードドライブ（[SMR](https://huskhoard.com/blog-post-smr.html)や[CMR](https://huskhoard.com/blog-post-cmr.html)）、[LTOテープ](https://huskhoard.comom/blog-post-lto.html)、または[クラウドストレージ](https://huskhoard.com/blog-post-cloud.html)にバックグラウンドで自動的にアーカイブすることで、高価なNVMeドライブを「底なしのファイルシステム」に変えます。アーカイブされた後も、ファイルはOS上から完全に可視化され、いつでもアクセス可能な状態を保ちます。詳細は [www.huskhoard.com](http://www.huskhoard.com) をご覧ください。
+**HuskHoard** はLinux向けのオープンソース・データ階層化アーカイブ（Data Tiering Archive）です。コールドデータを安価なハードドライブ（[SMR](https://huskhoard.com/ja/blog-post-smr.html)や[CMR](https://huskhoard.com/ja/blog-post-cmr.html)）、[LTOテープ](https://huskhoard.com/ja/blog-post-lto.html)、または[クラウドストレージ](https://huskhoard.com/ja/blog-post-cloud.html)にバックグラウンドで自動的にアーカイブすることで、高価なNVMeドライブを「底なしのファイルシステム」に変えます。アーカイブされた後も、ファイルはOS上から完全に可視化され、いつでもアクセス可能な状態を保ちます。詳細は [www.huskhoard.com](http://www.huskhoard.com/ja) をご覧ください。
 
 モダンなハイブリッドクラウドユーザーのために構築された、エンタープライズ向けのテープライブラリのように機能します。
-[LTO互換性リスト](https://huskhoard.com/compatibility.html) を確認し、今日からLTOアーカイブを構築しましょう！
+[LTO互換性リスト](https://huskhoard.com/ja/compatibility.html) を確認し、今日からLTOアーカイブを構築しましょう！
 
 ## なぜ HuskHoard なのか？
 
