@@ -1442,33 +1442,70 @@ pub fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io
 // ---------------------------------------------------------
 // 8.6 Maintenance: Prune & Hard Remove
 // ---------------------------------------------------------
-pub fn prune_catalog(db_path: &str) -> std::io::Result<()> {
-    info!("Starting Catalog Reconciliation...");
-    let conn = Connection::open(db_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+pub fn prune_catalog(config: &std::sync::Arc<crate::config::HuskConfig>) -> std::io::Result<()> {
+    info!("Starting Catalog Reconciliation (Soft Delete & Retention)...");
+    let conn = Connection::open(&config.db_path).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     
-    // Get all unique files currently in the catalog
-    let mut stmt = conn.prepare("SELECT DISTINCT file_path FROM catalog").unwrap();
-    let paths: Vec<String> = stmt.query_map([], |row| row.get(0)).unwrap().filter_map(Result::ok).collect();
+    // Fetch the latest version's deleted_at timestamp AND custom_metadata
+    let mut stmt = conn.prepare("
+        SELECT c1.file_path, c1.deleted_at, c1.custom_metadata 
+        FROM catalog c1 
+        INNER JOIN (
+            SELECT file_path, MAX(version) as max_ver 
+            FROM catalog 
+            GROUP BY file_path
+        ) c2 ON c1.file_path = c2.file_path AND c1.version = c2.max_ver
+    ").unwrap();
     
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    }).unwrap().filter_map(Result::ok).collect();
+    
+    let mut marked_count = 0;
     let mut purged_count = 0;
 
-    for path in paths {
-        // If the file does not exist on the SSD AT ALL (not even a stub)
+    for (path, deleted_at, custom_metadata) in rows {
+        // Check for superseding legal or policy rules
+        let mut has_legal_hold = false;
+        if let Some(meta_str) = custom_metadata {
+            if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                if meta_json.get("legal_hold").and_then(|v| v.as_bool()).unwrap_or(false) ||
+                   meta_json.get("compliance_policy").and_then(|v| v.as_str()) == Some("HIPAA") {
+                    has_legal_hold = true;
+                }
+            }
+        }
         if !std::path::Path::new(&path).exists() {
-            info!("  [Prune] File missing from filesystem. Removing from catalog: {}", path);
-            
-            // Delete from Catalog
-            let _ = conn.execute("DELETE FROM catalog WHERE file_path = ?1", params![path]);
-            
-            // Delete from StreamGate index
-            let _ = conn.execute("DELETE FROM object_frames WHERE file_path = ?1", params![path]);
-            
-            purged_count += 1;
+            if deleted_at.is_none() {
+                info!("  [Prune] File missing from filesystem. Marking as soft-deleted in catalog: {}", path);
+                let _ = conn.execute("UPDATE catalog SET deleted_at = CURRENT_TIMESTAMP WHERE file_path = ?1", params![path]);
+                marked_count += 1;
+            } else {
+                let del_str = deleted_at.unwrap();
+                    let query = "SELECT (julianday('now') - julianday(?1))";
+                    let days_deleted: f64 = conn.query_row(query, params![del_str], |row| row.get(0)).unwrap_or(0.0);
+
+                    if days_deleted > config.retention_days as f64 {
+                        if has_legal_hold {
+                            info!("  [Prune] BLOCKED: File past retention but has superseding rules (HIPAA/Legal Hold). Kept in catalog: {}", path);
+                        } else {
+                            info!("  [Prune] File past retention limit ({} days). Purging permanently: {}", config.retention_days, path);
+                            let _ = conn.execute("DELETE FROM catalog WHERE file_path = ?1", params![path]);
+                            let _ = conn.execute("DELETE FROM object_frames WHERE file_path = ?1", params![path]);
+                            purged_count += 1;
+                        }
+                    }
+                }
+        } else if deleted_at.is_some() {
+            info!("  [Prune] File reappeared on filesystem. Removing deletion mark: {}", path);
+            let _ = conn.execute("UPDATE catalog SET deleted_at = NULL WHERE file_path = ?1", params![path]);
         }
     }
     
-    info!("Reconciliation complete. Purged {} orphaned records from the catalog.", purged_count);
-    info!("These files will be physically erased from tape during the next 'repack'.");
+    info!("Reconciliation complete. Marked {} missing files. Purged {} old/orphaned records.", marked_count, purged_count);
+    if purged_count > 0 {
+        info!("These purged files will be physically erased from tape during the next 'repack'.");
+    }
     
     Ok(())
 }
@@ -1481,6 +1518,22 @@ pub fn hard_remove(db_path: &str, file_path: &str) -> std::io::Result<()> {
         .unwrap_or_else(|_| std::path::PathBuf::from(file_path))
         .to_string_lossy()
         .to_string();
+
+    // Check for legal holds before allowing a manual hard deletion
+    let custom_metadata: Option<String> = conn.query_row(
+        "SELECT custom_metadata FROM catalog WHERE file_path = ?1 ORDER BY version DESC LIMIT 1",
+        params![abs_path], |row| row.get(0)
+    ).unwrap_or(None);
+
+    if let Some(meta_str) = custom_metadata {
+        if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            if meta_json.get("legal_hold").and_then(|v| v.as_bool()).unwrap_or(false) ||
+               meta_json.get("compliance_policy").and_then(|v| v.as_str()) == Some("HIPAA") {
+                error!("  [Remove] BLOCKED: Cannot permanently delete file due to superseding rules (HIPAA/Legal Hold): {}", abs_path);
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "File protected by legal hold or compliance policy"));
+            }
+        }
+    }
 
     // 2. Erase from Filesystem if it exists
     if std::path::Path::new(&abs_path).exists() {
@@ -1500,3 +1553,4 @@ pub fn hard_remove(db_path: &str, file_path: &str) -> std::io::Result<()> {
 
     Ok(())
 }
+
