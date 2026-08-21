@@ -160,7 +160,7 @@ fn main() {
             }
         }
         Commands::Prune => {
-            if let Err(e) = prune_catalog(&config_arc.db_path) {
+            if let Err(e) = prune_catalog(&config_arc) {
                 error!("Prune failed: {}", e);
             }
         }
