@@ -17,6 +17,8 @@ pub fn default_no_compress() -> Vec<String> {
     ]
 }
 
+pub fn default_retention_days() -> u64 { 30 }
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct HuskConfig {
     pub min_free_space_gb: Option<u64>,
@@ -37,7 +39,9 @@ pub struct HuskConfig {
     #[serde(default = "default_no_compress")]
     pub no_compress_extensions: Vec<String>,
     #[serde(default)]
-    pub no_replicate_dirs: Vec<String>, 
+    pub no_replicate_dirs: Vec<String>,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
     pub log_level: String,
     pub http_port: Option<u16>,
     pub sidecar_socket_path: Option<String>, 
@@ -130,6 +134,10 @@ immediate_archive_dirs = ["/ArchiveDrop/"]
 no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "tar", "gz", "rar", "7z", "jpg", "png", "iso"]
 no_replicate_dirs = ["/NoReplicate/", "/Temp/"]
 ignore_processes = []
+
+# --- Soft Deletion & Retention ---
+# Days to keep the catalog record and tape data after the file is deleted from the SSD
+retention_days = 30
 "#;
 
 
