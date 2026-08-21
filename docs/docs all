@@ -43,6 +43,7 @@ Unlike standard archivers that require you to decompress a file from the beginni
 *   **The Jump Table:** During the archival process, HuskHoard records the exact byte-offset of every 16MB frame in the SQLite catalog.
 *   **O(1) Seeking:** When you request a partial read (e.g., via `cat --offset`), HuskHoard calculates which frame contains that byte, seeks the hardware (Tape/Disk) or Cloud stream directly to that frame, and begins decoding. This enables instant seeking in massive media files.
 *   **Compression Bypass:** If a file is excluded from compression (e.g., MP4s), StreamGate skips the frame index and performs a true, instant O(1) mathematical seek directly to the raw byte offset.
+*   **Metadata Hoisting:** For native video files (`.mp4`, `.mov`), HuskHoard automatically extracts the `moov` atom (the video index usually located at the *end* of the file) and packs it into the 4KB Volume Header at the *beginning* of the tape. This allows media players to instantly start streaming massive video files without having to seek to the end of the tape first to figure out the framerate/resolution.
 
 ### 3. The Archive Worker (SCSI & Cloud Driver)
 The Worker manages the hardware interface:
@@ -320,14 +321,20 @@ HuskHoard offers two completely different workflows for deleting files depending
 If you delete a file using standard OS tools (e.g., `rm`, deleting via a Windows SMB share, or moving to the Trash), the file is removed from your SSD. **However, it remains safely in the HuskHoard Catalog and on your physical tapes.**
 * **Use Case:** You are done working on a project and want it off your active NVMe drive, but you still want it archived forever on tape.
 
+**Replace it with:**
+```markdown
 ### B. True Delete (Permanent Destruction)
 If you have a file that is garbage (e.g., a bad video take, corrupted render) and you want it completely purged from both the SSD and the underlying Tape database, you must use the Husk CLI:
 ```bash
 ./huskhoard rm --file-path /home/jm/bad_render.mp4
 ```
-* **Use Case:** Reclaiming tape space and permanently destroying sensitive or useless files. *Note: The physical space on the tape is fully reclaimed the next time you run a `repack`.*
+* **Use Case:**  Reclaiming tape space and permanently destroying sensitive or useless files. Note: The physical space on the tape is fully reclaimed the next time you run a repack.*
 ```
+### C. Legal Holds & Compliance Protection (HIPAA)
+HuskHoard supports strict compliance policies that supersede both automated pruning and manual true deletes. If a file's custom_metadata (populated via the Sidecar API during ingest) contains specific retention flags, HuskHoard will physically block permanent deletion.
 
+*Triggering a Hold: Inject JSON containing {"legal_hold": true} or {"compliance_policy": "HIPAA"} into the file's catalog record.
+*The Result: If a user deletes the file from the SSD, the prune garbage collector will soft-delete it but will never permanently purge it from the database or tape. Manual attempts to run huskhoard rm will result in a PermissionDenied error.
 
 
 ### Section 5.1 : # Configuration Recipes
@@ -462,8 +469,11 @@ You can force the Catalog to sync perfectly with your SSD by running the Pruner:
 ```bash
 ./huskhoard prune
 ```
-The Pruner scans the entire database. If a file exists in the database but is completely missing from the SSD (no stub, no file), it permanently deletes the record from the Catalog. 
-*Note: Run a `repack` after a massive `prune` to physically free the space on your tapes.*
+The Pruner scans the entire database. If a file exists in the database but is completely missing from the SSD (no stub, no file), it permanently deletes the record from the Catalog based on your `retention_days` setting. 
+
+**Compliance Override:** If a file is protected by a Legal Hold or HIPAA policy in its `custom_metadata`, the Pruner will mark it as soft-deleted but will **never** permanently purge the record, ensuring strict legal compliance.
+
+*Note: Run a `repack` after a massive `prune` to physically free the space of unprotected files on your tapes.**
 
 ## 3. Disaster Recovery (The Rebuild)
 If your SSD dies and you lose your `husk_catalog.db`, do not panic. Your data is not lost.
@@ -701,7 +711,7 @@ This is the master index of every file version.
 *   `tape_uuid`: Which volume contains this file.
 *   `tape_offset`: The exact byte-offset on the volume where the file starts.
 *   `blake3_hash`: The cryptographic fingerprint of the file.
-*   `custom_metadata`: JSON blob injected by the Sidecar `PRE_ARCHIVE` hook (e.g., Media Hash Lists or external MAM IDs).
+*   `custom_metadata`: JSON blob injected by the Sidecar `PRE_ARCHIVE` hook. In addition to custom MAM tags, this column controls **Data Retention Policies**. Injecting `{"legal_hold": true}` or `{"compliance_policy": "HIPAA"}` here will globally block the file from being permanently purged or destroyed.
 
 ### `tapes`
 The registry of all physical and virtual archive volumes.
