@@ -81,6 +81,7 @@ def generate_toml():
         janitor_interval_secs = 5
         max_age_days = 0   
         max_versions = 3
+        retention_days = 0
         
         exclude_dirs = ["/.git/", "/node_modules/"]
         temp_extensions = [".swp", ".tmp", "~"]
@@ -732,6 +733,10 @@ def main():
     wait_for_stubbing(prune_test_file)
     abs_prune_file = os.path.realpath(prune_test_file)
     os.remove(prune_test_file) # User violently deletes stub without using husk rm
+    
+    logging.info("🕵️ DEBUG: Dumping active config file contents...")
+    run_cmd(["cat", CONFIG_FILE], capture=False)
+    logging.info("🕵️ DEBUG: Executing Prune...")
     
     run_cmd(["sudo", "./target/release/huskhoard", "--config", CONFIG_FILE, "prune"])
     conn = sqlite3.connect(DB_PATH)
