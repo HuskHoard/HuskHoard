@@ -1,7 +1,7 @@
 
 ## Quick Start (Pre-compiled Binary)
 
-If you prefer not to build HuskHoard from source, you can use our pre-compiled release binaries. 
+If you prefer not to build HuskHoard from source, you can use our pre-compiled x86_64 release binaries. 
 
 **1. Download the Latest Release**
 Fetch the latest binary from the GitHub Releases page. :
