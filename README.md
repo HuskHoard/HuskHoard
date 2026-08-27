@@ -29,6 +29,7 @@ Enterprise storage vendors charge thousands of dollars for automated storage tie
 *   **Native SCSI Tape Driver:** Professional-grade support for LTO-5 through LTO-9 drives via `/dev/nstX`. Handles hardware positioning and 256KB block-alignment to prevent "shoe-shining."
 *   **N-Way Replication:** Automatically mirror cold data across local drives, physical tapes, and cloud buckets (via rclone) simultaneously.
 *   **High-Water Mark Spillover:** Automatically safeguard your SSD. If the Hot Tier exceeds a threshold (e.g., 80%), HuskHoard triggers an emergency archive cycle.
+*   **SMR-Optimized Architecture:** By treating hard drives like sequential LTO tape, HuskHoard completely avoids the "SMR performance cliff." Safely use Shingled Magnetic Recording drives without complex block-level hardware management.
 
 ### Architecture Overview
 *   **The Catalog:** A SQLite "Brain" tracking every file, its version history, and its exact byte-offset on physical media.
