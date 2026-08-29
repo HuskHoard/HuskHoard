@@ -540,7 +540,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let max_age_secs = config.max_age_days * 24 * 3600; 
 
-    // Check Hot Tier Usage (High-Water Mark)
+    //  Check Hot Tier Usage (High-Water Mark)
     let mut emergency_bytes_to_free = 0u64;
     let max_pct = config.hot_tier_max_usage_percent.unwrap_or(80) as f64 / 100.0;
     
@@ -590,8 +590,10 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
 
         if should_archive {
-            if let Err(mpsc::TrySendError::Full(_)) = tx.try_send(path_str) {
-                info!("[Janitor] Queue full, will retry later.");
+            // Block and wait whenever the 100-file buffer is full.
+            // As the worker completes files, the scanner automatically feeds the next one.
+            if let Err(_) = tx.send(path_str) {
+                info!("[Janitor] Worker thread disconnected. Stopping scan.");
                 break; 
             }
         }
@@ -601,9 +603,12 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
 // 8.5 The "Stubber" Logic (Hole Punching & Xattr)
 // ---------------------------------------------------------
 fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
-    info!("\nStubbing '{}' (Punching hole to free {} bytes of SSD space)...", file_path, file_size);
-    
-    // 0. Save the original timestamps to prevent IDEs/Git from noticing the change
+    info!(
+        "\nStubbing '{}' (Punching hole to free {} bytes of SSD space)...",
+        file_path, file_size
+    );
+
+    // Save the original timestamps to prevent IDEs/Git from noticing the change
     let meta = std::fs::metadata(file_path)?;
     let atime_sec = meta.atime();
     let atime_nsec = meta.atime_nsec();
@@ -613,35 +618,92 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     let file = OpenOptions::new().write(true).open(file_path)?;
     let fd = file.as_raw_fd();
 
-    // 1. Punch a hole through the entire file using Linux fallocate
-    // Kernel rejects fallocate length of 0 with EINVAL, so skip it for empty files
+    
+
     if file_size > 0 {
         let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+
         let ret = unsafe {
             libc::fallocate(fd, mode, 0, file_size as libc::off_t)
         };
 
         if ret != 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+
+            
+            match err.raw_os_error() {
+                Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOSYS) => {
+                        info!(
+                        "Filesystem does not support hole punching for '{}'; \
+                        falling back to POSIX sparse-file creation.",
+                        file_path
+                        );
+
+                        // First remove the existing allocation.
+                        let trunc_ret = unsafe {
+                        libc::ftruncate(fd, 0)
+                        };
+
+                        if trunc_ret != 0 {
+                return Err(std::io::Error::last_os_error());
+                }
+
+                        
+                let expand_ret = unsafe {
+                        libc::ftruncate(fd, file_size as libc::off_t)
+                        };
+
+                        if expand_ret != 0 {
+                           return Err(std::io::Error::last_os_error());
+                        }
+                }
+
+                
+                        _ => {
+                return Err(err);
+                }
+            }
         }
     }
+
     
-    // Explicitly drop/close the file descriptor before restoring timestamps
     drop(file);
 
-    // 2. Mark it as an archived stub via xattr
+    
     xattr::set(file_path, "trusted.husk.status", b"stubbed")?;
 
-    // 3. Silently restore the old timestamps to fool file watchers
+    
     let c_path = CString::new(file_path).unwrap();
+
     let times = [
-        libc::timespec { tv_sec: atime_sec as libc::time_t, tv_nsec: atime_nsec as libc::c_long },
-        libc::timespec { tv_sec: mtime_sec as libc::time_t, tv_nsec: mtime_nsec as libc::c_long },
+        libc::timespec {
+            tv_sec: atime_sec as libc::time_t,
+            tv_nsec: atime_nsec as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: mtime_sec as libc::time_t,
+            tv_nsec: mtime_nsec as libc::c_long,
+        },
     ];
-    unsafe {
-        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+
+    let ret = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            0,
+        )
+    };
+
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
     }
 
-    info!("File successfully stubbed! 'ls -l' shows full size, but actual disk space used is 0.");
+    info!(
+        "File successfully stubbed! 'ls -l' shows full size, \
+         but actual disk space used is minimal."
+    );
+
     Ok(())
 }
