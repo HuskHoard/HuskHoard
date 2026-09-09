@@ -154,8 +154,9 @@ fn main() {
                 eprintln!("Cat failed: {}", e);
             }
         }
-        Commands::Repack { source_tape, dest_tape } => {
-            if let Err(e) = repack_tape(&config_arc.db_path, source_tape, dest_tape, use_direct_io) {
+        Commands::Repack { source_tape, dest_tape, versions } => {
+            let keep_versions = versions.unwrap_or(config_arc.max_versions);
+            if let Err(e) = repack_tape(&config_arc.db_path, source_tape, dest_tape, use_direct_io, keep_versions) {
                 error!("Repacker failed: {}", e);
             }
         }
