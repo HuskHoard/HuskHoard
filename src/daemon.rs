@@ -22,7 +22,7 @@ use crate::hardware::get_drive_serial;
 // ---------------------------------------------------------
 // Helper: Recursively apply fanotify marks to subdirectories
 // ---------------------------------------------------------
-pub fn mark_directory_recursive(fan_fd: i32, dir: &Path, mask: u64, config: &Arc<HuskConfig>) {
+pub fn mark_directory_recursive(fan_fd: i32, dir: &Path, mask: u64, config: &Arc<HuskConfig>, conn: Option<&Connection>) {
     let path_str = dir.to_str().unwrap_or("");
     if is_path_excluded(path_str, config) {
         return;
@@ -40,7 +40,26 @@ pub fn mark_directory_recursive(fan_fd: i32, dir: &Path, mask: u64, config: &Arc
                 if let Ok(file_type) = entry.file_type() {
                     // Ignore symlinks to prevent infinite recursive loop traps
                     if file_type.is_dir() && !file_type.is_symlink() {
-                        mark_directory_recursive(fan_fd, &entry.path(), mask, config);
+                        mark_directory_recursive(fan_fd, &entry.path(), mask, config, conn);
+                    } else if file_type.is_file() {
+                        // SWEEPER: Catch any "ghost files" created inside new directories before fanotify was attached
+                        if let Some(db) = conn {
+                            let entry_path = entry.path().to_string_lossy().to_string();
+                            if !is_path_excluded(&entry_path, config) {
+                                let is_stubbed = xattr::get(&entry_path, "trusted.husk.status")
+                                    .map(|v| v == Some(b"stubbed".to_vec()))
+                                    .unwrap_or(false);
+                                
+                                if !is_stubbed {
+                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                    // Use INSERT OR IGNORE so we don't reset the countdown timer on files already queued
+                                    let _ = db.execute(
+                                        "INSERT OR IGNORE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)",
+                                        rusqlite::params![entry_path, now],
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -71,7 +90,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
         
         // 1. Recursively mark the root watch directory and all current subdirectories
         info!("[Daemon]  Scanning and attaching listeners to all subdirectories...");
-        mark_directory_recursive(fan_fd, &abs_dir, mark_mask, &config);
+        mark_directory_recursive(fan_fd, &abs_dir, mark_mask, &config, None);
 
         info!("\n=======================================================");
         info!("[Daemon] Listening for File Reads & Modifies...");
@@ -81,10 +100,16 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
         let bg_fan_fd = fan_fd;
         let bg_watch_dir = abs_dir.clone();
         let config_clone = Arc::clone(&config);
+        let db_path_clone = config.db_path.clone();
+        
         thread::spawn(move || {
+            // Open a DB connection specifically for the background sweeper
+            let bg_conn = Connection::open(&db_path_clone).unwrap();
+            let _ = bg_conn.busy_timeout(Duration::from_secs(30));
+            
             loop {
                 thread::sleep(Duration::from_secs(15)); // Rescan every 15s for new folders
-                mark_directory_recursive(bg_fan_fd, &bg_watch_dir, mark_mask, &config_clone);
+                mark_directory_recursive(bg_fan_fd, &bg_watch_dir, mark_mask, &config_clone, Some(&bg_conn));
             }
         });
 
@@ -172,7 +197,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                 info!("\n[Daemon] INTERCEPTED READ ON STUB: {} (Triggered by PID {}: {})", path_str, pid, proc_name);
                                 // 1. Gather Replicas synchronously
                                 let mut stmt = conn.prepare(
-                                    "SELECT t.device_path, c.tape_offset 
+                                    "SELECT t.device_path, c.tape_offset, t.tape_uuid 
                                      FROM catalog c 
                                      JOIN tapes t ON c.tape_uuid = t.tape_uuid 
                                      WHERE c.file_path = ?1 AND c.version = (SELECT MAX(version) FROM catalog WHERE file_path = ?1)"
@@ -180,8 +205,13 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                 let mut rows = stmt.query(params![path_str]).unwrap();
                                 let mut replicas = Vec::new();
                                 while let Some(row) = rows.next().unwrap() {
-                                    replicas.push((row.get::<_, String>(0).unwrap(), row.get::<_, u64>(1).unwrap()));
+                                    replicas.push((
+                                        row.get::<_, String>(0).unwrap(), 
+                                        row.get::<_, u64>(1).unwrap(),
+                                        row.get::<_, String>(2).unwrap()
+                                    ));
                                 }
+                                
 
                                 // 2. Dispatch restoration to thread pool to prevent blocking UI loops
                                 let path_clone = path_str.clone();
@@ -213,7 +243,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                         let dup_fd = unsafe { libc::dup(fd_raw) };
                                         let mut dest_file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
 
-                                        for (db_tape, _db_offset) in &replicas {
+                                        for (db_tape, _db_offset, db_uuid) in &replicas {
                                             info!("[Archive Tier] Fetching full file from replica '{}'...", db_tape);
                                             
                                             // Seek to the beginning of the file for a full restore
@@ -231,7 +261,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                                 0, // start from beginning
                                                 None, // read until EOF
                                                 use_direct_io, 
-                                                None, // tape_uuid
+                                                Some(db_uuid.as_str()), // Force strict UUID matching!
                                                 &mut dest_file
                                             ) {
                                                 Ok(_) => {
