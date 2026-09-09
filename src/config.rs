@@ -12,7 +12,7 @@ pub const ALIGNMENT: usize = 4096;
 pub fn default_no_compress() -> Vec<String> {
     vec![
         "mp4".into(), "mkv".into(), "avi".into(), "mov".into(), "zip".into(),
-         "gz".into(), "rar".into(), "7z".into(), "jpg".into(),
+        "tar".into(), "gz".into(), "rar".into(), "7z".into(), "jpg".into(),
         "png".into(), "iso".into()
     ]
 }
@@ -131,7 +131,7 @@ exclude_dirs = ["/.git/", "/node_modules/", "/__pycache__/"]
 temp_extensions = [".swp", ".tmp", ".crdownload", "~", ".part"]
 immediate_archive_extensions = ["mp4", "mov", "iso", "zip", "tar", "gz"]
 immediate_archive_dirs = ["/ArchiveDrop/"]
-no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "gz", "rar", "7z", "jpg", "png", "iso"]
+no_compress_extensions = ["mp4", "mkv", "avi", "mov", "zip", "tar", "gz", "rar", "7z", "jpg", "png", "iso"]
 no_replicate_dirs = ["/NoReplicate/", "/Temp/"]
 ignore_processes = []
 
@@ -212,6 +212,8 @@ pub enum Commands {
         source_tape: String,
         #[arg(long)]
         dest_tape: String,
+        #[arg(long)]
+        versions: Option<u32>,
     },
     /// Reconcile the catalog by deleting DB entries for files that no longer exist on the filesystem
     Prune,
