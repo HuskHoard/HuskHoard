@@ -562,7 +562,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
     let frames: Vec<(u64, u64, u64)> = stmt.query_map(params![file_path, version], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().filter_map(Result::ok).collect();
 
     let mut target_c_offset = 0;
-    let mut target_c_len = ((db_comp + 4095) / 4096) * 4096; // Default to reading padded EOF
+    let mut target_c_len = db_comp; // Feed only exact compressed bytes to Zstd
     let mut skip_bytes = offset;
 
     info!("[StreamGate] Requested file: {}, version: {}, offset: {}, length: {:?}", file_path, version, offset, length);
@@ -1162,7 +1162,7 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
 // ---------------------------------------------------------
 // 7.5 The Repacker: Tape Garbage Collection 
 // ---------------------------------------------------------
-pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_io: bool) -> std::io::Result<()> {
+pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_io: bool, versions_to_keep: u32) -> std::io::Result<()> {
     let src_is_char = std::fs::metadata(source_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
     let dest_is_char = std::fs::metadata(dest_dev).map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR).unwrap_or(false);
     
@@ -1193,14 +1193,14 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     let dest_vol: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
     let dest_uuid_hex = dest_vol.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
     
-    // --- NEW: Capacity Check before repacking ---
+    // --- Capacity Check before repacking ---
     let query_req = "
         SELECT COALESCE(SUM(((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 0)
         FROM catalog c1 
         WHERE tape_uuid = ?1 
-          AND version = (SELECT MAX(version) FROM catalog c2 WHERE c1.file_path = c2.file_path)
+          AND version IN (SELECT DISTINCT version FROM catalog c2 WHERE c1.file_path = c2.file_path ORDER BY version DESC LIMIT ?2)
     ";
-    let required_space = conn.query_row(query_req, params![src_uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
+    let required_space = conn.query_row(query_req, params![src_uuid_hex, versions_to_keep], |row| row.get::<_, i64>(0)).unwrap_or(0) as u64;
     
     // Add a 10MB safety buffer room for headers and alignment skew
     let required_space_with_room = required_space + (10 * 1024 * 1024);
@@ -1218,17 +1218,17 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     }
     // ---------------------------------------------
     
-    // 3. Find latest versions of all files on the source tape
+    // 3. Find the specified number of recent versions of all files on the source tape
     let query = "
         SELECT id, file_path, tape_offset, compressed_size, ext_blocks 
         FROM catalog c1 
         WHERE tape_uuid = ?1 
-          AND version = (SELECT MAX(version) FROM catalog c2 WHERE c1.file_path = c2.file_path)
+          AND version IN (SELECT DISTINCT version FROM catalog c2 WHERE c1.file_path = c2.file_path ORDER BY version DESC LIMIT ?2)
         ORDER BY tape_offset ASC
     ";
     
     let mut stmt = conn.prepare(query).unwrap();
-    let mut rows = stmt.query(params![src_uuid_hex]).unwrap();
+    let mut rows = stmt.query(params![src_uuid_hex, versions_to_keep]).unwrap();
     
     let mut moved_count = 0;
     let mut dest_offset: u64 = conn.query_row(
