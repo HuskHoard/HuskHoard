@@ -45,9 +45,10 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     if method != "GET" && method != "HEAD" { return; }
     let is_head_request = method == "HEAD";
 
-    // 1. Map URL to Local Path securely
+    // 1. Map URL to Local Path securely (Strip Query Parameters!)
+    let raw_url = parts[1].split('?').next().unwrap_or(parts[1]);
     let mut decoded = Vec::new();
-    let mut bytes = parts[1].bytes();
+    let mut bytes = raw_url.bytes();
     while let Some(b) = bytes.next() {
         if b == b'%' {
             if let (Some(h1), Some(h2)) = (bytes.next(), bytes.next()) {
@@ -237,32 +238,37 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
         }
     }
 
-    // 3. Database Lookup: Fetch Logical Size AND Target Device Path
+    // 3. Database Lookup: Fetch Logical Size AND Target Device Path with Failover!
     let conn = rusqlite::Connection::open(&config.db_path).unwrap();
-    let db_res: Result<(u64, String), _> = conn.query_row(
-        "SELECT c.payload_size, t.device_path 
+    let mut stmt = conn.prepare(
+        "SELECT c.payload_size, t.device_path, t.tape_uuid 
          FROM catalog c 
          JOIN tapes t ON c.tape_uuid = t.tape_uuid 
-         WHERE c.file_path = ?1 ORDER BY c.version DESC LIMIT 1",
-        rusqlite::params![path_str],
-        |row| Ok((row.get(0)?, row.get(1)?))
-    );
+         WHERE c.file_path = ?1 AND c.version = (SELECT MAX(version) FROM catalog WHERE file_path = ?1)"
+    ).unwrap();
+    
+    let mut rows = stmt.query(rusqlite::params![path_str]).unwrap();
+    
+    let mut total_size: u64 = 0;
+    let mut target_tape_uuid = String::new();
+    let mut found_valid = false;
 
-    let (total_size, device_path) = match db_res {
-        Ok(res) => res,
-        Err(_) => {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n");
-            return;
+    while let Some(row) = rows.next().unwrap() {
+        total_size = row.get(0).unwrap();
+        let dev_path: String = row.get(1).unwrap();
+        let tape_uuid: String = row.get(2).unwrap();
+        
+        if dev_path.starts_with("rclone:") || std::path::Path::new(&dev_path).exists() {
+            target_tape_uuid = tape_uuid;
+            found_valid = true;
+            break;
         }
-    };
+    }
 
-    // 3.5 Hardware Safety Check (Requirement 4: Graceful Backend Handling / 503)
-    if !device_path.starts_with("rclone:") {
-        if !std::path::Path::new(&device_path).exists() {
-            error!("[Gateway] Backend volume offline or unreachable: {}", device_path);
-            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-            return;
-        }
+    if !found_valid {
+        error!("[Gateway] Backend volume offline or unreachable for: {}", path_str);
+        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        return;
     }
 
     let end = range_end.unwrap_or(total_size.saturating_sub(1));
@@ -298,7 +304,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
 
     // 6. Zero-Disk Delivery (Requirement 3: Performance & Zero-Copy)
     info!("[Gateway] Streaming {} (Bytes {}-{})", clean_path, range_start, end);
-    if let Err(e) = stream_file(&config, &config.db_path, &path_str, range_start, Some(length), use_direct_io, None, &mut stream) {
+    if let Err(e) = stream_file(&config, &config.db_path, &path_str, range_start, Some(length), use_direct_io, Some(&target_tape_uuid), &mut stream) {
         // VITAL: Ignore "BrokenPipe". It just means the user closed VLC or scrubbed forward on the timeline.
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             error!("[Gateway] Streaming interrupted for {}: {}", clean_path, e);
