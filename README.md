@@ -54,7 +54,7 @@ if you prefer to install the binary use this [Quick Start](https://github.com/Hu
 #### 1. Prerequisites
 ```bash
 sudo apt update
-sudo apt install -y build-essential rclone libcap2-bin attr pkg-config libsqlite3-dev git
+sudo apt install -y curl build-essential rclone libcap2-bin attr pkg-config libsqlite3-dev git
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
