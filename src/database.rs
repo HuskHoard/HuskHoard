@@ -6,7 +6,7 @@ use crate::hardware::get_vpd_serial;
 pub fn rescan_tape_drives(conn: &Connection) {
     info!(" Scanning for physically moved Volumes...");
     let mut stmt = conn.prepare("SELECT tape_uuid, drive_serial, device_path FROM tapes WHERE drive_serial != 'VIRTUAL_IMAGE'").unwrap();
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map((), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
     }).unwrap().filter_map(Result::ok);
 
@@ -93,7 +93,7 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
             ext_blocks INTEGER DEFAULT 0,
             deleted_at DATETIME DEFAULT NULL
         )",
-        [],
+        (),
     )?;
     
     conn.execute(
@@ -110,15 +110,15 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
             backend_type TEXT DEFAULT 'local',
             location_hint TEXT DEFAULT NULL
         )",
-        [],
+        (),
     )?;
     
     // Alpha Patch: Add columns to existing DBs without wiping them
-    let _ = conn.execute("ALTER TABLE catalog ADD COLUMN ext_blocks INTEGER DEFAULT 0", []);
-    let _ = conn.execute("ALTER TABLE catalog ADD COLUMN deleted_at DATETIME DEFAULT NULL", []);
-    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN drive_serial TEXT DEFAULT 'VIRTUAL_IMAGE'", []);
-    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN backend_type TEXT DEFAULT 'local'", []);
-    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN location_hint TEXT DEFAULT NULL", []);
+    let _ = conn.execute("ALTER TABLE catalog ADD COLUMN ext_blocks INTEGER DEFAULT 0", ());
+    let _ = conn.execute("ALTER TABLE catalog ADD COLUMN deleted_at DATETIME DEFAULT NULL", ());
+    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN drive_serial TEXT DEFAULT 'VIRTUAL_IMAGE'", ());
+    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN backend_type TEXT DEFAULT 'local'", ());
+    let _ = conn.execute("ALTER TABLE tapes ADD COLUMN location_hint TEXT DEFAULT NULL", ());
 
     //  Active File Tracking (Event-Driven Sweeper queue)
     conn.execute(
@@ -126,7 +126,7 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
             file_path TEXT PRIMARY KEY,
             last_touch INTEGER NOT NULL
         )",
-        [],
+        (),
     )?;
     
     //  StreamGate Frame Index
@@ -138,16 +138,16 @@ pub fn init_catalog(db_path: &str) -> SqlResult<Connection> {
             compressed_offset INTEGER NOT NULL,
             compressed_size INTEGER NOT NULL
         )",
-        [],
+        (),
     )?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_frames ON object_frames (file_path, version);", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_frames ON object_frames (file_path, version);", ())?;
     
     Ok(conn)
 }
 // ---------------------------------------------------------
 // 10. Data Engineering: Parquet Export
 // ---------------------------------------------------------
-use arrow::array::{Int64Builder, StringBuilder};
+use arrow::array::{Int64Builder, StringBuilder, ArrayRef};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -227,17 +227,17 @@ pub fn export_catalog_parquet(db_path: &str, output_path: &str) -> Result<(), Bo
     let batch = RecordBatch::try_new(
         Arc::new(schema),
         vec![
-            Arc::new(id_b.finish()),
-            Arc::new(path_b.finish()),
-            Arc::new(version_b.finish()),
-            Arc::new(uuid_b.finish()),
-            Arc::new(offset_b.finish()),
-            Arc::new(payload_b.finish()),
-            Arc::new(comp_size_b.finish()),
-            Arc::new(comp_type_b.finish()),
-            Arc::new(archived_b.finish()),
-            Arc::new(hash_b.finish()),
-            Arc::new(meta_b.finish()),
+            Arc::new(id_b.finish()) as ArrayRef,
+            Arc::new(path_b.finish()) as ArrayRef,
+            Arc::new(version_b.finish()) as ArrayRef,
+            Arc::new(uuid_b.finish()) as ArrayRef,
+            Arc::new(offset_b.finish()) as ArrayRef,
+            Arc::new(payload_b.finish()) as ArrayRef,
+            Arc::new(comp_size_b.finish()) as ArrayRef,
+            Arc::new(comp_type_b.finish()) as ArrayRef,
+            Arc::new(archived_b.finish()) as ArrayRef,
+            Arc::new(hash_b.finish()) as ArrayRef,
+            Arc::new(meta_b.finish()) as ArrayRef,
         ],
     )?;
 
