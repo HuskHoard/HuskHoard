@@ -26,47 +26,7 @@ use crate::database::*;
 // Fills volumes one by one by sorting by MOST used space first.
 // ---------------------------------------------------------
 
-// --- STREAMGATE: Metadata Hoisting Extractor ---
-fn extract_moov_atom(path: &str) -> Option<Vec<u8>> {
-    let mut f = File::open(path).ok()?;
-    let file_len = f.metadata().ok()?.len();
-    let mut buf = [0u8; 8];
-
-    while f.stream_position().ok().unwrap_or(file_len) < file_len {
-        if f.read_exact(&mut buf).is_err() { break; }
-        
-        let mut size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
-        let atom_type = &buf[4..8];
-
-        if size == 1 { // 64-bit extended size
-            let mut ext_size = [0u8; 8];
-            if f.read_exact(&mut ext_size).is_err() { break; }
-            size = u64::from_be_bytes(ext_size);
-        } else if size == 0 { // Extends to EOF
-            size = file_len - f.stream_position().unwrap_or(0) + 8;
-        }
-
-        if atom_type == b"moov" {
-            // Found the index! Extract it (Cap at 200MB to prevent RAM exhaustion on massive files)
-            let data_size = std::cmp::min(size as usize, 200 * 1024 * 1024);
-            let mut moov_data = vec![0u8; data_size];
-            
-            // Seek back to capture the atom header as well
-            let back_step = if size > (u32::MAX as u64) { -16 } else { -8 };
-            if f.seek(SeekFrom::Current(back_step)).is_ok() {
-                if f.read_exact(&mut moov_data).is_ok() {
-                    return Some(moov_data);
-                }
-            }
-        }
-
-        // Skip to the next top-level atom
-        let skip_bytes = if size > 8 { size - 8 } else { 0 };
-        if f.seek(SeekFrom::Current(skip_bytes as i64)).is_err() { break; }
-    }
-    None
-}
-// -----------------------------------------------
+//
 pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) -> Vec<String> {
     let mut vols_with_space: Vec<(String, u64)> = volumes.iter().filter_map(|dev| {
         // Use existing gauge to safely check Tapes, Block Devs, and Rclone!
@@ -352,21 +312,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
         let mut all_tlvs = Vec::new();
         let filename = Path::new(source_path).file_name().unwrap().to_str().unwrap().as_bytes();
-        // --- STREAMGATE METADATA HOISTING (Type 0x04) ---
-        if file_ext == "mp4" || file_ext == "mov" {
-            info!("[StreamGate] Native Video detected. Scanning for 'moov' index...");
-            if let Some(moov_data) = extract_moov_atom(source_path) {
-                info!("[StreamGate] Hoisting {} bytes of moov metadata to Volume Header!", moov_data.len());
-                // Chunk the moov atom into 60KB TLV blocks to fit within the u16 length limits
-                for chunk in moov_data.chunks(60000) {
-                    all_tlvs.push(0x00); all_tlvs.push(0x04);
-                    all_tlvs.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
-                    all_tlvs.extend_from_slice(chunk);
-                }
-            } else {
-                info!("[StreamGate] No 'moov' atom found or file is malformed.");
-            }
-        }
+        
         // Type 0x01: Pack Filename
         all_tlvs.push(0x00); all_tlvs.push(0x01);
         all_tlvs.extend_from_slice(&(filename.len() as u16).to_be_bytes());
@@ -534,9 +480,9 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
     };
 
     let (tape_uuid, tape_offset, db_comp, db_type, payload_size, version): (String, u64, u64, u8, u64, u32) = if let Some(uuid) = target_uuid {
-        conn.query_row(query, params![file_path, uuid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+        conn.query_row(query, params![file_path, uuid], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64, row.get(3)?, row.get::<_, i64>(4)? as u64, row.get::<_, i32>(5)? as u32)))
     } else {
-        conn.query_row(query, params![file_path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+        conn.query_row(query, params![file_path], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64, row.get(3)?, row.get::<_, i64>(4)? as u64, row.get::<_, i32>(5)? as u32)))
     }.map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "File/Tape combination not found"))?;
 
     let (tape_dev, location_hint): (String, String) = conn.query_row(
@@ -559,7 +505,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
     let req_end = length.map(|l| std::cmp::min(offset + l, payload_size)).unwrap_or(payload_size);
     
     let mut stmt = conn.prepare("SELECT uncompressed_offset, compressed_offset, compressed_size FROM object_frames WHERE file_path = ?1 AND version = ?2 ORDER BY uncompressed_offset ASC").unwrap();
-    let frames: Vec<(u64, u64, u64)> = stmt.query_map(params![file_path, version], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap().filter_map(Result::ok).collect();
+    let frames: Vec<(u64, u64, u64)> = stmt.query_map(params![file_path, version], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64))).unwrap().filter_map(Result::ok).collect();
 
     let mut target_c_offset = 0;
     let mut target_c_len = db_comp; // Feed only exact compressed bytes to Zstd
@@ -643,7 +589,7 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
     } else if is_char_dev {
         let mut f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
         let fd = f.as_raw_fd();
-        let file_index: i32 = conn.query_row("SELECT COUNT(DISTINCT tape_offset) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2", params![tape_uuid, tape_offset], |row| row.get(0)).unwrap_or(0);
+        let file_index: i32 = conn.query_row("SELECT COUNT(DISTINCT tape_offset) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2", params![tape_uuid, tape_offset as i64], |row| row.get(0)).unwrap_or(0);
         let _ = send_mtio_cmd(fd, MTREW, 1);
         if file_index > 0 { let _ = send_mtio_cmd(fd, MTFSF, file_index); }
         
@@ -768,8 +714,8 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     let conn = Connection::open(db_path).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "DB Open Failed"))?;
     let (db_payload, db_comp, db_type): (u64, u64, u8) = conn.query_row(
         "SELECT payload_size, compressed_size, compression_type FROM catalog WHERE file_path = ?1 AND tape_offset = ?2",
-        params![file_path, tape_offset],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        params![file_path, tape_offset as i64],
+        |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64, row.get(2)?))
     ).map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "Object not found in catalog"))?;
     
     let padded_size = ((db_comp + 4095) / 4096) * 4096;
@@ -781,7 +727,7 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     // Fetch location hint and Wake Hardware
     let tape_uuid: String = conn.query_row(
         "SELECT tape_uuid FROM catalog WHERE file_path = ?1 AND tape_offset = ?2",
-        params![file_path, tape_offset], |row| row.get(0)
+        params![file_path, tape_offset as i64], |row| row.get(0)
     ).unwrap_or_default();
     
     let location_hint: String = conn.query_row(
@@ -825,12 +771,12 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
         
         let tape_uuid: String = conn.query_row(
             "SELECT tape_uuid FROM catalog WHERE file_path = ?1 AND tape_offset = ?2",
-            params![file_path, tape_offset], |row| row.get(0)
+            params![file_path, tape_offset as i64], |row| row.get(0)
         ).unwrap_or_default();
 
         let file_index: i32 = conn.query_row(
             "SELECT COUNT(DISTINCT tape_offset) FROM catalog WHERE tape_uuid = ?1 AND tape_offset < ?2",
-            params![tape_uuid, tape_offset], |row| row.get(0)
+            params![tape_uuid, tape_offset as i64], |row| row.get(0)
         ).unwrap_or(0);
 
         info!("📼 Physical Tape: Rewinding and advancing {} Filemarks...", file_index);
@@ -1011,19 +957,19 @@ pub fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, 
     let row_res = match (&version, &source) {
         (Some(v), Some(s)) => {
             query.push_str(" AND (t.device_path LIKE '%' || ?2 || '%' OR t.tape_uuid LIKE '%' || ?2 || '%') AND c.version = ?3 ORDER BY c.tape_offset ASC LIMIT 1");
-            conn.query_row(&query, params![file_path, s, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+            conn.query_row(&query, params![file_path, s, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i32>(2)? as u32)))
         }
         (Some(v), None) => {
             query.push_str(" AND c.version = ?2 ORDER BY c.tape_offset ASC LIMIT 1");
-            conn.query_row(&query, params![file_path, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+            conn.query_row(&query, params![file_path, v], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i32>(2)? as u32)))
         }
         (None, Some(s)) => {
             query.push_str(" AND (t.device_path LIKE '%' || ?2 || '%' OR t.tape_uuid LIKE '%' || ?2 || '%') ORDER BY c.version DESC, c.tape_offset ASC LIMIT 1");
-            conn.query_row(&query, params![file_path, s], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+            conn.query_row(&query, params![file_path, s], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i32>(2)? as u32)))
         }
         (None, None) => {
             query.push_str(" ORDER BY c.version DESC, c.tape_offset ASC LIMIT 1");
-            conn.query_row(&query, params![file_path], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u32>(2)?)))
+            conn.query_row(&query, params![file_path], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, i32>(2)? as u32)))
         }
     };
 
@@ -1095,7 +1041,7 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash) 
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![&filename, 1, tape_dev, offset, header.payload_size, header.compressed_size, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
+                params![&filename, 1, tape_dev, offset as i64, header.payload_size as i64, header.compressed_size as i64, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
             );
             
             // Recover StreamGate Jump Table from TLV, handling Extension Blocks
@@ -1134,7 +1080,7 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                         
                         let _ = conn.execute(
                             "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![&filename, 1, u_off, c_off, c_size]
+                            params![&filename, 1, u_off as i64, c_off as i64, c_size as i64]
                         );
                         
                         u_off += 16 * 1024 * 1024; // 16MB steps
@@ -1242,9 +1188,9 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
     while let Some(row) = rows.next().unwrap() {
         let id: i64 = row.get(0).unwrap();
         let path: String = row.get(1).unwrap();
-        let src_offset: u64 = row.get(2).unwrap();
-        let compressed_size: u64 = row.get(3).unwrap();
-        let ext_blocks: u64 = row.get::<_, Option<u64>>(4).unwrap().unwrap_or(0);
+        let src_offset: u64 = row.get::<_, i64>(2).unwrap() as u64;
+        let compressed_size: u64 = row.get::<_, i64>(3).unwrap() as u64;
+        let ext_blocks: u64 = row.get::<_, Option<i64>>(4).unwrap().unwrap_or(0) as u64;
         let padded_size: u64 = ((compressed_size + 4095) / 4096) * 4096;
         
         // Read Source Header
@@ -1281,7 +1227,7 @@ pub fn repack_tape(db_path: &str, source_dev: &str, dest_dev: &str, use_direct_i
         // Update Catalog pointing to the new tape
         conn.execute(
             "UPDATE catalog SET tape_uuid = ?1, tape_offset = ?2 WHERE id = ?3",
-            params![dest_uuid_hex, dest_offset, id]
+            params![dest_uuid_hex, dest_offset as i64, id]
         ).unwrap();
         
         moved_count += 1;
@@ -1338,7 +1284,7 @@ pub fn scrub_tape(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io
 
     while let Some(row) = rows.next().unwrap() {
         let file_path: String = row.get(0).unwrap();
-        let offset: u64 = row.get(1).unwrap();
+        let offset: u64 = row.get::<_, i64>(1).unwrap() as u64;
         let expected_hash_hex: String = row.get(2).unwrap();
         
         total_checked += 1;
@@ -1461,7 +1407,7 @@ pub fn prune_catalog(config: &std::sync::Arc<crate::config::HuskConfig>) -> std:
         GROUP BY c1.file_path
     ").unwrap();
     
-    let rows: Vec<(String, Option<String>, Option<String>)> = stmt.query_map([], |row| {
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt.query_map((), |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     }).unwrap().filter_map(Result::ok).collect();
     
