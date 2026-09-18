@@ -127,7 +127,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
         }
         // 4. Any DB-registered tapes not covered by config (e.g. old/moved volumes)
         if let Ok(mut stmt) = conn.prepare("SELECT device_path FROM tapes") {
-            let db_paths: Vec<String> = stmt.query_map([], |row| row.get(0))
+            let db_paths: Vec<String> = stmt.query_map((), |row| row.get(0))
                 .unwrap().filter_map(Result::ok).collect();
             for path in db_paths {
                 if seen_paths.insert(path.clone()) {
@@ -139,7 +139,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
         // Fetch Live Catalog
         let mut catalog = Vec::new();
         if let Ok(mut stmt) = conn.prepare("SELECT id, file_path, payload_size, version, original_mtime, tape_uuid FROM catalog ORDER BY id DESC LIMIT 50") {
-            let _ = stmt.query_map([], |row| {
+            let _ = stmt.query_map((), |row| {
                 let path_str: String = row.get(1)?;
                 let status = if xattr::get(&path_str, "trusted.husk.status").map(|v| v == Some(b"stubbed".to_vec())).unwrap_or(false) {
                     "STUBBED"
@@ -160,8 +160,8 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
             }).map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>());
         }
 
-        let files_today: i64 = conn.query_row("SELECT COUNT(*) FROM catalog WHERE archived_at >= date('now')", [], |row| row.get(0)).unwrap_or(0);
-        let total_replicas: i64 = conn.query_row("SELECT COUNT(*) FROM catalog", [], |row| row.get(0)).unwrap_or(0);
+        let files_today: i64 = conn.query_row("SELECT COUNT(*) FROM catalog WHERE archived_at >= date('now')", (), |row| row.get(0)).unwrap_or(0);
+        let total_replicas: i64 = conn.query_row("SELECT COUNT(*) FROM catalog", (), |row| row.get(0)).unwrap_or(0);
 
         let payload = json!({
             "volumes": vols,
@@ -254,7 +254,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     let mut found_valid = false;
 
     while let Some(row) = rows.next().unwrap() {
-        total_size = row.get(0).unwrap();
+        total_size = row.get::<_, i64>(0).unwrap() as u64;
         let dev_path: String = row.get(1).unwrap();
         let tape_uuid: String = row.get(2).unwrap();
         
