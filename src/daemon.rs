@@ -55,7 +55,7 @@ pub fn mark_directory_recursive(fan_fd: i32, dir: &Path, mask: u64, config: &Arc
                                     // Use INSERT OR IGNORE so we don't reset the countdown timer on files already queued
                                     let _ = db.execute(
                                         "INSERT OR IGNORE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)",
-                                        rusqlite::params![entry_path, now],
+                                        rusqlite::params![entry_path, now as i64],
                                     );
                                 }
                             }
@@ -207,7 +207,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                 while let Some(row) = rows.next().unwrap() {
                                     replicas.push((
                                         row.get::<_, String>(0).unwrap(), 
-                                        row.get::<_, u64>(1).unwrap(),
+                                        row.get::<_, i64>(1).unwrap() as u64,
                                         row.get::<_, String>(2).unwrap()
                                     ));
                                 }
@@ -292,7 +292,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
                                                 let _ = local_conn.execute(
                                                     "INSERT OR REPLACE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)",
-                                                    rusqlite::params![path_clone, now],
+                                                    rusqlite::params![path_clone, now as i64],
                                                 );
                                             }
 
@@ -357,7 +357,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                             if let Err(e) = conn.execute(
                                 "INSERT OR REPLACE INTO active_tracking (file_path, last_touch) VALUES (?1, ?2)",
-                                params![path_str, now],
+                                params![path_str, now as i64],
                             ) {
                                 error!("[Daemon]  Failed to track modified file {}: {}", path_str, e);
                             } else {
@@ -415,7 +415,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                     
                     // Safety: Capture touch time before archiving
                     let mut pre_archive_touch: u64 = 0;
-                    if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| row.get(0)) {
+                    if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| Ok(row.get::<_, i64>(0)? as u64)) {
                         pre_archive_touch = touch;
                     }
 
@@ -477,14 +477,14 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                         if tx.execute(
                                             "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata, ext_blocks) 
                                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                                            params![&path_str, next_version, tape_uuid, offset, size, comp_size, comp_type, meta.uid(), meta.gid(), meta.mode(), meta.mtime(), hash, custom_meta, *ext_blocks as u32],
+                                            params![&path_str, next_version, tape_uuid, *offset as i64, *size as i64, *comp_size as i64, comp_type, meta.uid(), meta.gid(), meta.mode(), meta.mtime(), hash, custom_meta, *ext_blocks as u32],
                                         ).is_err() { all_inserts_ok = false; }
                                     }
 
                                     for (u_off, c_off, c_size) in jump_table {
                                         if tx.execute(
                                             "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                            params![&path_str, next_version, u_off, c_off, c_size]
+                                            params![&path_str, next_version, u_off as i64, c_off as i64, c_size as i64]
                                         ).is_err() { all_inserts_ok = false; }
                                     }
 
@@ -512,7 +512,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
 
                                 // Safety: Ensure file wasn't modified during the long archive process
                                 let mut post_archive_touch: u64 = 0;
-                                if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| row.get(0)) {
+                                if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| Ok(row.get::<_, i64>(0)? as u64)) {
                                     post_archive_touch = touch;
                                 }
 
@@ -567,7 +567,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                     let backup_path = format!("{}_backup.db", config.db_path);
                     let _ = std::fs::remove_file(&backup_path);
                     
-                    if conn.execute(&format!("VACUUM INTO '{}'", backup_path), []).is_ok() {
+                    if conn.execute(&format!("VACUUM INTO '{}'", backup_path), ()).is_ok() {
                         //  Pass `None` as the 5th argument to archive_file
                         if let Ok((results, _)) = archive_file(&conn, &backup_path, &config, use_direct_io) {
                             let special_path = "__HUSK_CATALOG_BACKUP__";
@@ -580,7 +580,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                 let _ = conn.execute(
                                     "INSERT INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash, custom_metadata, ext_blocks) 
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                                    params![special_path, next_ver, tape_uuid, offset, size, comp_size, comp_type, 0, 0, 0644, 0, hash, "{}", ext_blocks as u32],
+                                    params![special_path, next_ver, tape_uuid, offset as i64, size as i64, comp_size as i64, comp_type, 0_u32, 0_u32, 0_u32, 0_i64, hash, "{}", ext_blocks as u32],
                                 );
                             }
 
@@ -635,7 +635,7 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
 
     //  Order by oldest first to ensure emergency spillover drops the stalest files
     let mut stmt = conn.prepare("SELECT file_path, last_touch FROM active_tracking ORDER BY last_touch ASC").unwrap();
-    let rows: Vec<(String, u64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    let rows: Vec<(String, u64)> = stmt.query_map((), |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))
         .unwrap().filter_map(Result::ok).collect();
 
     for (path_str, last_touch) in rows {
