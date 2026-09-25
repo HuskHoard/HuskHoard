@@ -73,30 +73,43 @@ impl SidecarBridge {
 
     pub fn wake_volume(&self, tape_uuid: &str, device_path: &str, location_hint: &str) -> std::io::Result<()> {
         let Some(ref path) = self.socket_path else { return Ok(()); };
-        let mut stream = UnixStream::connect(path)?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(60))); 
         
+        let mut stream = match UnixStream::connect(path) {
+            Ok(s) => s,
+            Err(_) => {
+                log::warn!("[Sidecar] IPC bridge offline. Bypassing hardware wake for {}", device_path);
+                return Ok(());
+            }
+        };
+        
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(60))); 
         let msg = json!({
-            "action": "WAKE_VOLUME",
-            "tape_uuid": tape_uuid,
-            "device_path": device_path,
-            "location_hint": location_hint
+            "action": "WAKE_VOLUME", "tape_uuid": tape_uuid, 
+            "device_path": device_path, "location_hint": location_hint
         });
         
-        stream.write_all(msg.to_string().as_bytes())?;
-        stream.write_all(b"\n")?;
+        // Ignore any write errors (Broken Pipe)
+        let _ = stream.write_all(msg.to_string().as_bytes());
+        let _ = stream.write_all(b"\n");
         
         let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf)?;
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if response.trim() == "READY" {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Sidecar hardware timeout or failure"))
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => {
+                // Trap EOF (0) or read errors (Connection Reset / Broken Pipe)
+                log::warn!("[Sidecar] IPC connection dropped. Bypassing hardware wake for {}", device_path);
+                Ok(())
+            }
+            Ok(n) => {
+                let response = String::from_utf8_lossy(&buf[..n]);
+                if response.trim() == "READY" {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Sidecar hardware timeout"))
+                }
+            }
         }
     }
 }
-
 pub const DEFAULT_TOML: &str = r#"# ==========================================
 # Husk - Hybrid User-Space Storage Kernel
 # ==========================================
