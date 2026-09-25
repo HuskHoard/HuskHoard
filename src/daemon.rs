@@ -302,7 +302,8 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                             if replicas.is_empty() {
                                                 error!("[Daemon] CRITICAL: Path '{}' not found in database. Check if paths are absolute!", path_clone);
                                             } else {
-                                                error!("[Daemon] CRITICAL: All replicas for '{}' are physically offline!", path_clone);
+                                                let missing_uuids: Vec<String> = replicas.iter().map(|(_, _, uuid)| uuid.clone()).collect();
+                                                error!("[Daemon] CRITICAL: All replicas for '{}' are physically offline! Please insert volume(s) with UUID: {}", path_clone, missing_uuids.join(", "));
                                             }
 
                                             if let Ok(meta) = std::fs::metadata(&path_clone) {
@@ -413,7 +414,7 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                 if !is_stubbed {
                     info!("[Worker] Processing Cold File: {}", path_str);
                     
-                    // Safety: Capture touch time before archiving
+                    // Safety: Capture touch time before archiving (This will capture the +1 year lock)
                     let mut pre_archive_touch: u64 = 0;
                     if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| Ok(row.get::<_, i64>(0)? as u64)) {
                         pre_archive_touch = touch;
@@ -510,7 +511,8 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                     continue;
                                 }
 
-                                // Safety: Ensure file wasn't modified during the long archive process
+                                // Safety: Compare post-archive timestamp against our pre-archive lock.
+                                // If the user modified the file, fanotify will have overwritten the +1 year lock with the current time.
                                 let mut post_archive_touch: u64 = 0;
                                 if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| Ok(row.get::<_, i64>(0)? as u64)) {
                                     post_archive_touch = touch;
@@ -671,8 +673,17 @@ pub fn run_janitor_scanner(tx: mpsc::SyncSender<String>, config: Arc<HuskConfig>
         }
 
         if should_archive {
+            let path_clone = path_str.clone();
+            
+            // LOCK: Set last_touch 1 year into the future to block the 15-second Sweeper.
+            
+            let future_lock = now + 31_536_000;
+            let _ = conn.execute(
+                "UPDATE active_tracking SET last_touch = ?1 WHERE file_path = ?2",
+                rusqlite::params![future_lock as i64, path_clone]
+            );
+
             // Block and wait whenever the 100-file buffer is full.
-            // As the worker completes files, the scanner automatically feeds the next one.
             if let Err(_) = tx.send(path_str) {
                 info!("[Janitor] Worker thread disconnected. Stopping scan.");
                 break; 
