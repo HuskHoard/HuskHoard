@@ -1,3 +1,9 @@
+# this script is supporting material for a proxy workflow demo https://youtu.be/izFoB7Sfhnw Include a file "husk_sidecar.sock" in your huskhoard
+# folder along with this sidecar.py script. place this line in the husk_config.toml: 
+# sidecar_socket_path = "husk_sidecar.sock" 
+# You must start this process before you run the daemon or you will get an error. 
+
+
 import socket, json, os, subprocess
 
 SOCKET_PATH = "husk_sidecar.sock"
