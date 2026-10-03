@@ -68,21 +68,13 @@ if ! command -v rclone &> /dev/null; then
     curl https://rclone.org/install.sh | sudo bash
 fi
 
-# 5. Install Rust
-echo "Checking for Rust..."
-if ! command -v cargo &> /dev/null; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source "$HOME/.cargo/env"
-else
-    echo " Rust is already installed."
-fi
-source "$HOME/.cargo/env" || true
-
-# 6. Clone and Build
-echo " Cloning HuskHoard..."
-[ -d "huskhoard" ] || git clone https://github.com/huskhoard/huskhoard.git
+# 5 & 6. Download Precompiled Husk Binary (Instant - No Rust Required!)
+echo " Fetching latest HuskHoard binary from GitHub..."
+mkdir -p huskhoard/target/release
 cd huskhoard
-cargo build --release
+
+curl -sL -o target/release/huskhoard https://github.com/HuskHoard/HuskHoard/releases/latest/download/huskhoard
+chmod +x target/release/huskhoard
 
 # 7. Grant Kernel Capabilities
 # On SLES, /usr/sbin might not be in the user's PATH even with sudo.
