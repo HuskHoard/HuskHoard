@@ -58,7 +58,7 @@ Choose between the **Automated Quick Start** (recommended, installs in seconds) 
 Run this single command as your standard user:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HuskHoard/HuskHoard/main/install_huskhoared.sh | bash
+curl -fsSL https://raw.githubusercontent.com/HuskHoard/HuskHoard/main/install_huskhoard.sh | bash
 ```
 
 Once the script finishes, jump straight into your new environment:
