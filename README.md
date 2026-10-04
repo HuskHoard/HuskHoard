@@ -66,7 +66,7 @@ Once the script finishes, jump straight into your new environment:
 cd huskhoard
 ./target/release/huskhoard daemon
 ```
-After you are up scroll down to the testing section and watch things at work.
+After you are running, scroll down to the testing section and drop in some files and watch things at work.
 
 ---
 
