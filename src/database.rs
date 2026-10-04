@@ -55,6 +55,30 @@ pub fn rescan_tape_drives(conn: &Connection) {
             }
         }
 
+        // 3. Scan Optical Drives (/dev/sr*) for burned scratch images
+        if !found {
+            for i in 0..10 {
+                let sr_path = format!("/dev/sr{}", i);
+                if std::path::Path::new(&sr_path).exists() {
+                    if let Ok(mut f) = std::fs::File::open(&sr_path) {
+                        let mut buf = [0u8; 4096];
+                        if std::io::Read::read_exact(&mut f, &mut buf).is_ok() {
+                            let header: crate::format::VolumeHeader = *bytemuck::from_bytes(&buf);
+                            if &header.magic_bytes == b"USTDVOL\0" {
+                                let read_uuid = header.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                                if read_uuid == uuid {
+                                    info!("Optical Volume Found! UUID {} is now safely tracked at {}", uuid, sr_path);
+                                    conn.execute("UPDATE tapes SET device_path = ?1, backend_type = 'optical' WHERE tape_uuid = ?2", params![sr_path, uuid]).unwrap();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if !found {
             error!("!!Drive {} (Serial/Model: {}) is OFFLINE. Restores from it will fail.", old_path, serial);
         }
