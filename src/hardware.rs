@@ -150,6 +150,12 @@ pub fn check_tape_gauge(tape_dev: &str, db_path: &str) -> std::io::Result<(u64, 
         active_data = used_capacity; 
     }
 
+    if tape_dev.starts_with("/dev/sr") || tape_dev.starts_with("/dev/cdrom") {
+        // Optical discs are strictly read-only media.
+        // Mock them as exactly 100% full so the allocation engine skips them for writes.
+        used_capacity = total_capacity;
+    }
+
     used_capacity = std::cmp::min(used_capacity, total_capacity);
     Ok((used_capacity, total_capacity, active_data))
 }
@@ -224,7 +230,8 @@ pub fn open_tape_device(tape_dev: &str, read: bool, write: bool, create: bool, u
 
     // O_DIRECT on Linux `st` character devices requires exact block size matching.
     // We disable it here to let the kernel handle SCSI frame buffering safely.
-    let effective_direct = if is_char_dev { false } else { use_direct_io };
+    let is_optical = tape_dev.starts_with("/dev/sr") || tape_dev.starts_with("/dev/cdrom");
+    let effective_direct = if is_char_dev || is_optical { false } else { use_direct_io };
 
     let file = if effective_direct {
         opts.custom_flags(libc::O_DIRECT);
