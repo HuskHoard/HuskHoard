@@ -170,6 +170,11 @@ fn main() {
                 error!("Remove failed: {}", e);
             }
         }
+        Commands::Rescan => {
+            let conn = init_catalog(&config_arc.db_path).expect("Failed to open DB");
+            rescan_tape_drives(&conn);
+            info!("Hardware rescan complete.");
+        }
         Commands::Export { format, output } => {
             if format.to_lowercase() == "parquet" {
                 info!("Exporting catalog to Parquet: {}", output);
