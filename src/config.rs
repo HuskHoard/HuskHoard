@@ -234,7 +234,9 @@ pub enum Commands {
     Rm {
         #[arg(long)]
         file_path: String,
-    }
+    },
+    /// Rescan hardware to locate moved volumes or inserted Optical Discs
+    Rescan
 }
 pub fn is_path_excluded(path: &str, config: &Arc<HuskConfig>) -> bool {
     if path.contains(".ustd_catalog.db") || path.contains(".img") {
