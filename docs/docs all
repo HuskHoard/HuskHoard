@@ -1,5 +1,3 @@
-
-
 ### Section 1: Introduction & Philosophy (`index.md`)
 
 # Introduction
@@ -23,8 +21,6 @@ HuskHoard automates this process using **Transparent Stubbing** and **StreamGate
 
 
 ---
-
-
 ### Section 2: Architecture (`architecture.md`)
 
 # Architecture
@@ -45,10 +41,11 @@ Unlike standard archivers that require you to decompress a file from the beginni
 *   **Compression Bypass:** If a file is excluded from compression (e.g., MP4s), StreamGate skips the frame index and performs a true, instant O(1) mathematical seek directly to the raw byte offset.
 *   **Metadata Hoisting:** For native video files (`.mp4`, `.mov`), HuskHoard automatically extracts the `moov` atom (the video index usually located at the *end* of the file) and packs it into the 4KB Volume Header at the *beginning* of the tape. This allows media players to instantly start streaming massive video files without having to seek to the end of the tape first to figure out the framerate/resolution.
 
-### 3. The Archive Worker (SCSI & Cloud Driver)
+### 3. The Archive Worker (SCSI, Optical & Cloud Driver)
 The Worker manages the hardware interface:
 *   **LTO Tape Driver:** Sends SCSI commands (`Rewind`, `Space to End`, `Filemark`) to physical tape drives.
 *   **SCSI Block Driver:** Optimized 256KB-aligned writes for hardware compatibility.
+*   **Optical Driver (`/dev/sr*`):** Auto-identifies inserted optical discs (BD-R, DVD, M-DISC), automatically disabling `O_DIRECT` and masking them as read-only 100% full pools.
 *   **Cloud Driver:** Multiplexed streaming to `rclone` remotes.
 
 ### 4. The Enterprise Sidecar (IPC Bridge)
@@ -114,8 +111,10 @@ Edit `husk_config.toml` to define your tiers and policies:
 *   `failover_volumes`: (Optional) Drives to use automatically if the primary is full or disconnected.
 *   `replication_volumes`: (Optional) Your `rclone` cloud remotes (e.g., `["rclone:s3:my-bucket"]`).
 *   `janitor_schedule_time`: Set a specific time for archival (e.g., `"02:00"` for 2 AM), or `"none"` to use an interval.
-*   `ignore_processes`: A list of process names (e.g., `["rsync", "clamscan", "mlocate"]`) allowed to touch a stubbed file without triggering rehydration. Required — use `[]` if you don't need it.
+*   `ignore_processes`: A list of process names (e.g., `["rsync", "clamscan", "mlocate"]`) allowed to touch a stubbed file without triggering rehydration. Optional — defaults to `[]` if you omit it from your config entirely.
 *   `sidecar_socket_path`: (Optional) Path to a Unix socket for the Enterprise Sidecar IPC Bridge — needed for M&E pre-archive hooks, multi-node sync, or `husk-grid://` targets. See Architecture, Section 4.
+*   `retention_days`: Grace period (in days, default `30`) to keep catalog metadata after a file is removed from the SSD before `prune` permanently deletes it.
+*   `no_replicate_dirs`: A list of hot tier subdirectories (e.g., `["/NoReplicate/", "/Temp/"]`) exempt from cloud/secondary replication.
 
 ## 4. Formatting your First Volume
 Before HuskHoard can write to a disk or image, it must be formatted with the **USTD Volume Header**:
@@ -133,11 +132,7 @@ fallocate -l 1G my_archive.img
 Start the engine:
 ```bash
 ./target/release/huskhoard daemon
-```
-
-
-
-### Section 4: Volume Management (`volumes.md`)
+```### Section 4: Volume Management (`volumes.md`)
 
 # Volume Management
 
@@ -153,18 +148,25 @@ HuskHoard is **SMR-Native**. By writing data in one continuous log, it avoids th
 ### Sticky Drive Allocation (Sequential Fill)
 When presented with multiple Primary or Replication volumes, HuskHoard does not stripe or round-robin data across them. It uses a **"Sticky" Sequential Fill** algorithm. It sorts available volumes by *most used space* first. This ensures that Volume 1 is filled completely before Volume 2 is touched, preventing your archive from becoming fragmented across multiple physical disks and ensuring cold drives can remain spun down.
 
-## 3. Hardware Identity (Serials & Models)
-HuskHoard tracks your "tapes" regardless of how they are connected:
-*   **HDDs:** Tracked by factory serial number via `/sys/block`.
-*   **LTO Tapes:** Tracked by SCSI Model/Inquiry data via `/sys/class/scsi_tape`.
-*   **Cloud:** Tracked by a unique Hash-UUID generated from the `rclone` remote path.
+## 3. Hardware Identity & Auto-Tracking
+HuskHoard does not rely on fragile Linux device paths like `/dev/sdb1` that can change across reboots:
+*   **Volume UUIDs:** Every formatted volume has a unique ID stored in its 4KB header (`USTDVOL`).
+*   **Hard Drives (HDDs/SSDs):** Tracked by factory serial numbers pulled from `/sys/block/*/device/serial`.
+*   **LTO Tape Drives:** Tracked via SCSI VPD Unit Serial Number (Page 0x80) from `/sys/class/scsi_tape/*/device`, falling back to SCSI model strings.
+*   **Optical Discs:** Discs inserted into `/dev/sr0` through `/dev/sr9` are identified by inspecting LBA 0 for the volume UUID in their 4KB header.
+*   **Cloud Remotes:** Tracked by a deterministic Hash-UUID generated from the `rclone` destination string.
+*   **Auto-Rescan:** If an external drive moves to another port, HuskHoard rescans `/sys/block` on startup and reconciles the catalog with the new device node.
 
-
-## 4. Hardware Identity (UUIDs & Serials)
-HuskHoard does not rely on fragile Linux device paths like `/dev/sdb1`. 
-*   **Volume UUIDs:** Every formatted volume has a unique ID stored in its 4KB header.
-*   **Hardware Serials:** For physical drives, HuskHoard records the factory serial number.
-*   **Auto-Rescan:** If you move a USB drive to a different port, HuskHoard will scan `/sys/block` at startup, find the serial number, and automatically update the Catalog with the new path.
+## 4. Optical Media Support (BD-R, DVD, M-DISC)
+HuskHoard supports optical media as immutable, offline-capable cold storage:
+*   **Burn & Ingest:** You can format an image file (`.img`), archive data into it using HuskHoard, and burn that raw image directly to optical media (BD-R, BD-RE, DVD-R, M-DISC).
+*   **Read-Only Safety:** When an optical device path (`/dev/sr*` or `/dev/cdrom`) is recognized, HuskHoard automatically marks its capacity as 100% full. This ensures the Janitor will never attempt write or append operations against physical discs.
+*   **Automatic I/O Compatibility:** Linux optical drivers reject `O_DIRECT`. HuskHoard detects optical devices and automatically falls back to buffered I/O, preventing `EINVAL` kernel panics.
+*   **Live Rescanning:** When a new disc is inserted while the daemon or system is running, execute:
+    ```bash
+    ./huskhoard rescan
+    ```
+    This sweeps `/dev/sr0` through `/dev/sr9`, extracts the disc's volume UUID, sets `backend_type = 'optical'`, and updates the catalog so transparent reads and StreamGate can immediately read from the optical tray.
 
 ## 5. The Cold Library: Shelf Management
 HuskHoard was designed with the understanding that you may have more data than you have SATA ports. It treats your archive drives like a **Tape Library**, where volumes can be "Ejected" and stored on a shelf.
@@ -177,22 +179,20 @@ When you format a volume, HuskHoard captures two critical pieces of metadata:
 This information is stored permanently in your `husk_catalog.db`. If you unplug a drive, the Catalog does not forget it; it simply marks it as **OFFLINE**.
 
 ### Handling Offline Recalls
-If a user or application attempts to read a "Husk" file that resides on a drive currently sitting on your shelf, the following happens:
+If a user or application attempts to read a "Husk" file that resides on a drive currently sitting on your shelf, here's what actually happens today:
 
-1.  **The Interceptor Pauses:** The application requesting the file is placed in a "wait" state by the Kernel.
-2.  **The Daemon Alerts:** The HuskHoard daemon detects that the required Volume UUID is not currently mounted.
-3.  **The CLI Prompt:** The daemon logs a high-priority alert to the terminal and system logs:
-    > `⚠️  OFFLINE RECALL: File 'family_photo_2012.raw' is stored on an offline volume.`  
-    > `👉  PLEASE INSERT: Volume UUID [c659bb93] (Drive Serial: ZEK12345)`
-4.  **Auto-Resume:** As soon as you plug the drive into **any** USB or SATA port, the daemon rescans, identifies the Serial/UUID, and automatically resumes the rehydration. The application that was "frozen" will suddenly receive its data and continue without crashing.
+1.  **The Interceptor Pauses:** fanotify blocks the requesting process while HuskHoard attempts to restore the file.
+2.  **A Restore Attempt Is Made:** HuskHoard looks up the file's replica(s) in the Catalog and tries to open each backing volume in turn.
+3.  **Failure Is Logged, Not Prompted:** If a volume's `device_path` doesn't currently exist (the drive is unplugged/offline) and no replica succeeds, HuskHoard logs a generic error — `CRITICAL: All replicas for '<path>' are physically offline!` — to the terminal and system logs. There is currently no interactive "please insert Volume UUID / Drive Serial" prompt; check the logs and cross-reference the `tapes` table (Section 9) to find the UUID/serial you need.
+4.  **The Process Is Unblocked Immediately:** HuskHoard only makes one restore attempt per read. If it fails, the file is re-stubbed and the blocked process is released right away — it will see the file's sparse hole (reading back as zeroes) rather than staying frozen until you reconnect the drive. Re-run whatever triggered the read once the volume is back online.
+5.  **Reconnecting a Drive Requires a Daemon Restart:** Volume rescans (matching a drive's hardware serial back to its Catalog UUID, per the sections above) currently run only once, at `huskhoard daemon` startup. Plugging a drive back in while the daemon is already running is **not** picked up automatically — restart the daemon after reconnecting a volume.
 
+> **Enterprise Sidecar note:** If you've configured `sidecar_socket_path` (Architecture, Section 4), HuskHoard sends a `WAKE_VOLUME` request to your Sidecar before every read and waits for a `READY` reply — this is the intended integration point for robotic tape libraries or custom "please load barcode X" operator prompts, rather than something HuskHoard prompts for natively.
 ### Ejecting Drives Safely
 Because HuskHoard uses `O_DIRECT` and performs sequential writes, it is very "safe" for removable media. To eject a drive:
 1. Ensure the **Archive Worker** is idle (check logs).
 2. Use standard Linux eject commands: `sudo eject /dev/sdX`.
 3. HuskHoard will continue to show the files in your `hot_tier`, preserving your ability to browse your library even when the "tapes" are offline.
-
-
 ### Section 5: User Guides (`usage.md`)
 
 # User Guides
@@ -220,12 +220,16 @@ The most common use case is archiving files once they haven't been touched for a
 ```Toml
 max_age_days = 30 # Files not accessed in 30 days become Husks
 ```
-### Exclusions & Temporary Files
-You can prevent certain directories or temporary files from ever being archived or tracked:
+### Exclusions & Replication Filters
+You can prevent certain directories, files, or replication paths from being processed:
 
-```Toml
+```toml
+# Exclude entirely from archival and tracking
 exclude_dirs = ["/.git/", "/node_modules/", "/__pycache__/"]
 temp_extensions = [".swp", ".tmp", ".crdownload", "~", ".part"]
+
+# Archive locally to primary volumes, but skip replicating to cloud/secondary pools
+no_replicate_dirs = ["/NoReplicate/", "/Temp/"]
 ```
 ### High-Performance Raw Copy (Compression Bypass)
 Many media formats (MP4, MKV) and archives (ZIP) are already highly compressed. Running Zstd on them wastes CPU cycles and slows down archiving. HuskHoard allows you to bypass compression for these extensions, resulting in a direct, high-speed raw copy to the archive:
@@ -317,12 +321,14 @@ If you have multiple tapes and suspect one is failing, you can force StreamGate 
 ## 7. Deleting Data (Deep Archive vs. True Delete)
 HuskHoard offers two completely different workflows for deleting files depending on your retention needs:
 
-### A. Deep Archiving (Standard OS Delete)
-If you delete a file using standard OS tools (e.g., `rm`, deleting via a Windows SMB share, or moving to the Trash), the file is removed from your SSD. **However, it remains safely in the HuskHoard Catalog and on your physical tapes.**
-* **Use Case:** You are done working on a project and want it off your active NVMe drive, but you still want it archived forever on tape.
+### A. Deep Archiving & Retention Periods (Standard OS Delete)
+If you delete a file using standard OS tools (e.g., `rm`, deleting via an SMB share, or moving to Trash), the file is removed from your SSD:
+* **The Grace Period:** The next time `huskhoard prune` runs, the file is stamped with `deleted_at = CURRENT_TIMESTAMP` (soft-deleted).
+* **Retention Window (`retention_days`):** The file and its tape entries remain safe in the catalog for the number of days specified by `retention_days` (default: 30). If the file reappears on the SSD during this window, the deletion mark is cleared automatically.
+* **Expiration & Purge:** Once the file has been missing longer than `retention_days`, running `huskhoard prune` permanently drops the record and its StreamGate frame index. (If `retention_days = 0`, missing files are purged immediately without soft-deletion).
+* **Physical Space Recovery:** Space occupied on tape by purged files is reclaimed the next time you run `huskhoard repack`.
 
-**Replace it with:**
-```markdown
+
 ### B. True Delete (Permanent Destruction)
 If you have a file that is garbage (e.g., a bad video take, corrupted render) and you want it completely purged from both the SSD and the underlying Tape database, you must use the Husk CLI:
 ```bash
@@ -430,6 +436,9 @@ no_compress_extensions = ["braw", "r3d", "mxf", "mov", "mp4"]
 ```
 ```
 
+
+
+
 ### Section 6: Maintenance & Disaster Recovery (`maintenance.md`)
 
 # Maintenance & Disaster Recovery
@@ -469,28 +478,29 @@ You can force the Catalog to sync perfectly with your SSD by running the Pruner:
 ```bash
 ./huskhoard prune
 ```
-The Pruner scans the entire database. If a file exists in the database but is completely missing from the SSD (no stub, no file), it permanently deletes the record from the Catalog based on your `retention_days` setting. 
-
-**Compliance Override:** If a file is protected by a Legal Hold or HIPAA policy in its `custom_metadata`, the Pruner will mark it as soft-deleted but will **never** permanently purge the record, ensuring strict legal compliance.
-
-*Note: Run a `repack` after a massive `prune` to physically free the space of unprotected files on your tapes.**
+The Pruner scans the entire database. If a file exists in the database but is completely missing from the SSD (no stub, no file), it permanently deletes the record from the Catalog. 
+*Note: Run a `repack` after a massive `prune` to physically free the space on your tapes.*
 
 ## 3. Disaster Recovery (The Rebuild)
-If your SSD dies and you lose your `husk_catalog.db`, do not panic. Your data is not lost.
-*   **For Disks:** HuskHoard scans for "USTD" magic bytes across the LBA range.
-*   **For Tapes:** HuskHoard reads every hardware Filemark, extracts the 4KB header at the start of each file, and re-indexes the tape's contents into a new SQLite database.
+If your SSD dies and you lose your `husk_catalog.db`, do not panic. Your data is not lost — as long as it's on a **Disk or Image volume**.
+*   **For Disks/Images:** HuskHoard walks the volume from LBA 0, reading a 4KB header at a time. Wherever it finds the `USTD` magic bytes, it decodes the filename and Jump Table straight out of the header's TLV data (see Technical Reference) and inserts a Catalog row, then jumps forward by that object's full padded size (plus any extension blocks) to the next header. Anywhere the magic bytes don't match, it steps forward 4KB and tries again, so the scan self-recovers from gaps or corruption.
+*   **For physical LTO Tape:** `rebuild` currently uses the same byte-offset scanning logic as disks/images, which relies on the device supporting arbitrary `seek()`. Physical tape character devices (`/dev/nst0`) generally don't support that — reads there are sequential and positioned with SCSI filemark ioctls (`MTFSF`/`MTREW`), not `lseek`. In practice, treat `rebuild` as **Disk/Image-only for now**, the same caveat that already applies to `scrub` and `repack` above. Native filemark-based rebuild for physical tape is on the roadmap.
 
-Because every 4KB header on the archive volume contains the filename and metadata, HuskHoard can perform a **Deep Scan** to rebuild your database from scratch:
 ```bash
 ./huskhoard rebuild --tape-dev /dev/sdb --output-db husk_recovered.db
 ```
-HuskHoard will scan the entire physical surface of the drive, identify "USTD" magic bytes, and re-index every file it finds.
 
-## 4. The "Easy Exit" (Manual Extraction)
-We believe you should never be locked into a storage tool. If you need to get your data out and don't want to use HuskHoard, you can use standard Linux tools:
-1. Use `dd` or a hex editor to find the offset of a file (skipping the 4096-byte header).
-2. Pipe the raw data into the standard `zstd` utility:
-   `dd if=/dev/sdb bs=4096 skip=[offset+1] | zstd -d > recovered_file`
+## 4. Hardware Limitations (Tape & Optical)
+*   **Scrubber & Repacker:** Currently require random-access Disk/Image files. Physical character tape devices (`/dev/nst0`), optical media (`/dev/sr*`), and `rclone:` cloud endpoints cannot be targets of `scrub` or `repack`. Native sequential scrubbing for tape is on the roadmap.
+*   **Optical Discs:** Because optical media is physically non-rewritable or finalized, repacking or pruning does not write back to physical discs. Reconciled records are removed from the database, and fresh burns should be performed for updated sets.
+
+## 5. The "Easy Exit" (Manual Extraction)
+We believe you should never be locked into a proprietary storage tool. If you need to get your data out without HuskHoard, standard Linux utilities suffice:
+1. Use `dd` or a hex editor to find the starting offset of an object.
+2. Skip the 4096-byte header and pipe the raw compressed stream into `zstd`:
+   ```bash
+   dd if=/dev/sdb bs=4096 skip=$(( (OFFSET / 4096) + 1 )) | zstd -d > recovered_file
+   ```
 
 
 ---
@@ -501,7 +511,7 @@ We believe you should never be locked into a storage tool. If you need to get yo
 
 This section provides the low-level specifications for the HuskHoard storage format and CLI.
 
-## 1. The USTD Object Header (4096 bytes)
+## 1. The Husk Object Header (4096 bytes)
 Every object on a HuskHoard volume begins with a 4KB header, aligned to the disk's physical sectors.
 
 | Offset | Size | Field | Description |
@@ -510,7 +520,7 @@ Every object on a HuskHoard volume begins with a 4KB header, aligned to the disk
 | 8 | 2B | `format_version` | Current version: 1 |
 | 10 | 2B | `flags` | Operational flags (e.g., deleted, partial) |
 | 12 | 1B | `compression_type` | 0=None, 1=Zstd |
-| 13 | 3B | `reserved_pad` | Structural padding to maintain 64-bit alignment |
+| 13 | 3B | `reserved_pad` | Byte 0 doubles as `ext_blocks`: the count of extra 4KB blocks appended after the payload when TLV metadata overflows the 3960-byte `tlv_data` field. Remaining bytes are structural padding for 64-bit alignment. |
 | 16 | 8B | `payload_size` | Uncompressed size in bytes |
 | 24 | 8B | `compressed_size` | Compressed size in bytes |
 | 32 | 8B | `padded_size` | Total size aligned to 4KB sectors |
@@ -526,30 +536,37 @@ Every object on a HuskHoard volume begins with a 4KB header, aligned to the disk
 | 136 | 3960B| `tlv_data` | Type-Length-Value packed variable metadata |
 
 ### TLV Metadata Packing
-The `tlv_data` block stores variable-length information:
+The `tlv_data` block stores variable-length information, packed as `[type: 2B][length: 2B][value]` entries:
 *   **Type 0x01:** Original Filename.
 *   **Type 0x02:** Linux Extended Attributes (xattrs).
+*   **Type 0x03:** StreamGate Jump Table — the per-frame compressed size for every 16MB frame, used to reconstruct O(1) seek offsets. This is also mirrored into the `object_frames` SQL table (see The Catalog).
 
-## 2. CLI Command Summary
+If the packed TLV data exceeds the 3960-byte inline capacity (common with many xattrs or a large Jump Table), the overflow spills into one or more additional 4KB "extension blocks" appended immediately after the object's payload on the volume, with the count recorded in `reserved_pad[0]` above.
 
-| Command | Argument | Description |
-| :--- | :--- | :--- |
-| `daemon` | None | Starts the interceptor, policy engine, and HTTP Gateway. |
-| `format` | `--tape-dev` | Writes a Volume Header to LBA 0 of a drive. |
-| `info` | `--tape-dev` | Displays capacity and "Wasteland" statistics. |
-| `scrub` | `--tape-dev` | Verifies BLAKE3 hashes for all data on volume. |
-| `cat` | `--file-path` | Streams a file directly to stdout with zero SSD writes (supports `--offset`, `--length`, `--tape-uuid`). |
-| `restore` | `--file-path` | Manually extracts a file (supports `--version` and `--source`). |
-| `rm` | `--file-path` | Permanently deletes a file from SSD and Catalog. |
-| `repack` | `--source-tape`, `--dest-tape` | Reclaims space by migrating active data. |
-| `prune` | None | Deletes orphaned catalog records missing from the SSD. |
-| `rebuild` | `--tape-dev` | Recovers a lost database by scanning hardware. |
-| `export` | `--format`, `--output`| Exports the SQLite catalog to a Data Engineering format (Parquet). |
+[... CLI Command Summary table unchanged ...]
 
 ## Storage Interface Specs
 *   **Block Size:** 4096 bytes (Logical), 262,144 bytes (Physical SCSI Tape Frame).
 *   **Tape Markers:** Uses standard SCSI `EOF` filemarks between every archived object.
-*   **Reported Capacity:** `info`/`scrub` currently report a fixed 12TB for any physical LTO drive and a fixed 1PB placeholder for any `rclone:` remote, regardless of actual hardware/quota. Treat the fill percentage as directional rather than exact until hardware-specific capacity lookup ships.
+*   **Reported Capacity:** `info`/`scrub` query the real drive/media capacity from physical LTO drives via the SCSI Tape Capacity log page (`sg_logs -p 0x31`) when the `sg3-utils` toolchain is available. If that lookup fails — `sg_logs` isn't installed, or the drive/media doesn't support the log page — HuskHoard falls back to a fixed 12TB (LTO-8 class) placeholder. `rclone:` remotes always report a fixed 1PB placeholder regardless of actual quota. Treat cloud fill percentages as directional, and disk/tape fill percentages as exact only when the `sg_logs` lookup succeeds.
+*   **Write-Time Admission Check:** Independently of the capacity lookup above, the archiver currently uses a fixed 12TB assumption when deciding whether a *physical tape* has room for a new object, regardless of what `sg_logs` reports. On tapes smaller than 12TB, this check alone won't stop a write from being attempted past the tape's true end — don't rely on it in place of monitoring `info` output and your own rotation policy.
+
+## 2. CLI Command Summary & Examples
+
+| Command | Description | Example Usage |
+| :--- | :--- | :--- |
+| **`daemon`** | Starts the interceptor, policy engine, and HTTP Gateway. | `./huskhoard daemon` |
+| **`format`** | Writes a Volume Header to LBA 0 of a drive. | `./huskhoard format --tape-dev /dev/sdb` |
+| **`info`** | Displays capacity and "Wasteland" statistics. | `./huskhoard info --tape-dev /dev/sdb` |
+| **`scrub`** | Verifies BLAKE3 hashes for all data on a volume. | `./huskhoard scrub --tape-dev /dev/sdb` |
+| **`cat`** | Streams a file directly to stdout with zero SSD writes. | `./huskhoard cat --file-path /var/log/syslog --offset 1024 --length 500 > snippet.log` |
+| **`restore`** | Manually extracts a specific version of a file. | `./huskhoard restore --file-path /home/hot_tier/doc.pdf --dest-path ./recovered.pdf --version 1` |
+| **`rm`** | Permanently deletes a file from SSD and Catalog. | `./huskhoard rm --file-path /home/hot_tier/bad_render.mp4` |
+| **`repack`** | Reclaims space by migrating active data to a new tape. | `./huskhoard repack --source-tape /dev/sdb --dest-tape /dev/sdc` |
+| **`prune`** | Reconciles the catalog, soft-deleting or purging records missing from SSD. | `./huskhoard prune` |
+| **`rescan`** | Scans `/sys/block`, tape devices, and optical trays (`/dev/sr*`) to update hardware paths. | `./huskhoard rescan` |
+| **`rebuild`**| Recovers a lost database by scanning hardware LBAs. | `./huskhoard rebuild --tape-dev /dev/sdb` |
+| **`export`** | Exports the SQLite catalog to Parquet format. | `./huskhoard export --format parquet --output catalog.parquet` |
 
 ## 3. Performance Tuning
 *   **Alignment:** HuskHoard enforces 4096-byte alignment. This ensures compatibility with **4Kn Advanced Format** drives and prevents "Partial Sector Writes."
@@ -558,8 +575,6 @@ The `tlv_data` block stores variable-length information:
 *   **HTTP Stream Squelching:** The gateway detects BrokenPipe errors during seeks. This allows for rapid timeline scrubbing in VLC without spamming system logs or resource leaks.
 
 ---
-
-
 ### Section 8: Production Deployment Guide (`production.md`)
 
 # Production Deployment
@@ -587,6 +602,32 @@ Unlike the test environment where we used `fallocate`, in production we format t
 # Format a physical 14TB Hard Drive
 sudo ./huskhoard format --tape-dev /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
 ```
+### Configuring Non-Root Permissions for Block Devices
+The daemon opens archive drives in **Read + Write (`O_RDWR`)** mode with direct I/O. Linux by default restricts direct write access to raw block devices to `root` and the `disk` group.
+
+To run HuskHoard as a non-root user without encountering `No valid tape pools available with capacity`:
+
+1. **Add your user to the `disk` group:**
+   ```bash
+   sudo usermod -aG disk $USER
+   ```
+
+2. **Activate the group change immediately (without rebooting or logging out):**
+   ```bash
+   newgrp disk
+   ```
+
+3. **Verify write permissions on the device:**
+   Ensure the device allows group read/write:
+   ```bash
+   sudo chmod 660 /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
+   ```
+
+4. **Verify access with the info command:**
+   Run without `sudo` to ensure your user has full access:
+   ```bash
+   ./huskhoard info --tape-dev /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
+   ```
 
 ## 2. Setting up the Cloud Replication Tier
 HuskHoard can replicate every byte to a cloud provider in real-time.
@@ -627,21 +668,18 @@ In production, you want HuskHoard to start automatically when the server boots. 
 `sudo nano /etc/systemd/system/huskhoard.service`
 
 ```ini
-[Unit]
-Description=HuskHoard Data Tiering Daemon
-After=network.target
-
 [Service]
 Type=simple
 User=huskuser
 Group=huskuser
+SupplementaryGroups=disk tape
 WorkingDirectory=/home/huskuser/husk
 ExecStart=/home/huskuser/husk/target/release/huskhoard daemon
 Restart=always
 RestartSec=5
 
-# Ensure the binary has fanotify capabilities
-AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+# Ensure the binary has fanotify capabilities and raw block I/O
+AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RAWIO
 
 [Install]
 WantedBy=multi-user.target
@@ -672,18 +710,26 @@ HuskHoard excels at managing a "Shelf" of disconnected drives and tapes.
 *   **The Recall Prompt:** If an app tries to access a file on a tape that is currently in a box on your shelf, the daemon will block the app and log:
     > `👉 PLEASE INSERT: Volume UUID [a1b2c3d4] (SCSI Model: HP LTO-7 ULTRIUM)`
 *   **Resume:** Once the tape is inserted and the drive is ready, HuskHoard automatically continues the stream.
+### Safely Ejecting Physical Media
+Because HuskHoard writes directly to raw block sectors without mounting a filesystem, traditional `umount` commands do not apply. To safely flush internal hardware caches and power down an archive drive before shelving or disconnecting it, run:
 
+```bash
+udisksctl power-off -b /dev/disk/by-id/ata-WDC_WD140EDGZ-11B1PA0_ZEK12345
+```
 ## 7. Performance Tuning for High Capacity
 When dealing with multi-terabyte drives, performance tuning is key:
 
-*   **O_DIRECT:** Production mode defaults to `O_DIRECT`. This ensures that archiving 10TB of data won't "pollute" your Linux RAM cache, leaving your system snappy for other tasks.
+*   **O_DIRECT:** Production mode defaults to `O_DIRECT`. This ensures that archiving multi-terabyte data streams bypasses the Linux page cache and writes straight to storage without polluting host RAM.
+    *   *USB Drive / Bridge Quirk:* Some USB flash drives and USB-to-SATA bridge controllers fail DMA block alignment under Linux `O_DIRECT`. If you encounter I/O errors or unmountable USB pools on cheap enclosures, you can disable direct I/O by setting:
+        ```bash
+        DISABLE_O_DIRECT=1 ./huskhoard daemon
+        ```
 *   **Disk Spindown:** If you are using standard HDDs, you can set an idle spindown timer using `hdparm -S`. HuskHoard will automatically wake the drive when a "Husk" is accessed.
 *   **Database Location:** Always keep your `husk_catalog.db` on your fastest SSD. This ensures that `ls` commands and file metadata lookups remain instantaneous, even if the data is on a sleeping hard drive.
 
----
 
-
-### Section 9: The Catalog (SQLite Deep Dive) (`catalog.md`)
+  --
+  ### Section 9: The Catalog (SQLite Deep Dive) (`catalog.md`)
 
 # The Catalog Database
 
@@ -796,8 +842,6 @@ duckdb -c "
 `
 
 ---
-
-
 ### Section 10: High-Performance Search (`search.md`)
 # High-Performance Search
 
@@ -856,7 +900,6 @@ Because the search is so fast and the database is standard, you can point other 
 
 ---
 
-
 # Section 11: Streaming Gateway (`streaming.md`)
 
 # HTTP Streaming Gateway
@@ -877,7 +920,7 @@ In your `husk_config.toml`, you can set the port:
 ```toml
 http_port = 8080
 ```
-By default, the gateway binds to `127.0.0.1`. This is a security feature to ensure your archive isn't exposed to the internet. If you need to access it from another machine, we recommend using an Nginx reverse proxy or a VPN (Tailscale).
+The gateway binds to `0.0.0.0` on that port — every network interface on the host, not just `localhost`. This is intentional: it's what lets an SSH tunnel, a Tailscale/VPN connection, or another device on your LAN reach the stream without extra setup like an Nginx reverse proxy. The tradeoff is there's no authentication layer — anyone who can reach the host on that port can stream your archived files. If the host is on an untrusted network, restrict access with a firewall rule, VPN, or authenticating reverse proxy rather than assuming the gateway is localhost-only.
 
 ## 3. Media Server Integration
 
@@ -905,7 +948,8 @@ Plex will now treat the LTO Tape or S3 bucket as a standard high-speed stream.
 *   **Localhost Enforcement:** The gateway is designed for local-to-local communication. This keeps your metadata and file content off the open web.
 *   **Graceful 503s:** If you try to stream a file from a tape that is currently sitting on your shelf (offline), the gateway will return an `HTTP 503 Service Unavailable` with a log entry telling you exactly which drive to plug in.
 *   **Connection Limit:** The gateway caps concurrent streams at 50. Beyond that, new requests get an immediate `HTTP 503 Service Unavailable` rather than queuing or crashing the daemon.
-
+*   **No Built-in Authentication:** The gateway binds to all interfaces (`0.0.0.0`) and doesn't require credentials — anything network-reachable can hit `/stream/` or `/api/dashboard`. Treat network access to the HuskHoard host as the security boundary (firewall, VPN, or an authenticating reverse proxy), not the gateway itself.
+  
 ## 6. Live Dashboard API
 In addition to `/stream/`, the gateway exposes a read-only JSON endpoint for building your own monitoring UI:
 
@@ -921,5 +965,3 @@ The response includes:
 
 The gateway also answers `OPTIONS` requests with CORS headers and supports `HEAD` requests (used by Plex/VLC to probe file size before streaming), so a browser-based dashboard can query it directly.
 ```
-
----
