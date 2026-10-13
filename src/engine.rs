@@ -600,7 +600,32 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
             f.read_exact(&mut discard_buf.as_mut_slice()[..chunk])?;
             bytes_to_discard -= chunk as u64;
         }
-        StorageReader::Local(f)
+
+        // --- STAGE TO SSD TO PREVENT TAPE SHOE-SHINING ---
+        info!("[StreamGate] Spooling {} bytes to SSD to prevent tape drive shoe-shining...", padded_target_c_len);
+        let stage_path = std::path::Path::new(&config.hot_tier).join(format!(".stage_{}_{}", tape_uuid, offset));
+        let mut stage_file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&stage_path)?;
+        
+        let mut bytes_to_spool = padded_target_c_len;
+        while bytes_to_spool > 0 {
+            let chunk = std::cmp::min(bytes_to_spool, discard_buf.capacity as u64) as usize;
+            f.read_exact(&mut discard_buf.as_mut_slice()[..chunk])?;
+            stage_file.write_all(&discard_buf.as_slice()[..chunk])?;
+            bytes_to_spool -= chunk as u64;
+        }
+        
+        stage_file.sync_all()?;
+        
+        // Close the tape immediately so the hardware is free for other ops!
+        drop(f); 
+        
+        // Unlink the file immediately. 
+        // The file descriptor stays open for the HTTP Gateway, but the file disappears 
+        // from the filesystem and auto-deletes when the HTTP stream ends.
+        let _ = std::fs::remove_file(&stage_path); 
+        
+        stage_file.seek(SeekFrom::Start(0))?;
+        StorageReader::Local(stage_file)
     } else {
         let mut f = open_tape_device(&tape_dev, true, false, false, use_direct_io)?;
         f.seek(SeekFrom::Start(aligned_offset))?;
