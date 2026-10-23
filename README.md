@@ -87,7 +87,7 @@ source $HOME/.cargo/env
 ### 2. Download and Build
 Clone the repository and compile the release binary:
 ```bash
-git clone https://github.com/HuskHoard/HuskHoard.git
+git clone https://github.com/HuskHoard/HuskHoard.git huskhoard
 cd huskhoard
 
 # Build the project (takes ~5–10 mins)
