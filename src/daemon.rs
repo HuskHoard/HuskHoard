@@ -115,6 +115,9 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
 
         let conn = Connection::open(db_path).unwrap();
         let active_restores = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // Paths whose last restore attempt failed: concurrent readers must be
+        // denied too, not handed the same all-zero stub.
+        let failed_restores = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let mut buf = [0u8; 4096];
 
     loop {
@@ -217,6 +220,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                 let path_clone = path_str.clone();
                                 let db_path_clone = db_path.to_string();
                                 let active_restores_clone = Arc::clone(&active_restores);
+                                let failed_restores_clone = Arc::clone(&failed_restores);
                                 let interceptor_config = Arc::clone(&config);
                                 
                                 thread::spawn(move || {
@@ -229,7 +233,14 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                         }
                                     }
 
+                                    // Set to false when the payload could not be recovered:
+                                    // the caller must see an error instead of reading a
+                                    // hole-punched (all-zero) file.
+                                    let mut allow_read = true;
+
                                     if is_primary {
+                                        // A fresh attempt supersedes an earlier failure.
+                                        failed_restores_clone.lock().unwrap().remove(&path_clone);
                                         // Capture timestamps before the kernel overwrites them during the fill
                                         let (atime_sec, atime_nsec, mtime_sec, mtime_nsec) = if let Ok(meta) = std::fs::metadata(&path_clone) {
                                             (meta.atime(), meta.atime_nsec(), meta.mtime(), meta.mtime_nsec())
@@ -309,6 +320,13 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                             if let Ok(meta) = std::fs::metadata(&path_clone) {
                                                 let _ = stub_file(&path_clone, meta.len());
                                             }
+
+                                            // Deny the read: the payload is not available and
+                                            // the file on disk is a hole-punched placeholder.
+                                            // Returning FAN_ALLOW here made applications read
+                                            // zeroes while believing the read succeeded.
+                                            allow_read = false;
+                                            failed_restores_clone.lock().unwrap().insert(path_clone.clone());
                                         }
 
                                         {
@@ -325,10 +343,17 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                                             }
                                             thread::sleep(Duration::from_millis(50));
                                         }
+                                        // The primary attempt failed: deny this reader too.
+                                        if failed_restores_clone.lock().unwrap().contains(&path_clone) {
+                                            allow_read = false;
+                                        }
                                     }
 
-                                    // Release the blocked process ONLY after restore is done
-                                    let response = libc::fanotify_response { fd: fd_raw, response: libc::FAN_ALLOW };
+                                    // Release the blocked process ONLY after restore is done.
+                                    // On failure the read is denied so the application sees an
+                                    // error instead of a silently all-zero file.
+                                    let verdict = if allow_read { libc::FAN_ALLOW } else { libc::FAN_DENY };
+                                    let response = libc::fanotify_response { fd: fd_raw, response: verdict };
                                     unsafe { 
                                         libc::write(fan_fd, &response as *const _ as *const libc::c_void, std::mem::size_of_val(&response)); 
                                         libc::close(fd_raw); 
