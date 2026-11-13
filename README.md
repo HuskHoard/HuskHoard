@@ -122,6 +122,8 @@ hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"
 max_age_days = 0                # TEST MODE: Archive files immediately
 janitor_interval_secs = 60
 http_port = 8080                # Port for the Streaming Gateway
+http_bind = "127.0.0.1"          # Loopback only; use "0.0.0.0" to serve the LAN/Tailscale
+http_token = ""                  # Optional bearer token required by the gateway
 hot_tier_max_usage_percent = 80 # Spillover threshold
 min_free_space_gb = 0
 ```
@@ -155,6 +157,17 @@ Leave the daemon running and open a **second terminal window**:
 ```bash
 ./target/release/huskhoard cat --file-path /media/movies/scifi.mp4 | mpv -
 ```
+
+**Stream over the LAN / Tailscale (with access control):**
+Set `http_bind = "0.0.0.0"` and `http_token = "a-long-random-string"` in `husk_config.toml`, then:
+```bash
+# Bearer header (scripts, *arr apps)
+curl -H "Authorization: Bearer $TOKEN" http://archive-host:8080/stream/movies/scifi.mp4 -o scifi.mp4
+# Query token (players that cannot set headers, e.g. VLC/Plex "network stream")
+# http://archive-host:8080/stream/movies/scifi.mp4?token=$TOKEN
+```
+The gateway serves raw archived payloads, so it binds to `127.0.0.1` by default; exposing it
+without a token logs a security warning at startup.
 
 **Export Catalog for Data Engineering (Parquet):**
 ```bash

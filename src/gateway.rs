@@ -45,25 +45,46 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     if method != "GET" && method != "HEAD" { return; }
     let is_head_request = method == "HEAD";
 
-    // 1. Map URL to Local Path securely (Strip Query Parameters!)
-    let raw_url = parts[1].split('?').next().unwrap_or(parts[1]);
-    let mut decoded = Vec::new();
-    let mut bytes = raw_url.bytes();
-    while let Some(b) = bytes.next() {
-        if b == b'%' {
-            if let (Some(h1), Some(h2)) = (bytes.next(), bytes.next()) {
-                if let (Ok(n1), Ok(n2)) = (
-                    u8::from_str_radix(std::str::from_utf8(&[h1]).unwrap_or(""), 16),
-                    u8::from_str_radix(std::str::from_utf8(&[h2]).unwrap_or(""), 16)
-                ) {
-                    decoded.push((n1 << 4) | n2);
-                    continue;
+    // 1. Read request headers first: both the access token and the Range
+    //    request must be known before we touch the filesystem or the catalog.
+    let mut range_start: u64 = 0;
+    let mut range_end: Option<u64> = None;
+    let mut auth_header: Option<String> = None;
+
+    loop {
+        let mut header_line = String::new();
+        if reader.read_line(&mut header_line).is_err() || header_line == "\r\n" { break; }
+        let lower = header_line.to_lowercase();
+        if lower.starts_with("range: bytes=") {
+            let range_val = header_line[13..].trim();
+            let split: Vec<&str> = range_val.split('-').collect();
+            if !split.is_empty() {
+                range_start = split[0].parse().unwrap_or(0);
+                if split.len() > 1 && !split[1].is_empty() {
+                    if let Ok(end_val) = split[1].parse() {
+                        range_end = Some(end_val);
+                    }
                 }
             }
+        } else if lower.starts_with("authorization:") {
+            auth_header = Some(header_line[14..].trim().to_string());
         }
-        decoded.push(b);
     }
-    let url_path = String::from_utf8_lossy(&decoded).into_owned(); 
+
+    // 2. Access control: the gateway hands out raw archived payloads, so an
+    //    optional bearer token gates every route (dashboard included).
+    if let Some(expected) = config.http_token.as_deref().filter(|t| !t.is_empty()) {
+        if !is_authorized(auth_header.as_deref(), parts[1], expected) {
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+    }
+
+    // 3. Map URL to Local Path securely (Strip Query Parameters!)
+    let raw_url = parts[1].split('?').next().unwrap_or(parts[1]);
+    let url_path = String::from_utf8_lossy(&percent_decode(raw_url)).into_owned();
     if url_path.contains("..") { return; } // Requirement 4: Prevent Path Traversal
 
     // --- NEW: Live Dashboard API Endpoint ---
@@ -217,26 +238,7 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
     
     let path_str = abs_path.to_string_lossy().to_string();
 
-    // 2. Parse 'Range' Header for media players (RFC 7233)
-    let mut range_start: u64 = 0;
-    let mut range_end: Option<u64> = None;
-    
-    loop {
-        let mut header_line = String::new();
-        if reader.read_line(&mut header_line).is_err() || header_line == "\r\n" { break; }
-        if header_line.to_lowercase().starts_with("range: bytes=") {
-            let range_val = header_line[13..].trim();
-            let split: Vec<&str> = range_val.split('-').collect();
-            if !split.is_empty() {
-                range_start = split[0].parse().unwrap_or(0);
-                if split.len() > 1 && !split[1].is_empty() {
-                    if let Ok(end_val) = split[1].parse() {
-                        range_end = Some(end_val);
-                    }
-                }
-            }
-        }
-    }
+    // The Range request was already parsed together with the other headers.
 
     // 3. Database Lookup: Fetch Logical Size AND Target Device Path with Failover!
     let conn = rusqlite::Connection::open(&config.db_path).unwrap();
@@ -271,7 +273,21 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
         return;
     }
 
-    let end = range_end.unwrap_or(total_size.saturating_sub(1));
+    // RFC 7233: clamp the range to the object and reject unsatisfiable ones.
+    // Computing `end - start + 1` on an unbounded/inverted range underflows a
+    // u64: debug builds panic, release builds wrap into a huge Content-Length.
+    let (range_start, end) = match resolve_range(range_start, range_end, total_size) {
+        Some(v) => v,
+        None => {
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n",
+                    total_size
+                ).as_bytes(),
+            );
+            return;
+        }
+    };
     let length = end - range_start + 1;
 
     // 4. Content-Type Detection
@@ -314,11 +330,23 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
 
 pub fn run_http_gateway(config: Arc<HuskConfig>, use_direct_io: bool) {
     let port = config.http_port.unwrap_or(8080);
-    // Bind to 0.0.0.0 to allow SSH tunnels, Tailscale, and LAN connections
-    let addr = format!("0.0.0.0:{}", port); 
+    // Loopback by default: the gateway serves raw archived payloads, so exposing
+    // it on all interfaces must be an explicit decision (see `http_bind`).
+    let bind = config.http_bind.as_deref().filter(|b| !b.is_empty()).unwrap_or("127.0.0.1");
+    let has_token = config.http_token.as_deref().map(|t| !t.is_empty()).unwrap_or(false);
+    if !has_token && !is_loopback(bind) {
+        log::warn!(
+            "[Gateway] SECURITY: StreamGate is listening on {} without http_token; \
+             anyone who can reach this port can read every archived file. \
+             Set http_token (or bind to 127.0.0.1) to restrict access.",
+            bind
+        );
+    }
+
+    let addr = format!("{}:{}", bind, port);
     
     let listener = TcpListener::bind(&addr).expect(" Failed to bind HTTP Gateway port");
-    info!("[Gateway] Local HTTP Streaming Gateway active: http://{}/stream/", addr);
+    info!("[Gateway] HTTP Streaming Gateway active: http://{}/stream/", addr);
 
     for stream in listener.incoming() {
         if let Ok(mut stream) = stream {
@@ -334,5 +362,175 @@ pub fn run_http_gateway(config: Arc<HuskConfig>, use_direct_io: bool) {
                 handle_http_client(stream, cfg, use_direct_io);
             });
         }
+    }
+}
+
+// ---------------------------------------------------------
+// Request helpers (pure functions, unit-tested below)
+// ---------------------------------------------------------
+
+/// Decode `%XX` escapes without panicking on malformed input.
+fn percent_decode(input: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut bytes = input.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            match (bytes.next(), bytes.next()) {
+                (Some(h1), Some(h2)) => {
+                    if let (Some(n1), Some(n2)) = (hex_val(h1), hex_val(h2)) {
+                        out.push((n1 << 4) | n2);
+                    } else {
+                        // Not a valid escape sequence: keep the raw bytes.
+                        out.push(b);
+                        out.push(h1);
+                        out.push(h2);
+                    }
+                }
+                (Some(h1), None) => {
+                    out.push(b);
+                    out.push(h1);
+                }
+                (None, _) => out.push(b),
+            }
+            continue;
+        }
+        out.push(b);
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Constant-time comparison so a token check cannot leak how much of the
+/// prefix matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Accepted forms: `Authorization: Bearer <token>` or `?token=<token>`
+/// (media players often cannot set custom headers).
+fn is_authorized(header: Option<&str>, request_target: &str, expected: &str) -> bool {
+    if let Some(value) = header {
+        let token = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .unwrap_or(value)
+            .trim();
+        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+            return true;
+        }
+    }
+    if let Some((_, query)) = request_target.split_once('?') {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("token=") {
+                if constant_time_eq(&percent_decode(value), expected.as_bytes()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolve a requested byte range against the object size.
+/// `None` means the range is unsatisfiable (HTTP 416).
+fn resolve_range(start: u64, requested_end: Option<u64>, total: u64) -> Option<(u64, u64)> {
+    if total == 0 || start >= total {
+        return None;
+    }
+    let end = requested_end.unwrap_or(total - 1).min(total - 1);
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+fn is_loopback(bind: &str) -> bool {
+    matches!(bind, "127.0.0.1" | "::1" | "localhost")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_file_without_range() {
+        assert_eq!(resolve_range(0, None, 100), Some((0, 99)));
+    }
+
+    #[test]
+    fn open_ended_range_clamps_to_eof() {
+        assert_eq!(resolve_range(90, None, 100), Some((90, 99)));
+    }
+
+    #[test]
+    fn end_beyond_eof_is_clamped() {
+        assert_eq!(resolve_range(10, Some(500), 100), Some((10, 99)));
+    }
+
+    #[test]
+    fn inverted_range_is_unsatisfiable() {
+        // `Range: bytes=10-5` used to underflow `end - start + 1`.
+        assert_eq!(resolve_range(10, Some(5), 100), None);
+    }
+
+    #[test]
+    fn start_past_eof_is_unsatisfiable() {
+        // `Range: bytes=500-` used to underflow as well.
+        assert_eq!(resolve_range(500, None, 100), None);
+    }
+
+    #[test]
+    fn empty_object_is_unsatisfiable() {
+        assert_eq!(resolve_range(0, None, 0), None);
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_garbage() {
+        assert_eq!(percent_decode("/a%20b"), b"/a b".to_vec());
+        assert_eq!(percent_decode("/a%zz"), b"/a%zz".to_vec());
+        assert_eq!(percent_decode("/a%2"), b"/a%2".to_vec());
+    }
+
+    #[test]
+    fn auth_accepts_bearer_and_query_token() {
+        assert!(is_authorized(Some("Bearer s3cret"), "/stream/f", "s3cret"));
+        assert!(is_authorized(Some("bearer s3cret"), "/stream/f", "s3cret"));
+        assert!(is_authorized(None, "/stream/f?token=s3cret", "s3cret"));
+        assert!(is_authorized(
+            None,
+            "/stream/f?a=1&token=s3%63ret",
+            "s3cret"
+        ));
+    }
+
+    #[test]
+    fn auth_rejects_missing_or_wrong_tokens() {
+        assert!(!is_authorized(None, "/stream/f", "s3cret"));
+        assert!(!is_authorized(Some("Bearer wrong"), "/stream/f", "s3cret"));
+        assert!(!is_authorized(Some("Basic s3cret"), "/stream/f", "s3cret"));
+        assert!(!is_authorized(None, "/stream/f?token=wrong", "s3cret"));
+    }
+
+    #[test]
+    fn only_loopback_binds_are_treated_as_safe() {
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("::1"));
+        assert!(!is_loopback("0.0.0.0"));
+        assert!(!is_loopback("192.168.1.10"));
     }
 }

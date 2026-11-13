@@ -44,6 +44,15 @@ pub struct HuskConfig {
     pub retention_days: u64,
     pub log_level: String,
     pub http_port: Option<u16>,
+    /// Address the StreamGate HTTP server binds to. Defaults to loopback so an
+    /// archive host does not expose every archived payload to the network by
+    /// accident. Set "0.0.0.0" (together with `http_token`) for LAN/Tailscale.
+    #[serde(default)]
+    pub http_bind: Option<String>,
+    /// Optional bearer token for the StreamGate HTTP server. When set, every
+    /// request must carry `Authorization: Bearer <token>` or `?token=<token>`.
+    #[serde(default)]
+    pub http_token: Option<String>,
     pub sidecar_socket_path: Option<String>, 
     pub hot_tier_max_usage_percent: Option<u8>,
     #[serde(default)]
@@ -119,6 +128,8 @@ hot_tier = "hot_tier"
 db_path = "husk_catalog.db"
 log_level = "info" # Options: debug, info, warn, error
 http_port = 8080   # HTTP Streaming Gateway Port
+http_bind = "127.0.0.1"          # Loopback by default; set "0.0.0.0" to serve the LAN/Tailscale
+http_token = ""                  # Optional bearer token; required if http_bind is not loopback
 hot_tier_max_usage_percent = 80 # Spillover to tape if Hot Tier exceeds 80% full
 
 # --- Volume Tiering ---
