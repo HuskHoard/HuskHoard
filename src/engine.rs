@@ -1493,19 +1493,6 @@ pub fn prune_catalog(config: &std::sync::Arc<crate::config::HuskConfig>) -> std:
             }
         }
 
-        // The file's own directory must be visible too: a vanished sub-mount
-        // makes its files look deleted while the hot tier root still exists.
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            if !parent.is_dir() {
-                info!(
-                    "  [Prune] Skipping '{}': parent directory '{}' is not mounted.",
-                    path,
-                    parent.display()
-                );
-                continue;
-            }
-        }
-
         if !std::path::Path::new(&path).exists() {
             // FAST PATH: If retention is 0, skip the soft-delete mark and purge directly
             if config.retention_days == 0 {
