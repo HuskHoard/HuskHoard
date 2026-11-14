@@ -27,6 +27,25 @@ use crate::database::*;
 // ---------------------------------------------------------
 
 //
+/// One frame per 16 MiB of payload; a u16 TLV length caps a single 0x03 record
+/// at 65535/4 frames, so longer jump tables are split over several records.
+const MAX_FRAMES_PER_TLV: usize = (u16::MAX as usize) / 4;
+
+/// Serialize the StreamGate jump table as one or more 0x03 TLV records.
+/// Splitting keeps every record's u16 length field representable; the reader
+/// continues the running offsets across consecutive records.
+fn encode_jump_table(jump_table: &[(u64, u64, u64)], out: &mut Vec<u8>) {
+    for chunk in jump_table.chunks(MAX_FRAMES_PER_TLV) {
+        let frames_payload_len = (chunk.len() * 4) as u16;
+        out.push(0x00);
+        out.push(0x03);
+        out.extend_from_slice(&frames_payload_len.to_be_bytes());
+        for (_, _, c_size) in chunk {
+            out.extend_from_slice(&(*c_size as u32).to_be_bytes());
+        }
+    }
+}
+
 pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) -> Vec<String> {
     let mut vols_with_space: Vec<(String, u64)> = volumes.iter().filter_map(|dev| {
         // Use existing gauge to safely check Tapes, Block Devs, and Rclone!
@@ -339,13 +358,12 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             }
         }
 
-        // Type 0x03: Pack StreamGate Jump Table
-        let frames_payload_len = jump_table.len() * 4;
-        all_tlvs.push(0x00); all_tlvs.push(0x03);
-        all_tlvs.extend_from_slice(&(frames_payload_len as u16).to_be_bytes());
-        for (_, _, c_size) in &jump_table {
-            all_tlvs.extend_from_slice(&(*c_size as u32).to_be_bytes());
-        }
+        // Type 0x03: Pack StreamGate Jump Table.
+        // The TLV length field is u16, so a jump table with more than 16383
+        // entries (one frame per ~16 MiB, i.e. objects beyond ~256 GiB) used to
+        // have its length truncated and every following TLV misparsed. Emit
+        // consecutive 0x03 records instead; the reader continues the offsets.
+        encode_jump_table(&jump_table, &mut all_tlvs);
 
         let mut ext_blocks = 0;
         let mut ext_buffer = Vec::new();
@@ -359,8 +377,17 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
             ext_buffer[..overflow.len()].copy_from_slice(overflow);
         }
         
-        // Use the first byte of reserved_pad to store the number of extension blocks
-        header.reserved_pad[0] = ext_blocks as u8;
+        // Store the extension block count as u16: more than 255 blocks (about
+        // 1 MiB of TLV data, reached by the jump table of a multi-TB object)
+        // used to be silently truncated.
+        let ext_blocks_u16 = u16::try_from(ext_blocks).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "object metadata exceeds the 4 KiB header extension capacity",
+            )
+        })?;
+        header.reserved_pad[0] = ext_blocks_u16 as u8;
+        header.reserved_pad[1] = (ext_blocks_u16 >> 8) as u8;
 
         let mut crc = Crc32Hasher::new();
         crc.update(bytemuck::bytes_of(&header));
@@ -916,7 +943,7 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     }
 
     // Unpack Xattrs from TLV, merging Extension Blocks if present
-    let ext_blocks = header.reserved_pad[0] as usize;
+    let ext_blocks = u16::from_le_bytes([header.reserved_pad[0], header.reserved_pad[1]]) as usize;
     let mut all_tlvs = header.tlv_data.to_vec();
 
     if ext_blocks > 0 {
@@ -1070,7 +1097,7 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
             );
             
             // Recover StreamGate Jump Table from TLV, handling Extension Blocks
-            let ext_blocks = header.reserved_pad[0] as usize;
+            let ext_blocks = u16::from_le_bytes([header.reserved_pad[0], header.reserved_pad[1]]) as usize;
             let mut all_tlvs = header.tlv_data.to_vec();
 
             if ext_blocks > 0 {
@@ -1086,6 +1113,10 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
             }
 
             let mut tlv_offset = 0;
+            // A large jump table is split over several 0x03 records; keep the
+            // running offsets so the reconstructed frames stay contiguous.
+            let mut frame_u_off: u64 = 0;
+            let mut frame_c_off: u64 = 0;
             while tlv_offset + 4 <= all_tlvs.len() {
                 let t_type = u16::from_be_bytes([all_tlvs[tlv_offset], all_tlvs[tlv_offset+1]]);
                 let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
@@ -1096,8 +1127,6 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                 } else if t_type == 0x03 {
                     let frame_count = t_len / 4;
                     let mut p = tlv_offset + 4;
-                    let mut u_off: u64 = 0;
-                    let mut c_off: u64 = 0;
                     
                     for _ in 0..frame_count {
                         if p + 4 > all_tlvs.len() { break; }
@@ -1105,11 +1134,11 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                         
                         let _ = conn.execute(
                             "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![&filename, 1, u_off as i64, c_off as i64, c_size as i64]
+                            params![&filename, 1, frame_u_off as i64, frame_c_off as i64, c_size as i64]
                         );
                         
-                        u_off += 16 * 1024 * 1024; // 16MB steps
-                        c_off += c_size;
+                        frame_u_off += 16 * 1024 * 1024; // 16MB steps
+                        frame_c_off += c_size;
                         p += 4;
                     }
                 }
@@ -1523,4 +1552,68 @@ pub fn hard_remove(db_path: &str, file_path: &str) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_tlv_records(buf: &[u8]) -> Vec<(u16, usize)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + 4 <= buf.len() {
+            let t = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let l = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize;
+            out.push((t, l));
+            off += 4 + l;
+        }
+        assert_eq!(off, buf.len(), "records must exactly cover the buffer");
+        out
+    }
+
+    #[test]
+    fn jump_table_fits_in_a_single_record() {
+        let table = [(0u64, 0u64, 1024u64), (16 << 20, 1024, 2048)];
+        let mut out = Vec::new();
+        encode_jump_table(&table, &mut out);
+        let records = decode_tlv_records(&out);
+        assert_eq!(records, vec![(0x03, 8)]);
+    }
+
+    #[test]
+    fn jump_table_beyond_16383_frames_is_split_without_truncation() {
+        // 20_000 frames used to overflow the u16 length field and corrupt every
+        // TLV that followed.
+        let table: Vec<(u64, u64, u64)> =
+            (0..20_000u64).map(|i| (i * (16 << 20), i * 4096, 4096)).collect();
+        let mut out = Vec::new();
+        encode_jump_table(&table, &mut out);
+
+        let records = decode_tlv_records(&out);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], (0x03, MAX_FRAMES_PER_TLV * 4));
+        assert_eq!(records[1].0, 0x03);
+        let frames: usize = records.iter().map(|(_, len)| len / 4).sum();
+        assert_eq!(frames, table.len());
+    }
+
+    #[test]
+    fn jump_table_chunk_boundary_is_exact() {
+        let table: Vec<(u64, u64, u64)> = (0..MAX_FRAMES_PER_TLV as u64)
+            .map(|i| (i, i, 4096))
+            .collect();
+        let mut out = Vec::new();
+        encode_jump_table(&table, &mut out);
+        assert_eq!(decode_tlv_records(&out), vec![(0x03, 65532)]);
+    }
+
+    #[test]
+    fn extension_block_count_round_trips_through_u16() {
+        // >255 blocks (the old u8 field) must survive the header round trip.
+        for count in [0u16, 1, 255, 256, 1000] {
+            let pad = [count as u8, (count >> 8) as u8, 0u8];
+            let decoded = u16::from_le_bytes([pad[0], pad[1]]);
+            assert_eq!(decoded, count);
+        }
+    }
 }
