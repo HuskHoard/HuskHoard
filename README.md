@@ -124,6 +124,7 @@ janitor_interval_secs = 60
 http_port = 8080                # Port for the Streaming Gateway
 http_bind = "127.0.0.1"          # Loopback only; use "0.0.0.0" to serve the LAN/Tailscale
 http_token = ""                  # Optional bearer token required by the gateway
+intercept_open_reads = false     # Also intercept open(2): needed if apps mmap stubbed files
 hot_tier_max_usage_percent = 80 # Spillover threshold
 min_free_space_gb = 0
 ```
