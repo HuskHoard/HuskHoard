@@ -204,7 +204,8 @@ pub fn handle_http_client(mut stream: TcpStream, config: Arc<HuskConfig>, use_di
                 "janitor_interval_secs": config.janitor_interval_secs,
                 "exclude_dirs": config.exclude_dirs,
                 "immediate_archive_extensions": config.immediate_archive_extensions,
-                "no_compress_extensions": config.no_compress_extensions
+                "no_compress_extensions": config.no_compress_extensions,
+                "intercept_open_reads": config.intercept_open_reads.unwrap_or(false)
             }
         });
 
