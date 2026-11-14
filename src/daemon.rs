@@ -85,8 +85,16 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
         return Err(err); 
     }
 
-    //  Use FAN_ACCESS_PERM instead of FAN_OPEN_PERM to avoid VFS inode lock deadlocks
-        let mark_mask = libc::FAN_ACCESS_PERM | libc::FAN_CLOSE_WRITE | libc::FAN_EVENT_ON_CHILD;
+    // FAN_ACCESS_PERM is the default because FAN_OPEN_PERM adds one round trip per
+        // open and has historically been a source of VFS inode-lock deadlocks.
+        // However, FAN_ACCESS_PERM is only delivered for read(2)/readdir(3): an
+        // application that mmap()s a stub faults in the hole-punched pages without
+        // ever generating an event, i.e. it silently reads zeroes. Enable
+        // `intercept_open_reads` to also intercept open() and cover mmap readers.
+        let mut mark_mask = libc::FAN_ACCESS_PERM | libc::FAN_CLOSE_WRITE | libc::FAN_EVENT_ON_CHILD;
+        if config.intercept_open_reads.unwrap_or(false) {
+            mark_mask |= libc::FAN_OPEN_PERM;
+        }
         
         // 1. Recursively mark the root watch directory and all current subdirectories
         info!("[Daemon]  Scanning and attaching listeners to all subdirectories...");
@@ -132,7 +140,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
             // Ignore events triggered by the USTD daemon itself
             if metadata.pid == unsafe { libc::getpid() } {
                 if metadata.fd >= 0 {
-                    if (metadata.mask as u64 & libc::FAN_ACCESS_PERM) != 0 {
+                    if (metadata.mask as u64 & (libc::FAN_ACCESS_PERM | libc::FAN_OPEN_PERM)) != 0 {
                         let response = libc::fanotify_response { fd: metadata.fd, response: libc::FAN_ALLOW };
                         unsafe { libc::write(fan_fd, &response as *const _ as *const libc::c_void, std::mem::size_of_val(&response)); }
                     }
@@ -158,7 +166,7 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
                         .to_string();
 
                     // EVENT 1: Process is trying to READ a file
-                    if (mask & libc::FAN_ACCESS_PERM) != 0 {
+                    if (mask & (libc::FAN_ACCESS_PERM | libc::FAN_OPEN_PERM)) != 0 {
                         // Only query xattr (disk access) on READ events. 
                         let is_stubbed = xattr::get(&path_str, "trusted.husk.status")
                             .map(|v| v == Some(b"stubbed".to_vec()))

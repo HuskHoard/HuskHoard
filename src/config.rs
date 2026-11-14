@@ -53,6 +53,11 @@ pub struct HuskConfig {
     /// request must carry `Authorization: Bearer <token>` or `?token=<token>`.
     #[serde(default)]
     pub http_token: Option<String>,
+    /// Also intercept open(2) (FAN_OPEN_PERM) so mmap-based readers recall a stub
+    /// instead of faulting in zero pages. Off by default: it costs one permission
+    /// round trip per open and has historically caused VFS inode-lock deadlocks.
+    #[serde(default)]
+    pub intercept_open_reads: Option<bool>,
     pub sidecar_socket_path: Option<String>, 
     pub hot_tier_max_usage_percent: Option<u8>,
     #[serde(default)]
@@ -130,6 +135,7 @@ log_level = "info" # Options: debug, info, warn, error
 http_port = 8080   # HTTP Streaming Gateway Port
 http_bind = "127.0.0.1"          # Loopback by default; set "0.0.0.0" to serve the LAN/Tailscale
 http_token = ""                  # Optional bearer token; required if http_bind is not loopback
+intercept_open_reads = false     # Also intercept open(2) so mmap readers recall stubs (see docs)
 hot_tier_max_usage_percent = 80 # Spillover to tape if Hot Tier exceeds 80% full
 
 # --- Volume Tiering ---
