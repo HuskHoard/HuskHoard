@@ -747,15 +747,16 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     let mtime_sec = meta.mtime();
     let mtime_nsec = meta.mtime_nsec();
 
+    // Open file FIRST. If this fails (e.g. permissions/read-only), we exit before touching anything.
+    let file = OpenOptions::new().write(true).open(file_path)?;
+    let fd = file.as_raw_fd();
+
     // Mark the file as stubbed BEFORE touching the payload. If we crash between
     // the marker and the hole punch, the data is still on disk and a read just
     // restores it again; with the opposite order a crash leaves an all-zero file
     // with no stub marker, so the interceptor never recalls it and the payload
     // is silently lost.
     xattr::set(file_path, "trusted.husk.status", b"stubbed")?;
-
-    let file = OpenOptions::new().write(true).open(file_path)?;
-    let fd = file.as_raw_fd();
 
     if file_size > 0 {
         let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
