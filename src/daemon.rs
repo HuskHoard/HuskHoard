@@ -145,6 +145,21 @@ pub fn run_interceptor(config: Arc<HuskConfig>, use_direct_io: bool) -> std::io:
             let event_len = metadata.event_len as usize;
             if metadata.vers != libc::FANOTIFY_METADATA_VERSION as u8 { break; }
 
+            // The kernel drops events when its queue overflows and only reports
+            // this marker. A dropped ACCESS_PERM event means a stub read was
+            // released without a recall, i.e. the caller got zeroes. Nothing can
+            // be replayed, so make it loud enough to act on.
+            if (metadata.mask as u64 & libc::FAN_Q_OVERFLOW) != 0 {
+                error!(
+                    "[Daemon] !! fanotify event queue OVERFLOW: events were dropped. \
+                     Reads of stubbed files may have returned zeroes. \
+                     Raise fs.fanotify.max_queued_events (currently see \
+                     /proc/sys/fs/fanotify/max_queued_events) or reduce churn in the hot tier."
+                );
+                offset += event_len;
+                continue;
+            }
+
             if metadata.fd >= 0 {
                 let fd_raw = metadata.fd;
                 let proc_path = format!("/proc/self/fd/{}", fd_raw);
@@ -732,10 +747,15 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     let mtime_sec = meta.mtime();
     let mtime_nsec = meta.mtime_nsec();
 
+    // Mark the file as stubbed BEFORE touching the payload. If we crash between
+    // the marker and the hole punch, the data is still on disk and a read just
+    // restores it again; with the opposite order a crash leaves an all-zero file
+    // with no stub marker, so the interceptor never recalls it and the payload
+    // is silently lost.
+    xattr::set(file_path, "trusted.husk.status", b"stubbed")?;
+
     let file = OpenOptions::new().write(true).open(file_path)?;
     let fd = file.as_raw_fd();
-
-    
 
     if file_size > 0 {
         let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
@@ -747,7 +767,6 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
         if ret != 0 {
             let err = std::io::Error::last_os_error();
 
-            
             match err.raw_os_error() {
                 Some(libc::EOPNOTSUPP)
                 | Some(libc::ENOSYS) => {
@@ -763,11 +782,17 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
                         };
 
                         if trunc_ret != 0 {
-                return Err(std::io::Error::last_os_error());
-                }
+                            let e = std::io::Error::last_os_error();
+                            drop(file);
+                            // Nothing was destroyed yet, so the marker must go.
+                            let _ = xattr::remove(file_path, "trusted.husk.status");
+                            return Err(e);
+                        }
 
-                        
-                let expand_ret = unsafe {
+                        // The payload is gone from here on: keep the marker even
+                        // if the file cannot be expanded, so the next read still
+                        // triggers a recall instead of returning an empty file.
+                        let expand_ret = unsafe {
                         libc::ftruncate(fd, file_size as libc::off_t)
                         };
 
@@ -776,8 +801,10 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
                         }
                 }
 
-                
                         _ => {
+                drop(file);
+                // The payload is untouched: do not leave the file marked.
+                let _ = xattr::remove(file_path, "trusted.husk.status");
                 return Err(err);
                 }
             }
@@ -786,9 +813,6 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
 
     
     drop(file);
-
-    
-    xattr::set(file_path, "trusted.husk.status", b"stubbed")?;
 
     
     let c_path = CString::new(file_path).unwrap();
@@ -814,7 +838,14 @@ fn stub_file(file_path: &str, file_size: u64) -> std::io::Result<()> {
     };
 
     if ret != 0 {
-        return Err(std::io::Error::last_os_error());
+        // The payload is already archived and the stub marker is set; returning
+        // an error here would only make the worker re-queue the file and archive
+        // it a second time.
+        log::warn!(
+            "Failed to restore timestamps on '{}': {}",
+            file_path,
+            std::io::Error::last_os_error()
+        );
     }
 
     info!(
