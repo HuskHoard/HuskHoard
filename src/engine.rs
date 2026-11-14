@@ -1439,6 +1439,19 @@ pub fn prune_catalog(config: &std::sync::Arc<crate::config::HuskConfig>) -> std:
     let mut marked_count = 0;
     let mut purged_count = 0;
 
+    // A missing path is only evidence of deletion if the tree it lives in is
+    // actually visible. When the hot tier (or a sub-mount) is offline every
+    // tracked file "does not exist", and treating that as deletion soft-deletes
+    // - then eventually purges - the catalog entries for data that is still on
+    // tape. Bail out instead of reconciling against a tree we cannot see.
+    if !std::path::Path::new(&config.hot_tier).is_dir() {
+        log::warn!(
+            "[Prune] Hot tier '{}' is not available; skipping catalog reconciliation.",
+            config.hot_tier
+        );
+        return Ok(());
+    }
+
     for (path, deleted_at, custom_metadata) in rows {
         // Check for superseding legal or policy rules
         let mut has_legal_hold = false;
@@ -1448,6 +1461,19 @@ pub fn prune_catalog(config: &std::sync::Arc<crate::config::HuskConfig>) -> std:
                    meta_json.get("compliance_policy").and_then(|v| v.as_str()) == Some("HIPAA") {
                     has_legal_hold = true;
                 }
+            }
+        }
+
+        // The file's own directory must be visible too: a vanished sub-mount
+        // makes its files look deleted while the hot tier root still exists.
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            if !parent.is_dir() {
+                info!(
+                    "  [Prune] Skipping '{}': parent directory '{}' is not mounted.",
+                    path,
+                    parent.display()
+                );
+                continue;
             }
         }
 
