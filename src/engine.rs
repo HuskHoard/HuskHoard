@@ -2102,4 +2102,107 @@ mod tests {
             assert_eq!(decoded, count);
         }
     }
+
+    /// End-to-end: format a `.img` volume, archive a payload through the real
+    /// writer, rebuild the catalog from the tape image alone and compare the
+    /// recovered frame table with what the writer produced.
+    #[test]
+    fn end_to_end_archive_then_rebuild_matches_frame_table() {
+        use crate::config::{HuskConfig, DEFAULT_TOML};
+
+        let dir = std::env::temp_dir().join(format!("husk_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let img = dir.join("vol.img");
+        let img_path = img.to_string_lossy().to_string();
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(96 * 1024 * 1024)
+            .unwrap();
+        crate::hardware::format_tape(&img_path, false).unwrap();
+
+        let db_path = dir.join("catalog.db").to_string_lossy().to_string();
+        let conn = super::init_catalog(&db_path).unwrap();
+
+        // 16 MiB + 16 MiB + a short tail: exercises boundary and last frame.
+        let payload_len = (32usize << 20) + 12_345;
+        let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+        let src = dir.join("payload.bin");
+        std::fs::write(&src, &payload).unwrap();
+
+        let mut config: HuskConfig = toml::from_str(DEFAULT_TOML).unwrap();
+        config.hot_tier = dir.to_string_lossy().to_string();
+        config.db_path = db_path.clone();
+        config.primary_volumes = vec![img_path.clone()];
+        config.failover_volumes = vec![];
+        config.replication_volumes = vec![];
+        config.replicas = 0;
+        config.min_free_space_gb = Some(0);
+        config.no_compress_extensions = vec![];
+        let config = std::sync::Arc::new(config);
+
+        let (replicas, jump_table) =
+            archive_file(&conn, src.to_str().unwrap(), &config, false).unwrap();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(jump_table.len(), 3, "16 MiB + 16 MiB + short tail");
+        for (i, (u, _, size)) in jump_table.iter().enumerate() {
+            assert!(*size > 0, "frame {i} produced no compressed bytes");
+            assert_eq!(*u, i as u64 * (16 << 20), "frame {i} uncompressed start");
+        }
+        assert_eq!(jump_table[0].1, 0, "first frame starts at compressed offset 0");
+        for pair in jump_table.windows(2) {
+            assert!(pair[1].1 > pair[0].1, "compressed offsets must increase");
+        }
+
+        // The volume must actually carry the exact table (TLV 0x05), not only the
+        // legacy 0x03 record.
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut vol = std::fs::File::open(&img_path).unwrap();
+            vol.seek(SeekFrom::Start(4096)).unwrap(); // first object header
+            let mut hdr = [0u8; 4096];
+            vol.read_exact(&mut hdr).unwrap();
+            let tlvs = &hdr[136..]; // ObjectHeader::tlv_data
+            let has_exact = tlvs
+                .windows(2)
+                .any(|w| w[0] == 0x00 && w[1] == TLV_FRAME_TABLE_EXACT as u8);
+            let has_legacy = tlvs
+                .windows(2)
+                .any(|w| w[0] == 0x00 && w[1] == TLV_FRAME_TABLE_LEGACY as u8);
+            assert!(has_exact, "exact 0x05 frame table must be written");
+            assert!(has_legacy, "legacy 0x03 table must stay for old readers");
+        }
+
+        // Rebuild purely from the volume and compare the recovered index.
+        let rebuilt_db = dir.join("rebuilt.db").to_string_lossy().to_string();
+        super::rebuild_catalog(&img_path, &rebuilt_db, false).unwrap();
+
+        let rebuilt = rusqlite::Connection::open(&rebuilt_db).unwrap();
+        let mut stmt = rebuilt
+            .prepare("SELECT uncompressed_offset, compressed_offset, compressed_size FROM object_frames ORDER BY uncompressed_offset ASC")
+            .unwrap();
+        let rows: Vec<(i64, i64, i64)> = stmt
+            .query_map((), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        assert_eq!(rows.len(), jump_table.len(), "rebuilt frame count");
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.0 as u64, jump_table[i].0, "frame {i} uncompressed offset");
+            assert_eq!(row.2 as u64, jump_table[i].2, "frame {i} compressed size");
+        }
+
+        // The payload size recovered from the header must match what was read.
+        let recovered_len: i64 = rebuilt
+            .query_row("SELECT payload_size FROM catalog LIMIT 1", (), |r| r.get(0))
+            .unwrap();
+        assert_eq!(recovered_len as u64, payload_len as u64);
+
+        drop(stmt);
+        drop(rebuilt);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
