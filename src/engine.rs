@@ -31,6 +31,18 @@ use crate::database::*;
 /// at 65535/4 frames, so longer jump tables are split over several records.
 const MAX_FRAMES_PER_TLV: usize = (u16::MAX as usize) / 4;
 
+/// Legacy frame table record: compressed size only (4 bytes per frame).
+const TLV_FRAME_TABLE_LEGACY: u16 = 0x03;
+
+/// Exact frame table record: compressed size + uncompressed size (8 bytes per
+/// frame). Rebuild needs the real frame lengths because the writer flushes a
+/// frame once it has accumulated *at least* 16 MiB (read granularity is 1 MiB),
+/// so frames are 16-17 MiB and a fixed 16 MiB step drifts.
+const TLV_FRAME_TABLE_EXACT: u16 = 0x05;
+
+/// u16 length field / 8 bytes per entry.
+const MAX_EXACT_FRAMES_PER_TLV: usize = (u16::MAX as usize) / 8;
+
 /// Serialize the StreamGate jump table as one or more 0x03 TLV records.
 /// Splitting keeps every record's u16 length field representable; the reader
 /// continues the running offsets across consecutive records.
@@ -43,6 +55,32 @@ fn encode_jump_table(jump_table: &[(u64, u64, u64)], out: &mut Vec<u8>) {
         for (_, _, c_size) in chunk {
             out.extend_from_slice(&(*c_size as u32).to_be_bytes());
         }
+    }
+}
+
+/// Serialize the exact frame table (0x05): compressed size plus the true
+/// uncompressed length of each frame, so a catalog rebuild reproduces the same
+/// seek offsets the writer used.
+fn encode_frame_table_exact(jump_table: &[(u64, u64, u64)], payload_size: u64, out: &mut Vec<u8>) {
+    let mut start = 0;
+    while start < jump_table.len() {
+        let end = (start + MAX_EXACT_FRAMES_PER_TLV).min(jump_table.len());
+        let chunk = &jump_table[start..end];
+        let payload_len = (chunk.len() * 8) as u16;
+        out.push(0x00);
+        out.push(TLV_FRAME_TABLE_EXACT as u8);
+        out.extend_from_slice(&payload_len.to_be_bytes());
+        for (i, (u_start, _, c_size)) in chunk.iter().enumerate() {
+            let next_u = if start + i + 1 < jump_table.len() {
+                jump_table[start + i + 1].0
+            } else {
+                payload_size
+            };
+            let u_size = next_u.saturating_sub(*u_start);
+            out.extend_from_slice(&(*c_size as u32).to_be_bytes());
+            out.extend_from_slice(&(u_size as u32).to_be_bytes());
+        }
+        start = end;
     }
 }
 
@@ -249,6 +287,9 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
     let final_padded_size: u64;
 
     let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
+    // Bytes actually streamed: the frame table must describe what was written,
+    // even if the file changed size between metadata() and the read loop.
+    let mut total_read: u64 = 0;
     
     // LOGIC: Check config to bypass Zstd compression
     let file_ext = std::path::Path::new(source_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
@@ -276,6 +317,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 let n = src_file.read(&mut io_buf)?;
                 if n == 0 { break; }
                 hasher.update(&io_buf[..n]);
+                total_read += n as u64;
                 
                 encoder.write_all(&io_buf[..n])?;
                 current_frame_bytes += n;
@@ -306,6 +348,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 let n = src_file.read(&mut io_buf)?;
                 if n == 0 { break; }
                 hasher.update(&io_buf[..n]);
+                total_read += n as u64;
                 tape_writer.write_all(&io_buf[..n])?;
             }
             final_compressed_size = tape_writer.bytes_written + tape_writer.cursor as u64;
@@ -364,6 +407,9 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         // have its length truncated and every following TLV misparsed. Emit
         // consecutive 0x03 records instead; the reader continues the offsets.
         encode_jump_table(&jump_table, &mut all_tlvs);
+        // Also record the exact per-frame lengths (0x05). Readers that predate
+        // this TLV skip it and keep using the legacy approximation above.
+        encode_frame_table_exact(&jump_table, total_read, &mut all_tlvs);
 
         let mut ext_blocks = 0;
         let mut ext_buffer = Vec::new();
@@ -1113,10 +1159,15 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
             }
 
             let mut tlv_offset = 0;
-            // A large jump table is split over several 0x03 records; keep the
-            // running offsets so the reconstructed frames stay contiguous.
+            // Both frame tables can be present in the same header: the legacy
+            // 0x03 record (compressed size only, offsets have to be assumed) and
+            // the exact 0x05 record. Parse both and prefer the exact one.
+            let mut legacy_frames: Vec<(u64, u64, u64)> = Vec::new();
+            let mut exact_frames: Vec<(u64, u64, u64)> = Vec::new();
             let mut frame_u_off: u64 = 0;
             let mut frame_c_off: u64 = 0;
+            let mut exact_u_off: u64 = 0;
+            let mut exact_c_off: u64 = 0;
             while tlv_offset + 4 <= all_tlvs.len() {
                 let t_type = u16::from_be_bytes([all_tlvs[tlv_offset], all_tlvs[tlv_offset+1]]);
                 let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
@@ -1124,25 +1175,45 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                 
                 if t_type == 0x04 {
                     // Ignore hoisted metadata during database rebuilds
-                } else if t_type == 0x03 {
+                } else if t_type == TLV_FRAME_TABLE_EXACT {
+                    let frame_count = t_len / 8;
+                    let mut p = tlv_offset + 4;
+
+                    for _ in 0..frame_count {
+                        if p + 8 > all_tlvs.len() { break; }
+                        let c_size = u32::from_be_bytes([all_tlvs[p], all_tlvs[p+1], all_tlvs[p+2], all_tlvs[p+3]]) as u64;
+                        let u_size = u32::from_be_bytes([all_tlvs[p+4], all_tlvs[p+5], all_tlvs[p+6], all_tlvs[p+7]]) as u64;
+
+                        exact_frames.push((exact_u_off, exact_c_off, c_size));
+                        exact_u_off += u_size;
+                        exact_c_off += c_size;
+                        p += 8;
+                    }
+                } else if t_type == TLV_FRAME_TABLE_LEGACY {
                     let frame_count = t_len / 4;
                     let mut p = tlv_offset + 4;
-                    
+
                     for _ in 0..frame_count {
                         if p + 4 > all_tlvs.len() { break; }
                         let c_size = u32::from_be_bytes([all_tlvs[p], all_tlvs[p+1], all_tlvs[p+2], all_tlvs[p+3]]) as u64;
-                        
-                        let _ = conn.execute(
-                            "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![&filename, 1, frame_u_off as i64, frame_c_off as i64, c_size as i64]
-                        );
-                        
-                        frame_u_off += 16 * 1024 * 1024; // 16MB steps
+
+                        legacy_frames.push((frame_u_off, frame_c_off, c_size));
+                        // Approximation kept only for volumes written before the
+                        // exact table existed: frames are 16-17 MiB, not 16 MiB.
+                        frame_u_off += 16 * 1024 * 1024;
                         frame_c_off += c_size;
                         p += 4;
                     }
                 }
                 tlv_offset += 4 + t_len;
+            }
+
+            let frames = if exact_frames.is_empty() { legacy_frames } else { exact_frames };
+            for (u_off, c_off, c_size) in frames {
+                let _ = conn.execute(
+                    "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![&filename, 1, u_off as i64, c_off as i64, c_size as i64]
+                );
             }
 
             recovered_count += 1;
@@ -1618,6 +1689,74 @@ mod tests {
         let mut out = Vec::new();
         encode_jump_table(&table, &mut out);
         assert_eq!(decode_tlv_records(&out), vec![(0x03, 65532)]);
+    }
+
+    fn decode_exact_records(buf: &[u8]) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + 4 <= buf.len() {
+            let t = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            let l = u16::from_be_bytes([buf[off + 2], buf[off + 3]]) as usize;
+            if t == TLV_FRAME_TABLE_EXACT {
+                let mut p = off + 4;
+                while p + 8 <= off + 4 + l {
+                    let c = u32::from_be_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+                    let u = u32::from_be_bytes([buf[p + 4], buf[p + 5], buf[p + 6], buf[p + 7]]);
+                    out.push((c, u));
+                    p += 8;
+                }
+            }
+            off += 4 + l;
+        }
+        assert_eq!(off, buf.len(), "records must exactly cover the buffer");
+        out
+    }
+
+    fn table_from_sizes(sizes: &[u64]) -> (Vec<(u64, u64, u64)>, u64) {
+        let mut table = Vec::new();
+        let mut u = 0u64;
+        let mut c = 0u64;
+        for (i, size) in sizes.iter().enumerate() {
+            table.push((u, c, 4096 + i as u64));
+            u += *size;
+            c += 4096;
+        }
+        (table, u)
+    }
+
+    #[test]
+    fn exact_frame_table_preserves_irregular_frame_offsets() {
+        // Real frames are 16-17 MiB because the writer flushes once it has
+        // accumulated at least 16 MiB. Rebuilding with a fixed 16 MiB step
+        // drifts; the 0x05 table must reproduce the writer's offsets exactly.
+        let sizes = vec![17u64 << 20, 16u64 << 20, 3_000_000, 16u64 << 20];
+        let (table, payload) = table_from_sizes(&sizes);
+
+        let mut buf = Vec::new();
+        encode_frame_table_exact(&table, payload, &mut buf);
+        let decoded = decode_exact_records(&buf);
+        assert_eq!(decoded.len(), table.len());
+
+        let mut rebuilt_u = 0u64;
+        for (i, (c_size, u_size)) in decoded.iter().enumerate() {
+            assert_eq!(rebuilt_u, table[i].0, "uncompressed offset drift at frame {i}");
+            assert_eq!(*c_size as u64, table[i].2);
+            rebuilt_u += *u_size as u64;
+        }
+        assert_eq!(rebuilt_u, payload);
+    }
+
+    #[test]
+    fn exact_frame_table_is_split_past_8191_frames() {
+        let sizes = vec![16u64 << 20; 9_000];
+        let (table, payload) = table_from_sizes(&sizes);
+
+        let mut buf = Vec::new();
+        encode_frame_table_exact(&table, payload, &mut buf);
+        let records = decode_tlv_records(&buf);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], (TLV_FRAME_TABLE_EXACT, (MAX_EXACT_FRAMES_PER_TLV * 8) as usize));
+        assert_eq!(decode_exact_records(&buf).len(), table.len());
     }
 
     #[test]
