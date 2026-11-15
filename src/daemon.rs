@@ -503,6 +503,18 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                         //  Pass `None` as the 5th argument to archive_file
                         match archive_file(&conn, &path_str, &config, use_direct_io) {
                             Ok((replica_list, jump_table)) => {
+                                // Check for concurrent modification BEFORE committing anything:
+                                // the catalog row must describe the same snapshot the payload does.
+                                // fanotify overwrites our +1 year lock with the current time on write.
+                                let mut post_archive_touch: u64 = 0;
+                                if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| Ok(row.get::<_, i64>(0)? as u64)) {
+                                    post_archive_touch = touch;
+                                }
+                                if post_archive_touch != pre_archive_touch {
+                                    error!("[Worker] File {} modified during archive! Discarding this version to preserve data.", path_str);
+                                    continue;
+                                }
+
                                 let next_version: i64 = conn.query_row(
                                     "SELECT COALESCE(MAX(version), 0) + 1 FROM catalog WHERE file_path = ?1",
                                     params![&path_str], |row| row.get(0),
@@ -557,18 +569,6 @@ pub fn run_archive_worker(rx: mpsc::Receiver<String>, config: Arc<HuskConfig>, u
                                 if !db_commit_success {
                                     error!("[Worker] Catalog write failed for {}. Aborting stub process.", path_str);
                                     continue;
-                                }
-
-                                // Safety: Compare post-archive timestamp against our pre-archive lock.
-                                // If the user modified the file, fanotify will have overwritten the +1 year lock with the current time.
-                                let mut post_archive_touch: u64 = 0;
-                                if let Ok(touch) = conn.query_row("SELECT last_touch FROM active_tracking WHERE file_path = ?1", params![&path_str], |row| Ok(row.get::<_, i64>(0)? as u64)) {
-                                    post_archive_touch = touch;
-                                }
-
-                                if post_archive_touch != pre_archive_touch {
-                                    error!("[Worker] File {} modified during archive! Aborting stub to preserve data.", path_str);
-                                    continue; 
                                 }
 
                                 let sidecar = SidecarBridge::new(&config);
