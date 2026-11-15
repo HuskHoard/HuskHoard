@@ -61,12 +61,17 @@ fn encode_jump_table(jump_table: &[(u64, u64, u64)], out: &mut Vec<u8>) {
 /// Serialize the exact frame table (0x05): compressed size plus the true
 /// uncompressed length of each frame, so a catalog rebuild reproduces the same
 /// seek offsets the writer used.
-fn encode_frame_table_exact(jump_table: &[(u64, u64, u64)], payload_size: u64, out: &mut Vec<u8>) {
+fn encode_frame_table_exact(
+    jump_table: &[(u64, u64, u64)],
+    payload_size: u64,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
     let mut start = 0;
     while start < jump_table.len() {
         let end = (start + MAX_EXACT_FRAMES_PER_TLV).min(jump_table.len());
         let chunk = &jump_table[start..end];
-        let payload_len = (chunk.len() * 8) as u16;
+        let payload_len = u16::try_from(chunk.len() * 8)
+            .map_err(|_| invalid_data("exact frame table chunk exceeds the u16 TLV length"))?;
         out.push(0x00);
         out.push(TLV_FRAME_TABLE_EXACT as u8);
         out.extend_from_slice(&payload_len.to_be_bytes());
@@ -76,12 +81,22 @@ fn encode_frame_table_exact(jump_table: &[(u64, u64, u64)], payload_size: u64, o
             } else {
                 payload_size
             };
-            let u_size = next_u.saturating_sub(*u_start);
-            out.extend_from_slice(&(*c_size as u32).to_be_bytes());
-            out.extend_from_slice(&(u_size as u32).to_be_bytes());
+            let u_size = next_u
+                .checked_sub(*u_start)
+                .ok_or_else(|| invalid_data("frame offsets are not monotonic"))?;
+            if u_size == 0 {
+                return Err(invalid_data("zero-length frame must not enter the seek index"));
+            }
+            let c_size = u32::try_from(*c_size)
+                .map_err(|_| invalid_data("compressed frame exceeds u32"))?;
+            let u_size = u32::try_from(u_size)
+                .map_err(|_| invalid_data("uncompressed frame exceeds u32"))?;
+            out.extend_from_slice(&c_size.to_be_bytes());
+            out.extend_from_slice(&u_size.to_be_bytes());
         }
         start = end;
     }
+    Ok(())
 }
 
 pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u64) -> Vec<String> {
@@ -326,22 +341,46 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                     encoder.finish()?;
                     let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
                     let compressed_size = current_compressed_offset - compressed_start;
+                    if compressed_size == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "non-empty frame produced no compressed bytes",
+                        ));
+                    }
                     jump_table.push((uncompressed_start, compressed_start, compressed_size));
-                    
+
                     uncompressed_start += current_frame_bytes as u64;
                     compressed_start = current_compressed_offset;
                     current_frame_bytes = 0;
                     encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?;
                 }
             }
-            encoder.finish()?;
-            
-            let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
-            let compressed_size = current_compressed_offset - compressed_start;
-            if compressed_size > 0 {
+
+            // A frame cut exactly on the boundary leaves a freshly created, empty
+            // encoder behind. Finishing it would emit an empty Zstd frame and index
+            // it with uncompressed_size == 0, which breaks frame selection for
+            // reads that end exactly at EOF.
+            if current_frame_bytes > 0 {
+                encoder.finish()?;
+                let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
+                let compressed_size = current_compressed_offset - compressed_start;
+                if compressed_size == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "non-empty frame produced no compressed bytes",
+                    ));
+                }
                 jump_table.push((uncompressed_start, compressed_start, compressed_size));
+            } else if jump_table.is_empty() {
+                // A genuinely empty object keeps one empty Zstd stream so the
+                // decoder still has a frame header to read.
+                encoder.finish()?;
+            } else {
+                // Nothing buffered: drop the unused encoder without a frame.
+                drop(encoder);
             }
-            final_compressed_size = current_compressed_offset;
+
+            final_compressed_size = tape_writer.bytes_written + tape_writer.cursor as u64;
         } else {
             // HIGH-PERFORMANCE RAW COPY (Compression Bypassed)
             loop {
@@ -358,6 +397,24 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         final_padded_size = tape_writer.bytes_written;
     }
     
+    // Archive a consistent snapshot: the bytes hashed, the frame table and the
+    // object header must all describe the same content. Re-check the source after
+    // streaming and refuse the object if it changed underneath us.
+    let post_meta = src_file.metadata()?;
+    if total_read != payload_size
+        || post_meta.len() != payload_size
+        || post_meta.mtime() != src_meta.mtime()
+        || post_meta.ctime() != src_meta.ctime()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "source '{}' changed while archiving (expected {} bytes, read {})",
+                source_path, payload_size, total_read
+            ),
+        ));
+    }
+
     let data_hash = hasher.finalize();
     let hash_hex = data_hash.to_hex().to_string();
 
@@ -409,7 +466,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         encode_jump_table(&jump_table, &mut all_tlvs);
         // Also record the exact per-frame lengths (0x05). Readers that predate
         // this TLV skip it and keep using the legacy approximation above.
-        encode_frame_table_exact(&jump_table, total_read, &mut all_tlvs);
+        encode_frame_table_exact(&jump_table, total_read, &mut all_tlvs)?;
 
         let mut ext_blocks = 0;
         let mut ext_buffer = Vec::new();
@@ -575,7 +632,19 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
 
     // --- STREAMGATE MATH (Jump Table Lookup) ---
     let req_start = offset;
-    let req_end = length.map(|l| std::cmp::min(offset + l, payload_size)).unwrap_or(payload_size);
+    let req_end = length
+        .map(|l| std::cmp::min(offset.saturating_add(l), payload_size))
+        .unwrap_or(payload_size);
+
+    // An empty or past-EOF request must not touch the volume, and must not pick
+    // a frame index (a zero length used to fall through to a bogus range).
+    if length == Some(0) || req_start >= payload_size || req_end <= req_start {
+        info!(
+            "[StreamGate] Empty request for {} (offset={}, length={:?}); nothing to stream",
+            file_path, offset, length
+        );
+        return Ok(());
+    }
     
     let mut stmt = conn.prepare("SELECT uncompressed_offset, compressed_offset, compressed_size FROM object_frames WHERE file_path = ?1 AND version = ?2 ORDER BY uncompressed_offset ASC").unwrap();
     let frames: Vec<(u64, u64, u64)> = stmt.query_map(params![file_path, version], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64))).unwrap().filter_map(Result::ok).collect();
@@ -597,7 +666,14 @@ pub fn stream_file<W: std::io::Write>(config: &Arc<HuskConfig>, db_path: &str, f
 
         target_c_offset = frames[start_idx].1;
         let final_frame = &frames[end_idx];
-        target_c_len = (final_frame.1 + final_frame.2) - target_c_offset;
+        let final_end = final_frame.1 + final_frame.2;
+        if final_end < target_c_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "corrupt frame index: selected frame range ends before it starts",
+            ));
+        }
+        target_c_len = final_end - target_c_offset;
         skip_bytes = req_start - frames[start_idx].0;
         
         info!("[StreamGate] Frames found: {}. Selected range {} to {}", frames.len(), start_idx, end_idx);
@@ -993,17 +1069,21 @@ pub fn restore_file(config: &Arc<HuskConfig>, db_path: &str, tape_dev: &str, fil
     let mut all_tlvs = header.tlv_data.to_vec();
 
     if ext_blocks > 0 {
-        let mut ext_buf = vec![0u8; ext_blocks * 4096];
+        // Same O_DIRECT constraints as the rebuild path, and a short read must not
+        // silently drop the tail of the TLV stream (xattrs would be lost).
+        let ext_len = ext_blocks
+            .checked_mul(ALIGNMENT)
+            .ok_or_else(|| invalid_data("extension block count overflow"))?;
+        let mut ext_buf = AlignedBuffer::new(ext_len);
         if tape_dev.starts_with("rclone:") || is_char_dev {
-            let _ = tape.read_exact(&mut ext_buf);
+            tape.read_exact(&mut ext_buf.as_mut_slice()[..ext_len])?;
         } else {
             if let StorageReader::Local(f) = &mut tape {
-                if f.seek(SeekFrom::Start(tape_offset + 4096 + header.padded_size)).is_ok() {
-                    let _ = f.read_exact(&mut ext_buf);
-                }
+                f.seek(SeekFrom::Start(tape_offset + 4096 + header.padded_size))?;
+                f.read_exact(&mut ext_buf.as_mut_slice()[..ext_len])?;
             }
         }
-        all_tlvs.extend_from_slice(&ext_buf);
+        all_tlvs.extend_from_slice(&ext_buf.as_slice()[..ext_len]);
     }
 
     let mut tlv_offset = 0;
@@ -1101,16 +1181,160 @@ pub fn manual_restore(config: &Arc<HuskConfig>, db_path: &str, file_path: &str, 
 // ---------------------------------------------------------
 // 7. Disaster Recovery: Deep Scan Rebuild
 // ---------------------------------------------------------
+/// One entry of the StreamGate seek index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameIndex {
+    uncompressed_offset: u64,
+    compressed_offset: u64,
+    compressed_size: u32,
+    uncompressed_size: u32,
+}
+
+fn invalid_data(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
+}
+
+/// Strictly parse the frame tables out of an object header's TLV stream.
+///
+/// `payload_size`/`compressed_size` come from the header and are used to prove
+/// that the table describes the whole object: an incomplete or corrupt index
+/// must fail loudly instead of being written as a partial seek index.
+fn parse_frame_tables(
+    tlvs: &[u8],
+    payload_size: u64,
+    compressed_size: u64,
+) -> std::io::Result<Vec<FrameIndex>> {
+    let mut legacy: Vec<u32> = Vec::new();
+    let mut exact: Vec<(u32, u32)> = Vec::new();
+    let mut off = 0usize;
+
+    while off + 4 <= tlvs.len() {
+        let t = u16::from_be_bytes([tlvs[off], tlvs[off + 1]]);
+        let len = u16::from_be_bytes([tlvs[off + 2], tlvs[off + 3]]) as usize;
+        if t == 0 {
+            break; // zero padding after the last record
+        }
+        let body = off + 4;
+        let end = body
+            .checked_add(len)
+            .ok_or_else(|| invalid_data("TLV length overflow"))?;
+        if end > tlvs.len() {
+            return Err(invalid_data("truncated TLV record"));
+        }
+        match t {
+            TLV_FRAME_TABLE_EXACT => {
+                if len % 8 != 0 {
+                    return Err(invalid_data("exact frame table length is not a multiple of 8"));
+                }
+                for rec in tlvs[body..end].chunks_exact(8) {
+                    let c = u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                    let u = u32::from_be_bytes([rec[4], rec[5], rec[6], rec[7]]);
+                    exact.push((c, u));
+                }
+            }
+            TLV_FRAME_TABLE_LEGACY => {
+                if len % 4 != 0 {
+                    return Err(invalid_data("legacy frame table length is not a multiple of 4"));
+                }
+                for rec in tlvs[body..end].chunks_exact(4) {
+                    legacy.push(u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]));
+                }
+            }
+            _ => {}
+        }
+        off = end;
+    }
+
+    if exact.is_empty() && legacy.is_empty() {
+        if payload_size == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(invalid_data("object has no frame table"));
+    }
+
+    if !exact.is_empty() {
+        if !legacy.is_empty() {
+            if exact.len() != legacy.len() {
+                return Err(invalid_data("frame tables disagree on the frame count"));
+            }
+            for (i, ((c, _), lc)) in exact.iter().zip(legacy.iter()).enumerate() {
+                if c != lc {
+                    return Err(invalid_data(format!(
+                        "frame {i} compressed size differs between the exact and legacy tables"
+                    )));
+                }
+            }
+        }
+        let mut frames = Vec::with_capacity(exact.len());
+        let mut u_off: u64 = 0;
+        let mut c_off: u64 = 0;
+        for (i, (c, u)) in exact.iter().enumerate() {
+            if *u == 0 {
+                return Err(invalid_data(format!("frame {i} has an empty uncompressed range")));
+            }
+            frames.push(FrameIndex {
+                uncompressed_offset: u_off,
+                compressed_offset: c_off,
+                compressed_size: *c,
+                uncompressed_size: *u,
+            });
+            u_off = u_off
+                .checked_add(*u as u64)
+                .ok_or_else(|| invalid_data("frame offset overflow"))?;
+            c_off = c_off
+                .checked_add(*c as u64)
+                .ok_or_else(|| invalid_data("frame offset overflow"))?;
+        }
+        if u_off != payload_size {
+            return Err(invalid_data("frame table does not cover the object payload"));
+        }
+        if c_off != compressed_size {
+            return Err(invalid_data("frame table does not cover the compressed payload"));
+        }
+        return Ok(frames);
+    }
+
+    // Legacy-only volume: the uncompressed size per frame was never recorded, so
+    // keep the historical 16 MiB assumption (and accept its drift).
+    let mut frames = Vec::with_capacity(legacy.len());
+    let mut u_off: u64 = 0;
+    let mut c_off: u64 = 0;
+    for (i, c) in legacy.iter().enumerate() {
+        let u_size = if i + 1 == legacy.len() {
+            payload_size.saturating_sub(u_off)
+        } else {
+            16 * 1024 * 1024
+        };
+        let u_size = u32::try_from(u_size).unwrap_or(u32::MAX);
+        frames.push(FrameIndex {
+            uncompressed_offset: u_off,
+            compressed_offset: c_off,
+            compressed_size: *c,
+            uncompressed_size: u_size,
+        });
+        u_off = u_off.saturating_add(u_size as u64);
+        c_off = c_off
+            .checked_add(*c as u64)
+            .ok_or_else(|| invalid_data("frame offset overflow"))?;
+    }
+    if c_off != compressed_size {
+        return Err(invalid_data("legacy frame table does not cover the compressed payload"));
+    }
+    Ok(frames)
+}
+
 pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> std::io::Result<()> {
     info!("Initiating Deep Scan Recovery on Volume: {}...", tape_dev);
     
     // Initialize a fresh catalog
-    let conn = init_catalog(db_path).expect("Failed to create recovery DB");
+    let mut conn = init_catalog(db_path)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("init catalog: {e}")))?;
     
     let mut tape = open_tape_device(tape_dev, true, false, false, use_direct_io)?;
     
     let mut offset: u64 = 0;
     let mut recovered_count = 0;
+    let mut failed_count = 0;
     let mut header_buf = AlignedBuffer::new(ALIGNMENT);
 
     loop {
@@ -1133,90 +1357,87 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
 
             let hash_hex = header.data_checksum.iter().map(|b| format!("{:02x}", b)).collect::<String>();
 
-            info!("Recovered: '{}' (Offset: {}, Size: {})", filename, offset, header.payload_size);
-            
-            // Re-insert into database
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                params![&filename, 1, tape_dev, offset as i64, header.payload_size as i64, header.compressed_size as i64, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
-            );
-            
-            // Recover StreamGate Jump Table from TLV, handling Extension Blocks
             let ext_blocks = u16::from_le_bytes([header.reserved_pad[0], header.reserved_pad[1]]) as usize;
+            let next_offset = offset
+                + ALIGNMENT as u64
+                + header.padded_size
+                + (ext_blocks as u64) * ALIGNMENT as u64;
+
+            // Read the TLV extension blocks into an O_DIRECT-compatible buffer and
+            // fail loudly: a short read used to leave zero padding that stopped the
+            // TLV walk silently, so the object looked recovered with no frames.
             let mut all_tlvs = header.tlv_data.to_vec();
-
-            if ext_blocks > 0 {
-                let mut ext_buf = vec![0u8; ext_blocks * 4096];
-                let ext_offset = offset + 4096 + header.padded_size;
-                
-                let current_pos = tape.stream_position().unwrap_or(0);
-                if tape.seek(SeekFrom::Start(ext_offset)).is_ok() {
-                    let _ = tape.read_exact(&mut ext_buf);
-                    all_tlvs.extend_from_slice(&ext_buf);
+            let tlvs_result = (|| -> std::io::Result<()> {
+                if ext_blocks == 0 {
+                    return Ok(());
                 }
-                let _ = tape.seek(SeekFrom::Start(current_pos));
+                let ext_len = ext_blocks
+                    .checked_mul(ALIGNMENT)
+                    .ok_or_else(|| invalid_data("extension block count overflow"))?;
+                let ext_offset = offset + ALIGNMENT as u64 + header.padded_size;
+                let current_pos = tape.stream_position()?;
+                let result = (|| -> std::io::Result<()> {
+                    tape.seek(SeekFrom::Start(ext_offset))?;
+                    let mut ext_buf = AlignedBuffer::new(ext_len);
+                    tape.read_exact(&mut ext_buf.as_mut_slice()[..ext_len])?;
+                    all_tlvs.extend_from_slice(&ext_buf.as_slice()[..ext_len]);
+                    Ok(())
+                })();
+                tape.seek(SeekFrom::Start(current_pos))?;
+                result
+            })();
+
+            if let Err(e) = tlvs_result {
+                error!("[Rebuild] '{}' at offset {}: cannot read metadata: {}", filename, offset, e);
+                failed_count += 1;
+                offset = next_offset;
+                continue;
             }
 
-            let mut tlv_offset = 0;
-            // Both frame tables can be present in the same header: the legacy
-            // 0x03 record (compressed size only, offsets have to be assumed) and
-            // the exact 0x05 record. Parse both and prefer the exact one.
-            let mut legacy_frames: Vec<(u64, u64, u64)> = Vec::new();
-            let mut exact_frames: Vec<(u64, u64, u64)> = Vec::new();
-            let mut frame_u_off: u64 = 0;
-            let mut frame_c_off: u64 = 0;
-            let mut exact_u_off: u64 = 0;
-            let mut exact_c_off: u64 = 0;
-            while tlv_offset + 4 <= all_tlvs.len() {
-                let t_type = u16::from_be_bytes([all_tlvs[tlv_offset], all_tlvs[tlv_offset+1]]);
-                let t_len = u16::from_be_bytes([all_tlvs[tlv_offset+2], all_tlvs[tlv_offset+3]]) as usize;
-                if t_type == 0 || tlv_offset + 4 + t_len > all_tlvs.len() { break; }
-                
-                if t_type == 0x04 {
-                    // Ignore hoisted metadata during database rebuilds
-                } else if t_type == TLV_FRAME_TABLE_EXACT {
-                    let frame_count = t_len / 8;
-                    let mut p = tlv_offset + 4;
-
-                    for _ in 0..frame_count {
-                        if p + 8 > all_tlvs.len() { break; }
-                        let c_size = u32::from_be_bytes([all_tlvs[p], all_tlvs[p+1], all_tlvs[p+2], all_tlvs[p+3]]) as u64;
-                        let u_size = u32::from_be_bytes([all_tlvs[p+4], all_tlvs[p+5], all_tlvs[p+6], all_tlvs[p+7]]) as u64;
-
-                        exact_frames.push((exact_u_off, exact_c_off, c_size));
-                        exact_u_off += u_size;
-                        exact_c_off += c_size;
-                        p += 8;
-                    }
-                } else if t_type == TLV_FRAME_TABLE_LEGACY {
-                    let frame_count = t_len / 4;
-                    let mut p = tlv_offset + 4;
-
-                    for _ in 0..frame_count {
-                        if p + 4 > all_tlvs.len() { break; }
-                        let c_size = u32::from_be_bytes([all_tlvs[p], all_tlvs[p+1], all_tlvs[p+2], all_tlvs[p+3]]) as u64;
-
-                        legacy_frames.push((frame_u_off, frame_c_off, c_size));
-                        // Approximation kept only for volumes written before the
-                        // exact table existed: frames are 16-17 MiB, not 16 MiB.
-                        frame_u_off += 16 * 1024 * 1024;
-                        frame_c_off += c_size;
-                        p += 4;
-                    }
+            let frames = match parse_frame_tables(&all_tlvs, header.payload_size, header.compressed_size) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("[Rebuild] '{}' at offset {}: {}", filename, offset, e);
+                    failed_count += 1;
+                    offset = next_offset;
+                    continue;
                 }
-                tlv_offset += 4 + t_len;
+            };
+
+            // The catalog row and every frame row are written in one transaction:
+            // a partial index must never be reported as a successful recovery.
+            let write_result = (|| -> rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO catalog (file_path, version, tape_uuid, tape_offset, payload_size, compressed_size, compression_type, uid, gid, posix_mode, original_mtime, blake3_hash) 
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![&filename, 1, tape_dev, offset as i64, header.payload_size as i64, header.compressed_size as i64, header.compression_type, header.uid, header.gid, header.posix_mode, header.mtime, hash_hex],
+                )?;
+                for f in &frames {
+                    tx.execute(
+                        "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![&filename, 1, f.uncompressed_offset as i64, f.compressed_offset as i64, f.compressed_size as i64],
+                    )?;
+                }
+                tx.commit()
+            })();
+
+            match write_result {
+                Ok(()) => {
+                    info!(
+                        "Recovered: '{}' (Offset: {}, Size: {}, Frames: {})",
+                        filename, offset, header.payload_size, frames.len()
+                    );
+                    recovered_count += 1;
+                }
+                Err(e) => {
+                    error!("[Rebuild] '{}' at offset {}: catalog write failed: {}", filename, offset, e);
+                    failed_count += 1;
+                }
             }
 
-            let frames = if exact_frames.is_empty() { legacy_frames } else { exact_frames };
-            for (u_off, c_off, c_size) in frames {
-                let _ = conn.execute(
-                    "INSERT INTO object_frames (file_path, version, uncompressed_offset, compressed_offset, compressed_size) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![&filename, 1, u_off as i64, c_off as i64, c_size as i64]
-                );
-            }
-
-            recovered_count += 1;
+            // Jump forward by the padded size + header size + ext blocks size
+            offset = next_offset;
             
             // Jump forward by the padded size + header size + ext blocks size
             offset += (ALIGNMENT as u64) + header.padded_size + (ext_blocks as u64 * ALIGNMENT as u64);
@@ -1226,7 +1447,10 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
         }
     }
     
-    info!(" Recovery Complete! Successfully rebuilt {} entries into {}.", recovered_count, db_path);
+    info!(
+        " Recovery Complete! rebuilt {} entries, {} failed, into {}.",
+        recovered_count, failed_count, db_path
+    );
     Ok(())
 }
 
@@ -1717,9 +1941,10 @@ mod tests {
         let mut u = 0u64;
         let mut c = 0u64;
         for (i, size) in sizes.iter().enumerate() {
-            table.push((u, c, 4096 + i as u64));
+            let c_size = 4096 + i as u64;
+            table.push((u, c, c_size));
             u += *size;
-            c += 4096;
+            c += c_size;
         }
         (table, u)
     }
@@ -1733,7 +1958,7 @@ mod tests {
         let (table, payload) = table_from_sizes(&sizes);
 
         let mut buf = Vec::new();
-        encode_frame_table_exact(&table, payload, &mut buf);
+        encode_frame_table_exact(&table, payload, &mut buf).unwrap();
         let decoded = decode_exact_records(&buf);
         assert_eq!(decoded.len(), table.len());
 
@@ -1752,11 +1977,120 @@ mod tests {
         let (table, payload) = table_from_sizes(&sizes);
 
         let mut buf = Vec::new();
-        encode_frame_table_exact(&table, payload, &mut buf);
+        encode_frame_table_exact(&table, payload, &mut buf).unwrap();
         let records = decode_tlv_records(&buf);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], (TLV_FRAME_TABLE_EXACT, (MAX_EXACT_FRAMES_PER_TLV * 8) as usize));
         assert_eq!(decode_exact_records(&buf).len(), table.len());
+    }
+
+    fn exact_table_bytes(sizes: &[u64]) -> (Vec<u8>, Vec<(u64, u64, u64)>, u64, u64) {
+        let (table, payload) = table_from_sizes(sizes);
+        let compressed: u64 = table.iter().map(|f| f.2).sum();
+        let mut buf = Vec::new();
+        encode_frame_table_exact(&table, payload, &mut buf).unwrap();
+        (buf, table, payload, compressed)
+    }
+
+    #[test]
+    fn parse_frame_tables_accepts_exact_table() {
+        let (buf, table, payload, compressed) =
+            exact_table_bytes(&[17 << 20, 16 << 20, 3_000_000]);
+        let frames = parse_frame_tables(&buf, payload, compressed).unwrap();
+        assert_eq!(frames.len(), table.len());
+        for (frame, expected) in frames.iter().zip(table.iter()) {
+            assert_eq!(frame.uncompressed_offset, expected.0);
+            assert_eq!(frame.compressed_offset, expected.1);
+            assert_eq!(frame.compressed_size as u64, expected.2);
+        }
+        assert_eq!(
+            frames.iter().map(|f| f.uncompressed_size as u64).sum::<u64>(),
+            payload
+        );
+    }
+
+    #[test]
+    fn parse_frame_tables_rejects_partial_coverage() {
+        let (buf, _table, payload, compressed) = exact_table_bytes(&[16 << 20, 8 << 20]);
+        let err = parse_frame_tables(&buf, payload + 1, compressed).unwrap_err();
+        assert!(err.to_string().contains("does not cover the object payload"));
+        let err = parse_frame_tables(&buf, payload, compressed + 1).unwrap_err();
+        assert!(err.to_string().contains("compressed payload"));
+    }
+
+    #[test]
+    fn parse_frame_tables_rejects_truncated_record() {
+        // Claims a 16-byte payload but only 8 bytes follow.
+        let buf = vec![0x00, 0x05, 0x00, 0x10, 0, 0, 0, 1, 0, 0, 0, 2];
+        assert!(parse_frame_tables(&buf, 16, 1).is_err());
+    }
+
+    #[test]
+    fn parse_frame_tables_rejects_misaligned_length() {
+        let buf = vec![0x00, 0x05, 0x00, 0x06, 0, 0, 0, 1, 0, 0];
+        let err = parse_frame_tables(&buf, 1, 1).unwrap_err();
+        assert!(err.to_string().contains("multiple of 8"));
+    }
+
+    #[test]
+    fn parse_frame_tables_rejects_dual_table_mismatch() {
+        let (mut buf, _table, payload, compressed) = exact_table_bytes(&[16 << 20]);
+        // A legacy record that disagrees on the compressed size.
+        let mut legacy = Vec::new();
+        encode_jump_table(&[(0, 0, 9999)], &mut legacy);
+        buf.extend_from_slice(&legacy);
+        let err = parse_frame_tables(&buf, payload, compressed).unwrap_err();
+        assert!(err.to_string().contains("differs between"));
+    }
+
+    #[test]
+    fn parse_frame_tables_falls_back_to_legacy_tables() {
+        let frames = 3usize;
+        let table: Vec<(u64, u64, u64)> = (0..frames as u64)
+            .map(|i| (i * (16 << 20), i * 4096, 4096))
+            .collect();
+        let mut buf = Vec::new();
+        encode_jump_table(&table, &mut buf);
+        let parsed = parse_frame_tables(&buf, 3 * (16 << 20), frames as u64 * 4096).unwrap();
+        assert_eq!(parsed.len(), frames);
+        assert_eq!(parsed[0].uncompressed_offset, 0);
+        assert_eq!(parsed[1].uncompressed_offset, 16 << 20);
+        assert_eq!(parsed[2].uncompressed_offset, 32 << 20);
+    }
+
+    #[test]
+    fn parse_frame_tables_skips_unknown_records_and_zero_padding() {
+        let (mut buf, table, payload, compressed) = exact_table_bytes(&[16 << 20]);
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x00, 0x07, 0x00, 0x02, 0xAA, 0xBB]); // unknown type
+        out.extend_from_slice(&buf);
+        out.extend_from_slice(&[0u8; 16]); // zero padding
+        buf = out;
+        let frames = parse_frame_tables(&buf, payload, compressed).unwrap();
+        assert_eq!(frames.len(), table.len());
+    }
+
+    #[test]
+    fn parse_frame_tables_allows_empty_object() {
+        assert!(parse_frame_tables(&[], 0, 0).unwrap().is_empty());
+        assert!(parse_frame_tables(&[], 1, 0).is_err());
+    }
+
+    #[test]
+    fn encoder_rejects_zero_length_frame() {
+        // Two entries at the same uncompressed offset -> the first frame is empty.
+        let table = [(0u64, 0u64, 100u64), (0u64, 100u64, 100u64)];
+        let mut buf = Vec::new();
+        let err = encode_frame_table_exact(&table, 16, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("zero-length frame"));
+    }
+
+    #[test]
+    fn encoder_rejects_non_monotonic_offsets() {
+        let table = [(10u64, 0u64, 100u64), (5u64, 100u64, 100u64)];
+        let mut buf = Vec::new();
+        let err = encode_frame_table_exact(&table, 16, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("monotonic"));
     }
 
     #[test]
