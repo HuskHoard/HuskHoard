@@ -401,10 +401,14 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
     // object header must all describe the same content. Re-check the source after
     // streaming and refuse the object if it changed underneath us.
     let post_meta = src_file.metadata()?;
+    // Compare nanoseconds too: an in-place overwrite that keeps the same length
+    // and lands in the same second would otherwise go unnoticed.
     if total_read != payload_size
         || post_meta.len() != payload_size
-        || post_meta.mtime() != src_meta.mtime()
-        || post_meta.ctime() != src_meta.ctime()
+        || (post_meta.mtime(), post_meta.mtime_nsec())
+            != (src_meta.mtime(), src_meta.mtime_nsec())
+        || (post_meta.ctime(), post_meta.ctime_nsec())
+            != (src_meta.ctime(), src_meta.ctime_nsec())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1366,6 +1370,14 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
             // Read the TLV extension blocks into an O_DIRECT-compatible buffer and
             // fail loudly: a short read used to leave zero padding that stopped the
             // TLV walk silently, so the object looked recovered with no frames.
+            //
+            // No position save/restore: stream_position()/seek() return ESPIPE on
+            // character tape devices, and the scan loop re-seeks to `offset` at the
+            // top of every iteration anyway. On sequential media the head is simply
+            // advanced past the payload.
+            let is_char_tape = std::fs::metadata(tape_dev)
+                .map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR)
+                .unwrap_or(false);
             let mut all_tlvs = header.tlv_data.to_vec();
             let tlvs_result = (|| -> std::io::Result<()> {
                 if ext_blocks == 0 {
@@ -1375,16 +1387,21 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                     .checked_mul(ALIGNMENT)
                     .ok_or_else(|| invalid_data("extension block count overflow"))?;
                 let ext_offset = offset + ALIGNMENT as u64 + header.padded_size;
-                let current_pos = tape.stream_position()?;
-                let result = (|| -> std::io::Result<()> {
+                if is_char_tape {
+                    let mut skip = header.padded_size;
+                    let mut skip_buf = AlignedBuffer::new(ALIGNMENT * 256);
+                    while skip > 0 {
+                        let chunk = std::cmp::min(skip, skip_buf.capacity as u64) as usize;
+                        tape.read_exact(&mut skip_buf.as_mut_slice()[..chunk])?;
+                        skip -= chunk as u64;
+                    }
+                } else {
                     tape.seek(SeekFrom::Start(ext_offset))?;
-                    let mut ext_buf = AlignedBuffer::new(ext_len);
-                    tape.read_exact(&mut ext_buf.as_mut_slice()[..ext_len])?;
-                    all_tlvs.extend_from_slice(&ext_buf.as_slice()[..ext_len]);
-                    Ok(())
-                })();
-                tape.seek(SeekFrom::Start(current_pos))?;
-                result
+                }
+                let mut ext_buf = AlignedBuffer::new(ext_len);
+                tape.read_exact(&mut ext_buf.as_mut_slice()[..ext_len])?;
+                all_tlvs.extend_from_slice(&ext_buf.as_slice()[..ext_len]);
+                Ok(())
             })();
 
             if let Err(e) = tlvs_result {
@@ -1394,13 +1411,19 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
                 continue;
             }
 
-            let frames = match parse_frame_tables(&all_tlvs, header.payload_size, header.compressed_size) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("[Rebuild] '{}' at offset {}: {}", filename, offset, e);
-                    failed_count += 1;
-                    offset = next_offset;
-                    continue;
+            // Raw (uncompressed) objects carry no frame table by design: the whole
+            // payload is one seekable range. Anything else must have a valid table.
+            let frames = if header.compression_type == 0 {
+                Vec::new()
+            } else {
+                match parse_frame_tables(&all_tlvs, header.payload_size, header.compressed_size) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("[Rebuild] '{}' at offset {}: {}", filename, offset, e);
+                        failed_count += 1;
+                        offset = next_offset;
+                        continue;
+                    }
                 }
             };
 
@@ -2201,6 +2224,66 @@ mod tests {
         assert_eq!(recovered_len as u64, payload_len as u64);
 
         drop(stmt);
+        drop(rebuilt);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raw objects (`no_compress_extensions`) have no frame table; the rebuild
+    /// must still recover their catalog row instead of failing on the missing TLV.
+    #[test]
+    fn end_to_end_uncompressed_object_rebuilds_without_frames() {
+        use crate::config::{HuskConfig, DEFAULT_TOML};
+
+        let dir = std::env::temp_dir().join(format!("husk_e2e_raw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let img = dir.join("vol.img");
+        let img_path = img.to_string_lossy().to_string();
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        crate::hardware::format_tape(&img_path, false).unwrap();
+
+        let db_path = dir.join("catalog.db").to_string_lossy().to_string();
+        let conn = super::init_catalog(&db_path).unwrap();
+
+        let payload_len = 2usize << 20;
+        let src = dir.join("raw.bin");
+        std::fs::write(&src, vec![0xABu8; payload_len]).unwrap();
+
+        let mut config: HuskConfig = toml::from_str(DEFAULT_TOML).unwrap();
+        config.hot_tier = dir.to_string_lossy().to_string();
+        config.db_path = db_path.clone();
+        config.primary_volumes = vec![img_path.clone()];
+        config.failover_volumes = vec![];
+        config.replication_volumes = vec![];
+        config.replicas = 0;
+        config.min_free_space_gb = Some(0);
+        config.no_compress_extensions = vec!["bin".to_string()];
+        let config = std::sync::Arc::new(config);
+
+        let (replicas, jump_table) =
+            archive_file(&conn, src.to_str().unwrap(), &config, false).unwrap();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(replicas[0].3, 0, "compression must be bypassed for .bin");
+        assert!(jump_table.is_empty(), "raw objects carry no frame table");
+
+        let rebuilt_db = dir.join("rebuilt.db").to_string_lossy().to_string();
+        super::rebuild_catalog(&img_path, &rebuilt_db, false).unwrap();
+
+        let rebuilt = rusqlite::Connection::open(&rebuilt_db).unwrap();
+        let rows: i64 = rebuilt
+            .query_row("SELECT COUNT(*) FROM catalog", (), |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "raw object must be recovered into the catalog");
+        let frames: i64 = rebuilt
+            .query_row("SELECT COUNT(*) FROM object_frames", (), |r| r.get(0))
+            .unwrap();
+        assert_eq!(frames, 0, "raw object has no frame rows");
+
         drop(rebuilt);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
