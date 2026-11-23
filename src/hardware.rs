@@ -260,18 +260,45 @@ pub fn open_tape_device(tape_dev: &str, read: bool, write: bool, create: bool, u
     Ok(file)
 }
 
+#[repr(C)]
+struct BlkZoneRange {
+    sector: u64,
+    nr_sectors: u64,
+}
+const BLKRESETZONE: libc::c_ulong = 0x40101283; // _IOW(0x12, 131, struct blk_zone_range)
+
 pub fn format_tape(tape_dev: &str, use_direct_io: bool) -> std::io::Result<()> {
     info!("Formatting Volume '{}'...", tape_dev);
     let mut tape = open_tape_device(tape_dev, false, true, true, use_direct_io)?;
 
-    let is_char_dev = std::fs::metadata(tape_dev)
-        .map(|m| (m.mode() & libc::S_IFMT) == libc::S_IFCHR)
-        .unwrap_or(false);
+    let meta = std::fs::metadata(tape_dev)?;
+    let is_char_dev = (meta.mode() & libc::S_IFMT) == libc::S_IFCHR;
+    let is_block_dev = (meta.mode() & libc::S_IFMT) == libc::S_IFBLK;
 
     if is_char_dev {
         info!("📼 Physical Tape Drive detected. Issuing SCSI Rewind (MTREW)...");
         if let Err(e) = send_mtio_cmd(tape.as_raw_fd(), MTREW, 1) {
             error!("!!Tape rewind failed: {}. Ensure device is ready.", e);
+        }
+    } else if is_block_dev {
+        let dev_name = Path::new(tape_dev).file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let zoned_sys = format!("/sys/block/{}/queue/zoned", dev_name);
+        if let Ok(zoned_mode) = std::fs::read_to_string(&zoned_sys) {
+            let mode = zoned_mode.trim();
+            if mode == "host-managed" || mode == "host-aware" {
+                let total_bytes = tape.seek(SeekFrom::End(0))?;
+                let mut range = BlkZoneRange {
+                    sector: 0,
+                    nr_sectors: total_bytes / 512,
+                };
+                info!("Zoned block device ({}) detected. Resetting zones via BLKRESETZONE...", mode);
+                let ret = unsafe { libc::ioctl(tape.as_raw_fd(), BLKRESETZONE, &mut range) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    error!("!!BLKRESETZONE failed on '{}': {}", tape_dev, err);
+                    return Err(err);
+                }
+            }
         }
     }
 
