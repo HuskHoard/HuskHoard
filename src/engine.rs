@@ -123,31 +123,218 @@ pub fn get_balanced_volumes(volumes: &[String], db_path: &str, min_free_bytes: u
 // Returns a tuple: (Vector of replicas, Vector of StreamGate Frames (UncompressedOffset, CompressedOffset, CompressedSize))
 pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfig>, use_direct_io: bool) -> std::io::Result<(Vec<(u64, u64, u64, u8, String, String, String, usize)>, Vec<(u64, u64, u64)>)> {
     info!("Archiving '{}'...", source_path);
-    
+
     let sidecar = SidecarBridge::new(config);
     let mut src_file = File::open(source_path)?;
     let src_meta = src_file.metadata()?;
     let payload_size = src_meta.len();
-    let estimated_need = payload_size + (ALIGNMENT as u64) * 2;
 
     // Telemetry Broadcast
     sidecar.send_event(json!({
-        "event": "ARCHIVE_START", 
-        "file": source_path, 
+        "event": "ARCHIVE_START",
+        "file": source_path,
         "size": payload_size
     }));
 
+    // ---------------------------------------------------------
+    // Phase 1: Hash & (if enabled) Stage Compression BEFORE touching tape/SMR write pointers
+    // ---------------------------------------------------------
+    enum StageTarget {
+        Ram(Vec<u8>),
+        Disk(File),
+    }
+    struct StageWriter {
+        target: StageTarget,
+        bytes_written: u64,
+    }
+    impl std::io::Write for StageWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = match &mut self.target {
+                StageTarget::Ram(v) => { v.extend_from_slice(buf); buf.len() }
+                StageTarget::Disk(f) => f.write(buf)?,
+            };
+            self.bytes_written += n as u64;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match &mut self.target {
+                StageTarget::Ram(_) => Ok(()),
+                StageTarget::Disk(f) => f.flush(),
+            }
+        }
+    }
+
+    enum StagedPayload {
+        RawFile(File),
+        Ram(std::io::Cursor<Vec<u8>>),
+        DiskFile(File),
+    }
+    impl std::io::Read for StagedPayload {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self {
+                StagedPayload::RawFile(f) => f.read(buf),
+                StagedPayload::Ram(c) => c.read(buf),
+                StagedPayload::DiskFile(f) => f.read(buf),
+            }
+        }
+    }
+
+    let file_ext = std::path::Path::new(source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let use_compression = !config.no_compress_extensions.contains(&file_ext);
+    let compression_type_flag: u8 = if use_compression { 1 } else { 0 };
+
+    let mut hasher = Hasher::new();
+    let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
+    let mut io_buf = vec![0u8; 1024 * 1024]; // 1MB buffer
+    let final_compressed_size: u64;
+    let mut staged_payload: StagedPayload;
+
+    if use_compression {
+        const RAM_STAGE_LIMIT: u64 = 64 * 1024 * 1024; // 64MB in RAM, larger files spill to unlinked temp file
+        let target = if payload_size <= RAM_STAGE_LIMIT {
+            StageTarget::Ram(Vec::with_capacity(payload_size as usize))
+        } else {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let stage_path = Path::new(&config.hot_tier)
+                .join(format!(".husk_stage_{}_{}.tmp", std::process::id(), ts));
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&stage_path)?;
+            let _ = std::fs::remove_file(&stage_path); // Unlink immediately so OS cleans up on drop/crash
+            StageTarget::Disk(f)
+        };
+
+        let mut stage_writer = StageWriter { target, bytes_written: 0 };
+        let chunk_size = 16 * 1024 * 1024; // 16MB Frame boundaries for StreamGate
+        let mut current_frame_bytes = 0;
+        let mut uncompressed_start = 0;
+        let mut compressed_start = 0;
+
+        let mut encoder = zstd::stream::write::Encoder::new(&mut stage_writer, 3)?;
+        loop {
+            let n = src_file.read(&mut io_buf)?;
+            if n == 0 { break; }
+            hasher.update(&io_buf[..n]);
+            encoder.write_all(&io_buf[..n])?;
+            current_frame_bytes += n;
+
+            if current_frame_bytes >= chunk_size {
+                encoder.finish()?;
+                let current_compressed_offset = stage_writer.bytes_written;
+                let compressed_size = current_compressed_offset - compressed_start;
+                jump_table.push((uncompressed_start, compressed_start, compressed_size));
+
+                uncompressed_start += current_frame_bytes as u64;
+                compressed_start = current_compressed_offset;
+                current_frame_bytes = 0;
+                encoder = zstd::stream::write::Encoder::new(&mut stage_writer, 3)?;
+            }
+        }
+        encoder.finish()?;
+
+        let current_compressed_offset = stage_writer.bytes_written;
+        let compressed_size = current_compressed_offset - compressed_start;
+        if compressed_size > 0 {
+            jump_table.push((uncompressed_start, compressed_start, compressed_size));
+        }
+        final_compressed_size = current_compressed_offset;
+
+        staged_payload = match stage_writer.target {
+            StageTarget::Ram(v) => StagedPayload::Ram(std::io::Cursor::new(v)),
+            StageTarget::Disk(mut f) => {
+                f.seek(SeekFrom::Start(0))?;
+                StagedPayload::DiskFile(f)
+            }
+        };
+    } else {
+        // Raw uncompressed: hash in pass 1 (0 extra disk/RAM), then stream directly
+        loop {
+            let n = src_file.read(&mut io_buf)?;
+            if n == 0 { break; }
+            hasher.update(&io_buf[..n]);
+        }
+        src_file.seek(SeekFrom::Start(0))?;
+        final_compressed_size = payload_size;
+        staged_payload = StagedPayload::RawFile(src_file);
+    }
+
+    let data_hash = hasher.finalize();
+    let hash_hex = data_hash.to_hex().to_string();
+    let final_padded_size = ((final_compressed_size + (ALIGNMENT as u64) - 1) / (ALIGNMENT as u64)) * (ALIGNMENT as u64);
+
+    // Build TLVs & extension blocks up front so header is 100% final before any write
+    let mut all_tlvs = Vec::new();
+    let filename = Path::new(source_path).file_name().unwrap().to_str().unwrap().as_bytes();
+
+    // Type 0x01: Pack Filename
+    all_tlvs.push(0x00); all_tlvs.push(0x01);
+    all_tlvs.extend_from_slice(&(filename.len() as u16).to_be_bytes());
+    all_tlvs.extend_from_slice(filename);
+
+    // Type 0x02: Pack Extracted Xattrs
+    if let Ok(xattrs) = xattr::list(source_path) {
+        for attr in xattrs {
+            if attr.to_string_lossy().starts_with("trusted.ustd") { continue; }
+            if let Ok(Some(val)) = xattr::get(source_path, &attr) {
+                let attr_bytes = attr.to_string_lossy().as_bytes().to_vec();
+                if attr_bytes.len() > 255 {
+                    log::warn!("Skipping xattr: name exceeds 255 bytes");
+                    continue;
+                }
+                let total_len = 1 + attr_bytes.len() + 2 + val.len();
+                all_tlvs.push(0x00); all_tlvs.push(0x02);
+                all_tlvs.extend_from_slice(&(total_len as u16).to_be_bytes());
+                all_tlvs.push(attr_bytes.len() as u8);
+                all_tlvs.extend_from_slice(&attr_bytes);
+                all_tlvs.extend_from_slice(&(val.len() as u16).to_be_bytes());
+                all_tlvs.extend_from_slice(&val);
+            }
+        }
+    }
+
+    // Type 0x03 & 0x05: Pack StreamGate Jump Tables (legacy 0x03 + exact 0x05)
+    encode_jump_table(&jump_table, &mut all_tlvs);
+    encode_frame_table_exact(&jump_table, payload_size, &mut all_tlvs)?;
+
+    let mut tlv_fixed = [0u8; 3960];
+    let mut ext_blocks = 0usize;
+    let mut ext_aligned_buf: Option<AlignedBuffer> = None;
+
+    if all_tlvs.len() <= 3960 {
+        tlv_fixed[..all_tlvs.len()].copy_from_slice(&all_tlvs);
+    } else {
+        tlv_fixed.copy_from_slice(&all_tlvs[..3960]);
+        let overflow = &all_tlvs[3960..];
+        ext_blocks = (overflow.len() + 4095) / 4096;
+        let mut aligned = AlignedBuffer::new(ext_blocks * 4096);
+        aligned.as_mut_slice()[..overflow.len()].copy_from_slice(overflow);
+        ext_aligned_buf = Some(aligned);
+    }
+
+    let estimated_need = (ALIGNMENT as u64) + final_padded_size + ((ext_blocks as u64 + 1) * ALIGNMENT as u64);
+
+    // ---------------------------------------------------------
+    // Phase 2: Select and attach target volumes
+    // ---------------------------------------------------------
     let mut active_tapes: Vec<ActiveTape> = Vec::new();
 
-    // Reusable closure to evaluate and attach a drive/remote
     let mut try_attach_tape = |dev_path: &str| -> bool {
-        // Multi-Node Remote Hand-off Hook
         if dev_path.starts_with("husk-grid://") {
             let mut hasher = blake3::Hasher::new();
             hasher.update(dev_path.as_bytes());
             let uuid_bytes: [u8; 16] = hasher.finalize().as_bytes()[0..16].try_into().unwrap();
             let uuid_hex = uuid_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-            
+
             let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
             let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
             let start_offset = if logical_eof % ALIGNMENT as u64 == 0 { logical_eof } else { logical_eof + ALIGNMENT as u64 - (logical_eof % ALIGNMENT as u64) };
@@ -157,7 +344,7 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                     let msg = json!({"action": "GRID_TUNNEL_WRITE", "target": dev_path, "offset": start_offset});
                     let _ = stream.write_all(msg.to_string().as_bytes());
                     let _ = stream.write_all(b"\n");
-                    
+
                     let mut buf = [0u8; 1024];
                     if let Ok(n) = std::io::Read::read(&mut stream, &mut buf) {
                         if String::from_utf8_lossy(&buf[..n]).trim() == "READY" {
@@ -189,12 +376,11 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                 return true;
             }
         } else {
-            // SIDE-CAR HARDWARE WAKE-UP HOOK
             let location_hint: String = conn.query_row(
-                "SELECT location_hint FROM tapes WHERE device_path = ?1", 
+                "SELECT location_hint FROM tapes WHERE device_path = ?1",
                 params![dev_path], |row| row.get(0)
             ).unwrap_or_default();
-            
+
             if let Err(e) = sidecar.wake_volume("UNKNOWN", dev_path, &location_hint) {
                 error!("!!Hardware timeout for {}: {}", dev_path, e);
                 sidecar.send_event(json!({"event": "HARDWARE_TIMEOUT", "device": dev_path}));
@@ -210,10 +396,10 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
                 let mut vol_buf = AlignedBuffer::new(ALIGNMENT);
                 if tape.read_exact(vol_buf.as_mut_slice()).is_err() { return false; }
-                
+
                 let vol_header: VolumeHeader = *bytemuck::from_bytes(vol_buf.as_slice());
                 if &vol_header.magic_bytes != b"USTDVOL\0" { return false; }
-                
+
                 let uuid_hex = vol_header.volume_uuid.iter().map(|b| format!("{:02x}", b)).collect::<String>();
                 let query = "SELECT COALESCE(MAX(tape_offset + ((compressed_size + 4095) / 4096) * 4096 + 4096 + (COALESCE(ext_blocks, 0) * 4096)), 4096) FROM catalog WHERE tape_uuid = ?1";
                 let logical_eof = conn.query_row(query, params![uuid_hex], |row| row.get::<_, i64>(0)).unwrap_or(4096) as u64;
@@ -224,9 +410,9 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
                     let mut f2 = std::fs::File::open(dev_path).unwrap();
                     f2.seek(SeekFrom::End(0)).unwrap_or(0)
                 } else if is_char_dev {
-                    12_000_000_000_000 // Mock 12TB for Tape
-                } else { 
-                    tape_meta.len() // Respect the actual fallocate size of the .img file
+                    12_000_000_000_000
+                } else {
+                    tape_meta.len()
                 };
 
                 if start_offset + estimated_need <= total_capacity {
@@ -249,14 +435,12 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
 
     let min_free_bytes = config.min_free_space_gb.unwrap_or(0) * 1024 * 1024 * 1024;
 
-    // Balance Tier 1: Primary Volume
     let balanced_primary = get_balanced_volumes(&config.primary_volumes, &config.db_path, min_free_bytes);
     let mut primary_secured = false;
-    
     for dev in &balanced_primary {
         if try_attach_tape(dev) { primary_secured = true; break; }
     }
-    
+
     if !primary_secured {
         error!("!!Primary volumes unavailable or below {} GB free! Attempting Failover Tier...", config.min_free_space_gb.unwrap_or(0));
         let balanced_failover = get_balanced_volumes(&config.failover_volumes, &config.db_path, min_free_bytes);
@@ -265,7 +449,6 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         }
     }
 
-    // Check if the source path is blacklisted from replication
     let mut skip_replication = false;
     for dir in &config.no_replicate_dirs {
         if source_path.contains(dir) {
@@ -275,7 +458,6 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         }
     }
 
-    // Balance Tier 2: Replication Volumes
     if !skip_replication {
         let balanced_replicas = get_balanced_volumes(&config.replication_volumes, &config.db_path, min_free_bytes);
         let mut replicas_secured = 0;
@@ -289,233 +471,91 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No valid tape pools available with capacity."));
     }
 
-    // 2. Reserve Headers on all Tapes (Skip seeking for rclone streams)
+    // ---------------------------------------------------------
+    // Phase 3: Write strictly sequentially (No backward seeks!)
+    // ---------------------------------------------------------
+    let mut tape_headers: Vec<ObjectHeader> = Vec::with_capacity(active_tapes.len());
+    let ext_blocks_u16 = u16::try_from(ext_blocks)
+        .map_err(|_| invalid_data("extension block count exceeds u16"))?;
+    let ext_pad = ext_blocks_u16.to_le_bytes();
+
     let mut header_buf = AlignedBuffer::new(ALIGNMENT);
+    let zero_buf = AlignedBuffer::new(ALIGNMENT);
+
     for tape in &mut active_tapes {
+        let mut header = ObjectHeader {
+            magic_bytes: *b"USTD\x00\x01\x02\x03",
+            format_version: 1,
+            flags: 0,
+            compression_type: compression_type_flag,
+            reserved_pad: [ext_pad[0], ext_pad[1], 0],
+            payload_size,
+            compressed_size: final_compressed_size,
+            padded_size: final_padded_size,
+            object_uuid: [0; 16],
+            tape_uuid: tape.volume_uuid,
+            mtime: src_meta.mtime(),
+            ctime: src_meta.ctime(),
+            posix_mode: src_meta.mode(),
+            uid: src_meta.uid(),
+            gid: src_meta.gid(),
+            data_checksum: *data_hash.as_bytes(),
+            header_crc32: 0,
+            tlv_data: tlv_fixed,
+        };
+        let mut crc = Crc32Hasher::new();
+        crc.update(bytemuck::bytes_of(&header));
+        header.header_crc32 = crc.finalize();
+
         tape.backend.seek_to(tape.start_offset)?;
-        tape.backend.write_all(header_buf.as_slice())?;
+        if tape.is_append_only {
+            // Tape/Rclone/Grid still use 4KB dummy prefix + real footer header
+            tape.backend.write_all(zero_buf.as_slice())?;
+        } else {
+            // Local/Block/HM-SMR: write the REAL ObjectHeader up front (no seek-back overwrite!)
+            header_buf.as_mut_slice().copy_from_slice(bytemuck::bytes_of(&header));
+            tape.backend.write_all(header_buf.as_slice())?;
+        }
+        tape_headers.push(header);
     }
 
-    // 3. Stream File -> Blake3 -> Zstd -> MultiTapeWriter (Simultaneous N-Way write)
-    let mut hasher = Hasher::new();
-    let final_compressed_size: u64;
-    let final_padded_size: u64;
-
-    let mut jump_table: Vec<(u64, u64, u64)> = Vec::new();
-    // Bytes actually streamed: the frame table must describe what was written,
-    // even if the file changed size between metadata() and the read loop.
-    let mut total_read: u64 = 0;
-    
-    // LOGIC: Check config to bypass Zstd compression
-    let file_ext = std::path::Path::new(source_path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    let use_compression = !config.no_compress_extensions.contains(&file_ext);
-    let compression_type_flag: u8 = if use_compression { 1 } else { 0 };
-
+    // Stream staged payload sequentially across all target volumes
     {
         let tape_refs: Vec<&mut dyn std::io::Write> = active_tapes
             .iter_mut()
             .map(|t| &mut t.backend as &mut dyn std::io::Write)
             .collect();
-            
         let mut tape_writer = MultiTapeWriter::new(tape_refs);
-        let mut io_buf = vec![0; 1024 * 1024]; // 1MB buffer
-        
-        if use_compression {
-            let chunk_size = 16 * 1024 * 1024; // 16MB Frame boundaries for StreamGate
-            let mut current_frame_bytes = 0;
-            let mut uncompressed_start = 0;
-            let mut compressed_start = 0;
-
-            let mut encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?; 
-
-            loop {
-                let n = src_file.read(&mut io_buf)?;
-                if n == 0 { break; }
-                hasher.update(&io_buf[..n]);
-                total_read += n as u64;
-                
-                encoder.write_all(&io_buf[..n])?;
-                current_frame_bytes += n;
-                
-                if current_frame_bytes >= chunk_size {
-                    encoder.finish()?;
-                    let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
-                    let compressed_size = current_compressed_offset - compressed_start;
-                    if compressed_size == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "non-empty frame produced no compressed bytes",
-                        ));
-                    }
-                    jump_table.push((uncompressed_start, compressed_start, compressed_size));
-
-                    uncompressed_start += current_frame_bytes as u64;
-                    compressed_start = current_compressed_offset;
-                    current_frame_bytes = 0;
-                    encoder = zstd::stream::write::Encoder::new(&mut tape_writer, 3)?;
-                }
-            }
-
-            // A frame cut exactly on the boundary leaves a freshly created, empty
-            // encoder behind. Finishing it would emit an empty Zstd frame and index
-            // it with uncompressed_size == 0, which breaks frame selection for
-            // reads that end exactly at EOF.
-            if current_frame_bytes > 0 {
-                encoder.finish()?;
-                let current_compressed_offset = tape_writer.bytes_written + tape_writer.cursor as u64;
-                let compressed_size = current_compressed_offset - compressed_start;
-                if compressed_size == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "non-empty frame produced no compressed bytes",
-                    ));
-                }
-                jump_table.push((uncompressed_start, compressed_start, compressed_size));
-            } else if jump_table.is_empty() {
-                // A genuinely empty object keeps one empty Zstd stream so the
-                // decoder still has a frame header to read.
-                encoder.finish()?;
-            } else {
-                // Nothing buffered: drop the unused encoder without a frame.
-                drop(encoder);
-            }
-
-            final_compressed_size = tape_writer.bytes_written + tape_writer.cursor as u64;
-        } else {
-            // HIGH-PERFORMANCE RAW COPY (Compression Bypassed)
-            loop {
-                let n = src_file.read(&mut io_buf)?;
-                if n == 0 { break; }
-                hasher.update(&io_buf[..n]);
-                total_read += n as u64;
-                tape_writer.write_all(&io_buf[..n])?;
-            }
-            final_compressed_size = tape_writer.bytes_written + tape_writer.cursor as u64;
+        loop {
+            let n = staged_payload.read(&mut io_buf)?;
+            if n == 0 { break; }
+            tape_writer.write_all(&io_buf[..n])?;
         }
-
         tape_writer.pad_and_flush()?;
-        final_padded_size = tape_writer.bytes_written;
     }
-    
-    // Archive a consistent snapshot: the bytes hashed, the frame table and the
-    // object header must all describe the same content. Re-check the source after
-    // streaming and refuse the object if it changed underneath us.
-    let post_meta = src_file.metadata()?;
-    // Compare nanoseconds too: an in-place overwrite that keeps the same length
-    // and lands in the same second would otherwise go unnoticed.
-    if total_read != payload_size
-        || post_meta.len() != payload_size
-        || (post_meta.mtime(), post_meta.mtime_nsec())
-            != (src_meta.mtime(), src_meta.mtime_nsec())
-        || (post_meta.ctime(), post_meta.ctime_nsec())
-            != (src_meta.ctime(), src_meta.ctime_nsec())
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "source '{}' changed while archiving (expected {} bytes, read {})",
-                source_path, payload_size, total_read
-            ),
+
+    // Append footer (append-only media only) and extension blocks sequentially
+    let mut results = Vec::new();
+    for (tape, header) in active_tapes.iter_mut().zip(tape_headers.iter()) {
+        if tape.is_append_only {
+            header_buf.as_mut_slice().copy_from_slice(bytemuck::bytes_of(header));
+            tape.backend.write_all(header_buf.as_slice())?;
+        }
+        if let Some(ref ext_buf) = ext_aligned_buf {
+            tape.backend.write_all(ext_buf.as_slice())?;
+        }
+        results.push((
+            tape.start_offset,
+            payload_size,
+            final_compressed_size,
+            compression_type_flag,
+            hash_hex.clone(),
+            tape.uuid_hex.clone(),
+            tape.dev_path.clone(),
+            ext_blocks,
         ));
     }
 
-    let data_hash = hasher.finalize();
-    let hash_hex = data_hash.to_hex().to_string();
-
-    // 4. Commit Unique Headers per Tape
-    let mut results = Vec::new();
-    for tape in &mut active_tapes {
-        let mut header = ObjectHeader {
-            magic_bytes: *b"USTD\x00\x01\x02\x03", format_version: 1, flags: 0, compression_type: compression_type_flag,
-            reserved_pad: [0; 3], payload_size, compressed_size: final_compressed_size, padded_size: final_padded_size,
-            object_uuid: [0; 16], tape_uuid: tape.volume_uuid,
-            mtime: src_meta.mtime(), ctime: src_meta.ctime(), posix_mode: src_meta.mode(), uid: src_meta.uid(), gid: src_meta.gid(),
-            data_checksum: *data_hash.as_bytes(), header_crc32: 0, tlv_data: [0; 3960],
-        };
-
-        let mut all_tlvs = Vec::new();
-        let filename = Path::new(source_path).file_name().unwrap().to_str().unwrap().as_bytes();
-        
-        // Type 0x01: Pack Filename
-        all_tlvs.push(0x00); all_tlvs.push(0x01);
-        all_tlvs.extend_from_slice(&(filename.len() as u16).to_be_bytes());
-        all_tlvs.extend_from_slice(filename);
-
-        // Type 0x02: Pack Extracted Xattrs
-        if let Ok(xattrs) = xattr::list(source_path) {
-            for attr in xattrs {
-                if attr.to_string_lossy().starts_with("trusted.ustd") { continue; } // Skip internal status
-                if let Ok(Some(val)) = xattr::get(source_path, &attr) {
-                    let attr_bytes = attr.to_string_lossy().as_bytes().to_vec();
-                    if attr_bytes.len() > 255 {
-                        log::warn!("Skipping xattr: name exceeds 255 bytes");
-                        continue;
-                    }
-                    let total_len = 1 + attr_bytes.len() + 2 + val.len();
-                    all_tlvs.push(0x00); all_tlvs.push(0x02);
-                    all_tlvs.extend_from_slice(&(total_len as u16).to_be_bytes());
-                    all_tlvs.push(attr_bytes.len() as u8);
-                    all_tlvs.extend_from_slice(&attr_bytes);
-                    all_tlvs.extend_from_slice(&(val.len() as u16).to_be_bytes());
-                    all_tlvs.extend_from_slice(&val);
-                }
-            }
-        }
-
-        // Type 0x03: Pack StreamGate Jump Table.
-        // The TLV length field is u16, so a jump table with more than 16383
-        // entries (one frame per ~16 MiB, i.e. objects beyond ~256 GiB) used to
-        // have its length truncated and every following TLV misparsed. Emit
-        // consecutive 0x03 records instead; the reader continues the offsets.
-        encode_jump_table(&jump_table, &mut all_tlvs);
-        // Also record the exact per-frame lengths (0x05). Readers that predate
-        // this TLV skip it and keep using the legacy approximation above.
-        encode_frame_table_exact(&jump_table, total_read, &mut all_tlvs)?;
-
-        let mut ext_blocks = 0;
-        let mut ext_buffer = Vec::new();
-        if all_tlvs.len() <= 3960 {
-            header.tlv_data[..all_tlvs.len()].copy_from_slice(&all_tlvs);
-        } else {
-            header.tlv_data.copy_from_slice(&all_tlvs[..3960]);
-            let overflow = &all_tlvs[3960..];
-            ext_blocks = (overflow.len() + 4095) / 4096;
-            ext_buffer = vec![0u8; ext_blocks * 4096];
-            ext_buffer[..overflow.len()].copy_from_slice(overflow);
-        }
-        
-        // Store the extension block count as u16: more than 255 blocks (about
-        // 1 MiB of TLV data, reached by the jump table of a multi-TB object)
-        // used to be silently truncated.
-        let ext_blocks_u16 = u16::try_from(ext_blocks).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "object metadata exceeds the 4 KiB header extension capacity",
-            )
-        })?;
-        header.reserved_pad[0] = ext_blocks_u16 as u8;
-        header.reserved_pad[1] = (ext_blocks_u16 >> 8) as u8;
-
-        let mut crc = Crc32Hasher::new();
-        crc.update(bytemuck::bytes_of(&header));
-        header.header_crc32 = crc.finalize();
-
-        // Write Header.
-        tape.backend.seek_to(tape.start_offset)?;
-        header_buf.as_mut_slice().copy_from_slice(bytemuck::bytes_of(&header));
-        tape.backend.write_all(header_buf.as_slice())?;
-        
-        // Write Extension Blocks dynamically attached to the end of padding
-        if ext_blocks > 0 {
-            let ext_offset = tape.start_offset + 4096 + final_padded_size;
-            tape.backend.seek_to(ext_offset)?;
-            tape.backend.write_all(&ext_buffer)?;
-        }
-        
-        results.push((tape.start_offset, payload_size, final_compressed_size, compression_type_flag, hash_hex.clone(), tape.uuid_hex.clone(), tape.dev_path.clone(), ext_blocks));
-    }
-
-    // CRITICAL: Wait for all uploads to finish before returning
     for tape in active_tapes {
         if let Err(e) = tape.backend.close() {
             error!(" Cloud finalization failed for {}: {}", tape.dev_path, e);
@@ -524,20 +564,19 @@ pub fn archive_file(conn: &Connection, source_path: &str, config: &Arc<HuskConfi
     }
 
     let destination_names: Vec<String> = results.iter().map(|r| r.6.clone()).collect();
-    info!("Replicated {} times to [{}] ({} bytes -> {} bytes)", 
-        results.len(), 
+    info!("Replicated {} times to [{}] ({} bytes -> {} bytes)",
+        results.len(),
         destination_names.join(", "),
-        payload_size, 
+        payload_size,
         final_compressed_size
     );
-    
-    // Telemetry Success
+
     sidecar.send_event(json!({
-        "event": "ARCHIVE_COMPLETE", 
-        "file": source_path, 
+        "event": "ARCHIVE_COMPLETE",
+        "file": source_path,
         "replicas": results.len()
     }));
-    
+
     Ok((results, jump_table))
 }
 // ---------------------------------------------------------
@@ -1461,9 +1500,6 @@ pub fn rebuild_catalog(tape_dev: &str, db_path: &str, use_direct_io: bool) -> st
 
             // Jump forward by the padded size + header size + ext blocks size
             offset = next_offset;
-            
-            // Jump forward by the padded size + header size + ext blocks size
-            offset += (ALIGNMENT as u64) + header.padded_size + (ext_blocks as u64 * ALIGNMENT as u64);
         } else {
             // Not a header. Move forward 4KB and try again (Scan mode).
             offset += ALIGNMENT as u64;
