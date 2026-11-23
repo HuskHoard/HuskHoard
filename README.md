@@ -113,8 +113,41 @@ fallocate -l 100M replication_archive.img
 ./target/release/huskhoard format --tape-dev my_archive.img
 ./target/release/huskhoard format --tape-dev replication_archive.img
 ```
+#### Optional: Emulate Raw DM-SMR and HM-SMR Block Devices (Linux)
 
-Open `husk_config.toml` in your editor and update the paths to absolute locations for rapid test mode:
+Huskhoard writes directly to raw block devices without a filesystem. You can test both SMR paths locally without physical hardware:
+
+**DM-SMR (Drive-Managed SMR):**
+DM-SMR drives expose a standard block device interface (`zoned = none`). You can emulate a raw block device using a loopback device:
+```bash
+fallocate -l 128M dm_smr.img
+LOOP_DEV=$(sudo losetup -f --show dm_smr.img)
+echo "DM-SMR loopback device: $LOOP_DEV"
+
+sudo ./target/release/huskhoard format --tape-dev "$LOOP_DEV"
+# Update husk_config.toml: primary_volumes = ["/dev/loopX"]
+# Cleanup when done: sudo losetup -d "$LOOP_DEV"
+```
+**HM-SMR (Host-Managed SMR):**
+Linux kernels 5.12+ can emulate a real SCSI ZBC host-managed drive in RAM using scsi_debug (requires util-linux for blkzone):
+```Bash
+# Create a 128 MB HM-SMR drive (8 MB zones, 1 conventional zone, 4K sectors)
+sudo modprobe scsi_debug dev_size_mb=128 zbc=host-managed zone_size_mb=8 zone_nr_conv=1 sector_size=4096
+
+# Locate the virtual /dev/sdX device (always verify it says scsi_debug before formatting!)
+grep -H "" /sys/block/sd*/device/model /sys/block/sd*/queue/zoned
+
+# Format the raw HM-SMR device (replace sdX with the device found above)
+sudo ./target/release/huskhoard format --tape-dev /dev/sdX
+sudo blkzone report /dev/sdX
+
+# Update husk_config.toml: primary_volumes = ["/dev/sdX"]
+# Cleanup when done (all in-RAM test data is discarded): sudo modprobe -r scsi_debug
+Alternative: If your kernel's scsi_debug was built without ZBC support,you can use null_blk instead
+(sudo modprobe null_blk nr_devices=1 zoned=1 memory_backed=1 gb=1 zone_size=8 zone_nr_conv=1 bs=4096), which creates /dev/nullb0.
+```
+
+**Open `husk_config.toml` in your editor and update the paths to absolute locations for rapid test mode:**
 ```toml
 primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
 replication_volumes = ["/home/YOUR_USERNAME/huskhoard/replication_archive.img"]
