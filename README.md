@@ -225,7 +225,7 @@ Start the background engine:
 
 ## 🧪 Testing the Engine (Both Options)
 
-Leave the daemon running and open a **second terminal window**:
+Confirm the husk_config.toml is set as above for testing, Leave the daemon running and open a **second terminal window**:
 
 1. **Generate a 12MB dummy file in your hot tier:**
    ```bash
