@@ -115,38 +115,93 @@ fallocate -l 100M replication_archive.img
 ```
 #### Optional: Emulate Raw DM-SMR and HM-SMR Block Devices (Linux)
 
-Huskhoard writes directly to raw block devices without a filesystem. You can test both SMR paths locally without physical hardware:
+HuskHoard writes directly to raw block devices without a filesystem. You can test both SMR paths locally without physical hardware.
 
-**DM-SMR (Drive-Managed SMR):**
-DM-SMR drives expose a standard block device interface (`zoned = none`). You can emulate a raw block device using a loopback device:
+> ⚠️ **Device Permissions (Required):** Linux creates raw block devices (`/dev/loopX`, `/dev/sdX`, `/dev/nullb0`) owned by `root:disk` (`0660`). Because `huskhoard daemon` runs as your standard user (and `cap_dac_read_search` only grants read bypass, not write access), **it will fail with `Permission denied` unless you grant your user ownership of the test device** with `chown` below.
+>
+> *(Using `chown` on the temporary test device is much safer than adding your user to the `disk` group, which exposes all physical drives on your system. Ownership resets automatically when the virtual device is removed.)*
+
+---
+
+##### DM-SMR (Drive-Managed SMR)
+DM-SMR drives expose a standard block device interface (`zoned = none`). You can emulate one using a loopback device:
+
 ```bash
+# 1. Create a 128 MB image and attach it to a loop device
 fallocate -l 128M dm_smr.img
 LOOP_DEV=$(sudo losetup -f --show dm_smr.img)
 echo "DM-SMR loopback device: $LOOP_DEV"
 
-sudo ./target/release/huskhoard format --tape-dev "$LOOP_DEV"
-# Update husk_config.toml: primary_volumes = ["/dev/loopX"]
-# Cleanup when done: sudo losetup -d "$LOOP_DEV"
+# 2. Grant your user read/write access (required before running huskhoard)
+sudo chown "$USER" "$LOOP_DEV"
+
+# 3. Format as your standard user (do NOT use sudo, or config/catalog files will be root-owned)
+./target/release/huskhoard format --tape-dev "$LOOP_DEV"
 ```
-**HM-SMR (Host-Managed SMR):**
-Linux kernels 5.12+ can emulate a real SCSI ZBC host-managed drive in RAM using scsi_debug (requires util-linux for blkzone):
-```Bash
-# Create a 128 MB HM-SMR drive (8 MB zones, 1 conventional zone, 4K sectors)
+
+Update `husk_config.toml` with the device printed above:
+```toml
+primary_volumes = ["/dev/loopX"]   # Replace with the $LOOP_DEV path printed above
+```
+
+Cleanup when done:
+```bash
+sudo losetup -d "$LOOP_DEV"
+```
+
+---
+
+##### HM-SMR (Host-Managed SMR)
+Linux kernels 5.12+ can emulate a real SCSI ZBC host-managed drive in RAM using `scsi_debug` (requires `util-linux` for `blkzone`):
+
+```bash
+# 1. Create a 128 MB HM-SMR drive in RAM (8 MB zones, 1 conventional zone, 4K sectors)
 sudo modprobe scsi_debug dev_size_mb=128 zbc=host-managed zone_size_mb=8 zone_nr_conv=1 sector_size=4096
 
-# Locate the virtual /dev/sdX device (always verify it says scsi_debug before formatting!)
+# 2. Locate the virtual /dev/sdX device (ALWAYS verify it says "scsi_debug" and "host-managed"!)
 grep -H "" /sys/block/sd*/device/model /sys/block/sd*/queue/zoned
-
-# Format the raw HM-SMR device (replace sdX with the device found above)
-sudo ./target/release/huskhoard format --tape-dev /dev/sdX
-sudo blkzone report /dev/sdX
-
-# Update husk_config.toml: primary_volumes = ["/dev/sdX"]
-# Cleanup when done (all in-RAM test data is discarded): sudo modprobe -r scsi_debug
-Alternative: If your kernel's scsi_debug was built without ZBC support,you can use null_blk instead
-(sudo modprobe null_blk nr_devices=1 zoned=1 memory_backed=1 gb=1 zone_size=8 zone_nr_conv=1 bs=4096), which creates /dev/nullb0.
 ```
 
+Once you have verified which `sdX` belongs to `scsi_debug`, copy/paste the block below and **replace `sdX` in the first line**:
+
+```bash
+# 3. Set your device path (replace sdX with the scsi_debug device found above)
+HM_DEV="/dev/sdX"
+
+# 4. Grant your user read/write access (required before running huskhoard)
+sudo chown "$USER" "$HM_DEV"
+
+# 5. Inspect zones and format as your standard user
+blkzone report "$HM_DEV"
+./target/release/huskhoard format --tape-dev "$HM_DEV"
+```
+
+Update `husk_config.toml`:
+```toml
+primary_volumes = ["/dev/sdX"]   # Replace sdX with your scsi_debug device
+```
+
+Cleanup when done (all in-RAM test data is discarded):
+```bash
+sudo modprobe -r scsi_debug
+```
+
+> **Alternative (`null_blk`):** If your kernel's `scsi_debug` was built without ZBC support (or you are on a cloud VM without `linux-modules-extra-$(uname -r)`), you can emulate an HM-SMR device with `null_blk` instead (allocates up to 1 GiB of RAM as written):
+> ```bash
+> sudo modprobe null_blk nr_devices=1 zoned=1 memory_backed=1 gb=1 zone_size=8 zone_nr_conv=1 bs=4096
+> sudo chown "$USER" /dev/nullb0
+> blkzone report /dev/nullb0
+> ./target/release/huskhoard format --tape-dev /dev/nullb0
+> ```
+> Update `husk_config.toml` to `primary_volumes = ["/dev/nullb0"]`. Cleanup when done:
+> ```bash
+> sudo modprobe -r null_blk
+> ```
+
+> 💡 **Already ran `format` with `sudo`?** Check your project directory with `ls -la`. If `husk_config.toml` or your catalog database is owned by `root`, fix ownership before starting the daemon:
+> ```bash
+> sudo chown "$USER:$USER" husk_config.toml
+> ```
 **Open `husk_config.toml` in your editor and update the paths to absolute locations for rapid test mode:**
 ```toml
 primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
