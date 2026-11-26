@@ -9,7 +9,7 @@
 > We are big in Japan! You can read the Japanese README here: **[日本語のREADMEはこちら](README-ja.md)**.  
 > *Note: We are actively looking for Japanese maintainers/translators to help improve our docs! If you're interested, please open a PR or say hello in the issues.*
 
-**HuskHoard** is an open source data tiering archive for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives([SMR](https://huskhoard.com/blog-post-smr.html)or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.com/blog-post-lto.html), or [cloud buckets](https://huskhoard.com/blog-post-cloud.html), while keeping the files fully visible and accessible to your OS. It lets you keep a 1 PB filesystem visible to applications while only keeping the data you're actively using on expensive storage.More info at [www.huskhoard.com](http://www.huskhoard.com)
+**HuskHoard** is an open source data tiering archive for Linux. It turns your expensive NVMe drives into a bottomless file system by silently archiving cold data to cheap hard drives ([SMR](https://huskhoard.com/blog-post-smr.html) or [CMR](https://huskhoard.com/blog-post-cmr.html), [LTO Tapes](https://huskhoard.com/blog-post-lto.html), or [cloud buckets](https://huskhoard.com/blog-post-cloud.html)), while keeping the files fully visible and accessible to your OS. It lets you keep a 1 PB filesystem visible to applications while only keeping the data you're actively using on expensive storage.More info at [www.huskhoard.com](http://www.huskhoard.com)
 
 It acts like an Enterprise Tape Library, but built for the modern hybrid cloud user.
 Check our [LTO Compatibility list](https://huskhoard.com/compatibility.html) and create your LTO Archive today! Here is a quick [video](https://youtu.be/SCS7sUUyp5w?si=s4UxEEDrrBAv-SDQ) of installation and archiving.
@@ -202,11 +202,12 @@ sudo modprobe -r scsi_debug
 > ```bash
 > sudo chown "$USER:$USER" husk_config.toml
 > ```
-**Open `husk_config.toml` in your editor and update the paths to absolute locations for rapid test mode:**
+**Open the generated `husk_config.toml` in your editor and update the paths to absolute locations for rapid test mode (keep or set `db_path`):**
 ```toml
 primary_volumes = ["/home/YOUR_USERNAME/huskhoard/my_archive.img"]
 replication_volumes = ["/home/YOUR_USERNAME/huskhoard/replication_archive.img"]
 hot_tier = "/home/YOUR_USERNAME/huskhoard/hot_tier"
+db_path = "/home/YOUR_USERNAME/huskhoard/husk_catalog.db"
 max_age_days = 0                # TEST MODE: Archive files immediately
 janitor_interval_secs = 60
 http_port = 8080                # Port for the Streaming Gateway
